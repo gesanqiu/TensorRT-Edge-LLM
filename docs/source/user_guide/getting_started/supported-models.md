@@ -51,12 +51,11 @@
 | Model | Parameters | FP16 | FP8 | INT4 | NVFP4 |
 |-------|-----------|------|-----|------|-------|
 | [NVIDIA-Nemotron-Nano-9B-v2](https://huggingface.co/nvidia/NVIDIA-Nemotron-Nano-9B-v2) | 9B | ✅ | ✅ | — | ✅ |
+| [NVIDIA-Nemotron-3-Nano-4B-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16) | 4B | ✅ | ✅ | — | ✅ |
 
-> **Note:** 
-- NVIDIA-Nemotron-Nano-9B-v2 does not support INT4 because TensorRT Edge-LLM currently only supports group_size = 128, and this model has weight dimensions that are not multiples of 128. 
-> **Note:** 
-> - NVIDIA-Nemotron-Nano-9B-v2 does not support INT4 because TensorRT Edge-LLM currently only supports group_size = 128, and this model has weight dimensions that are not multiples of 128. 
-> - NVIDIA-Nemotron-Nano-9B-v2 requires passing `--chat_template tensorrt_edgellm/chat_templates/templates/nemotron_nano_v2.json` during model export. 
+> **Note:**
+> - Nemotron Nano models (9B, 4B) do not support INT4 because TensorRT Edge-LLM currently only supports group_size = 128, and these models have weight dimensions that are not multiples of 128.
+> - The 9B model requires passing `--chat_template tensorrt_edgellm/chat_templates/templates/nemotron_nano_v2.json` during model export; the 4B model does not.
 
 ---
 

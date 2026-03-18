@@ -365,6 +365,36 @@ def quantize_draft(
     return model
 
 
+def _sanitize_generation_config(model: Any) -> None:
+    """Reset sampling-only params to neutral defaults when do_sample=False.
+
+    transformers >= 4.39 validates GenerationConfig strictly during
+    save_pretrained(), raising ValueError if sampling-only params are set
+    while do_sample=False. Affected params: temperature, top_p, min_p,
+    typical_p, top_k, epsilon_cutoff, eta_cutoff.
+    """
+    if not (hasattr(model, "generation_config")
+            and model.generation_config is not None):
+        return
+    gc = model.generation_config
+    if gc.do_sample:
+        return
+    if gc.temperature != 1.0:
+        gc.temperature = 1.0
+    if gc.top_p != 1.0:
+        gc.top_p = 1.0
+    if getattr(gc, "min_p", None) is not None:
+        gc.min_p = None
+    if getattr(gc, "typical_p", 1.0) != 1.0:
+        gc.typical_p = 1.0
+    if gc.top_k != 50 and not getattr(gc, "penalty_alpha", None):
+        gc.top_k = 50
+    if getattr(gc, "epsilon_cutoff", 0.0) != 0.0:
+        gc.epsilon_cutoff = 0.0
+    if getattr(gc, "eta_cutoff", 0.0) != 0.0:
+        gc.eta_cutoff = 0.0
+
+
 def quantize_and_save_llm(model_dir: str,
                           output_dir: str,
                           quantization: Optional[str] = None,
@@ -407,6 +437,7 @@ def quantize_and_save_llm(model_dir: str,
     # Save the quantized model
     os.makedirs(output_dir, exist_ok=True)
 
+    _sanitize_generation_config(model)
     with torch.inference_mode():
         model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
@@ -475,6 +506,7 @@ def quantize_and_save_draft(
     # Save the quantized model
     os.makedirs(output_dir, exist_ok=True)
 
+    _sanitize_generation_config(draft_model)
     with torch.inference_mode():
         draft_model.save_pretrained(output_dir)
 

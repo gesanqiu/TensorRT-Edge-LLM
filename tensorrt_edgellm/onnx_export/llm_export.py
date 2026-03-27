@@ -69,7 +69,10 @@ from ..llm_models.layers.int4_moe_plugin import (
     replace_moe_blocks_with_plugin)
 from ..llm_models.layers.mamba_plugin import \
     register_mamba_plugin_onnx_symbolic_functions
-from ..llm_models.model_utils import (is_gptq_model,
+from ..llm_models.layers.qqq_gemm_plugin import (
+    register_qqq_gemm_plugin_onnx_symbolic_functions,
+    replace_qqq_linear_with_plugin)
+from ..llm_models.model_utils import (is_gptq_model, is_qqq_model,
                                       is_incompatible_chat_template_model,
                                       load_eagle3_draft_model, load_llm_model,
                                       load_reduced_vocab_map)
@@ -428,6 +431,24 @@ def replace_torch_quant_linear_with_int4_plugin(model: nn.Module) -> nn.Module:
         )
         register_int4_gemm_plugin_onnx_symbolic_functions()
         model = replace_quant_linear_with_plugin(model)
+    return model
+
+
+def replace_qqq_quant_linear_with_plugin(model: nn.Module) -> nn.Module:
+    """Replace all QQQ QuantLinear modules with QqqGemmPluginModule.
+
+    Args:
+        model: PyTorch model loaded from a QQQ checkpoint.
+
+    Returns:
+        nn.Module: Model with QQQ QuantLinear replaced by QqqGemmPluginModule.
+    """
+    if is_qqq_model(model):
+        print(
+            "Detected QQQ (W4A8) quantization, replacing QuantLinear with QqqGemmPluginModule"
+        )
+        register_qqq_gemm_plugin_onnx_symbolic_functions()
+        model = replace_qqq_linear_with_plugin(model)
     return model
 
 
@@ -937,6 +958,7 @@ def export_llm_model(model_dir: str,
 
         # Step 1: Apply model modifications
         model = replace_torch_quant_linear_with_int4_plugin(model)
+        model = replace_qqq_quant_linear_with_plugin(model)
 
         # Step 2: Export ONNX
         if trt_native_ops:
@@ -1080,6 +1102,7 @@ def export_draft_model(draft_model_dir: str,
                                           'fp16', device, trt_native_ops)
 
     draft_model = replace_torch_quant_linear_with_int4_plugin(draft_model)
+    draft_model = replace_qqq_quant_linear_with_plugin(draft_model)
 
     # Export draft model
     print(f"Exporting draft model to {output_dir}")

@@ -98,6 +98,133 @@ def is_gptq_model(model: PreTrainedModel) -> bool:
     return quant_config and quant_config.get("quant_method") == "gptq"
 
 
+def is_qqq_model(model: PreTrainedModel) -> bool:
+    """Check if the model is a QQQ (W4A8) quantized model by config."""
+    config = model.config.to_dict()
+    quant_config = config.get("quantization_config", None)
+    return quant_config and quant_config.get("quant_method") == "qqq"
+
+
+def _get_qqq_quantlinear():
+    """Import QQQ QuantLinear, bypassing __init__ chain if needed."""
+    try:
+        from QQQ.gptq.qlinear.qlinear_marlin import QuantLinear
+        return QuantLinear
+    except ImportError:
+        pass
+    import importlib.util as _ilu
+    import QQQ
+    for base in QQQ.__path__:
+        import pathlib
+        candidate = pathlib.Path(base) / "QQQ" / "gptq" / "qlinear" / "qlinear_marlin.py"
+        if not candidate.exists():
+            candidate = pathlib.Path(base) / "gptq" / "qlinear" / "qlinear_marlin.py"
+        if candidate.exists():
+            spec = _ilu.spec_from_file_location("_qlinear_marlin", str(candidate))
+            mod = _ilu.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod.QuantLinear
+    raise ImportError("Cannot locate QQQ QuantLinear")
+
+
+def _load_qqq_model(model_dir: str, torch_dtype, device: str):
+    """Load a QQQ (W4A8) quantized model.
+
+    Strategy:
+    1. Create model skeleton from config (no weights)
+    2. Scan safetensors for .B keys to identify quantized layers
+    3. Replace nn.Linear → QuantLinear for those layers
+    4. Load safetensors weights into the patched model
+    """
+    import glob
+    import pathlib
+    import torch
+    from safetensors import safe_open
+    from safetensors.torch import load_file
+
+    QuantLinear = _get_qqq_quantlinear()
+
+    cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+    quant_config = cfg.quantization_config
+    del cfg.quantization_config
+    wbits = quant_config.get("wbits", 4)
+    group_size = quant_config.get("group_size", -1)
+
+    shard_files = sorted(glob.glob(str(pathlib.Path(model_dir) / "*.safetensors")))
+
+    qqq_prefixes = set()
+    qqq_bias_prefixes = set()
+    for sf in shard_files:
+        with safe_open(sf, framework="pt") as f:
+            for key in f.keys():
+                if key.endswith(".B"):
+                    qqq_prefixes.add(key[:-2])
+                elif key.endswith(".bias"):
+                    prefix = key[:-5]
+                    if prefix + ".B" != key:
+                        qqq_bias_prefixes.add(prefix)
+
+    qqq_bias_prefixes = qqq_prefixes & qqq_bias_prefixes
+    print(f"  Found {len(qqq_prefixes)} QQQ quantized layers "
+          f"({len(qqq_bias_prefixes)} with bias)")
+
+    # Build model from config (meta device to avoid allocating full weights)
+    with torch.device("meta"):
+        model = AutoModelForCausalLM.from_config(
+            cfg, torch_dtype=torch_dtype, trust_remote_code=True)
+
+    # Replace quantized Linear → QuantLinear
+    for prefix in qqq_prefixes:
+        parts = prefix.split(".")
+        parent = model
+        for part in parts[:-1]:
+            parent = getattr(parent, part)
+        attr_name = parts[-1]
+        old_module = getattr(parent, attr_name)
+        in_f = old_module.in_features
+        out_f = old_module.out_features
+        has_bias = prefix in qqq_bias_prefixes
+        new_ql = QuantLinear(
+            wbits, group_size, in_f, out_f, bias=has_bias)
+        setattr(parent, attr_name, new_ql)
+
+    # Materialize remaining meta tensors on CPU first
+    def _materialize(module, prefix=""):
+        for name, param in module._parameters.items():
+            if param is not None and param.is_meta:
+                module._parameters[name] = torch.nn.Parameter(
+                    torch.empty(param.shape, dtype=param.dtype, device="cpu"),
+                    requires_grad=param.requires_grad)
+        for name, buf in module._buffers.items():
+            if buf is not None and buf.is_meta:
+                module._buffers[name] = torch.empty(
+                    buf.shape, dtype=buf.dtype, device="cpu")
+        for child_name, child in module._modules.items():
+            if child is not None:
+                _materialize(child, prefix + child_name + ".")
+    _materialize(model)
+
+    # Load weights from safetensors
+    for sf in shard_files:
+        state = load_file(sf, device="cpu")
+        model.load_state_dict(state, strict=False)
+
+    model.to(device)
+    model.config.quantization_config = quant_config
+    return model
+
+
+def _is_qqq_model_dir(model_dir: str) -> bool:
+    """Check if a model directory contains a QQQ (W4A8) quantized model (before loading)."""
+    try:
+        cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+        cfg_dict = cfg.to_dict()
+        quant_config = cfg_dict.get("quantization_config", None)
+        return bool(quant_config and quant_config.get("quant_method") == "qqq")
+    except Exception:
+        return False
+
+
 def _is_gptq_moe_model(model_dir: str) -> bool:
     """Check if a model directory contains a GPTQ MoE model (before loading)."""
     try:
@@ -424,6 +551,9 @@ def load_hf_model(
         model = Qwen3OmniForConditionalGeneration.from_pretrained(
             model_dir, torch_dtype=torch_dtype,
             trust_remote_code=True).to(device)
+    elif _is_qqq_model_dir(model_dir):
+        print(f"Loading QQQ (W4A8) quantized model from {model_dir}")
+        model = _load_qqq_model(model_dir, torch_dtype, device)
     elif _is_gptq_moe_model(model_dir):
         print(
             f"Loading GPTQ MoE model from {model_dir}. You might see warnings saying 'Some weights of the model checkpoint at Qwen/Qwen3-30B-A3B-GPTQ-Int4 were not used when initializing Qwen3MoeForCausalLM', which is expected. The weights will be fixed automatically afterwards."
@@ -450,7 +580,7 @@ def load_hf_model(
             except Exception as e:
                 raise ValueError(
                     f"Could not load model from {model_dir}. Error: {e}")
-    if not is_gptq_model(model):
+    if not is_gptq_model(model) and not is_qqq_model(model):
         model.to(torch_dtype)
 
     # Set tokenizer padding token if needed

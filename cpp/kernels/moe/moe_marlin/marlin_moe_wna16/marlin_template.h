@@ -44,11 +44,15 @@
 #define MARLIN_NAMESPACE_NAME marlin_moe_wna16
 #endif
 
+#include <cassert>
+
 #include "../marlin/dequant.h"
 #include "../marlin/marlin.cuh"
 #include "../marlin/marlin_dtypes.cuh"
 #include "../marlin/marlin_mma.h"
 #include "../marlin/scalar_type.hpp"
+#include "common/cudaMacros.h"
+#include "kernels/moe/nvf4_w4an/nvfp4_dequant.cuh"
 
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)                                                                      \
     static_assert(std::is_same<scalar_t, half>::value || std::is_same<scalar_t, nv_bfloat16>::value,                   \
@@ -64,17 +68,17 @@ __device__ inline void ldsm(typename MarlinScalarType<type_id>::FragA& frag_a, v
 {
     uint32_t* a = reinterpret_cast<uint32_t*>(&frag_a);
     uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-    if constexpr (count == 4)
+    IF_CONSTEXPR(count == 4)
     {
         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
             : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
             : "r"(smem));
     }
-    else if constexpr (count == 2)
+    else IF_CONSTEXPR(count == 2)
     {
         asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n" : "=r"(a[0]), "=r"(a[1]) : "r"(smem));
     }
-    else if constexpr (count == 1)
+    else IF_CONSTEXPR(count == 1)
     {
         asm volatile("ldmatrix.sync.aligned.m8n8.x1.shared.b16 {%0}, [%1];\n" : "=r"(a[0]) : "r"(smem));
     }
@@ -243,15 +247,15 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
     // FP8 computation is only supported for Ada Lovelace or newer architectures.
-    if constexpr (a_type_id == trt_edgellm::marlin_dtypes::kFE4M3fn.id())
-        return;
+    IF_CONSTEXPR(a_type_id == trt_edgellm::marlin_dtypes::kFE4M3fn.id())
+    return;
 #endif
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
     // Turing TensorCore only supports fp16 and int8
-    if constexpr (a_type_id != trt_edgellm::marlin_dtypes::kFloat16.id()
-        && a_type_id != trt_edgellm::marlin_dtypes::kS8.id())
-        return;
+    IF_CONSTEXPR(
+        a_type_id != trt_edgellm::marlin_dtypes::kFloat16.id() && a_type_id != trt_edgellm::marlin_dtypes::kS8.id())
+    return;
 #endif
 
     int num_tokens_past_padded = num_tokens_past_padded_ptr[0];
@@ -283,24 +287,24 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
     static constexpr auto b_type = trt_edgellm::marlin_dtypes::ScalarType::from_id(b_type_id);
     static constexpr auto c_type = trt_edgellm::marlin_dtypes::ScalarType::from_id(c_type_id);
     static constexpr auto s_type = trt_edgellm::marlin_dtypes::ScalarType::from_id(s_type_id);
-    if constexpr (b_type == trt_edgellm::marlin_dtypes::kFE2M1f)
+    IF_CONSTEXPR(b_type == trt_edgellm::marlin_dtypes::kFE2M1f)
     {
-        static_assert(s_type == trt_edgellm::marlin_dtypes::kFE4M3fn && group_blocks == 1
-            || s_type == trt_edgellm::marlin_dtypes::kFE8M0fnu && group_blocks == 2);
+        assert((s_type == trt_edgellm::marlin_dtypes::kFE4M3fn && group_blocks == 1
+            || s_type == trt_edgellm::marlin_dtypes::kFE8M0fnu && group_blocks == 2));
     }
-    else if constexpr (std::is_same<scalar_t, nv_bfloat16>::value)
+    else IF_CONSTEXPR(std::is_same<scalar_t, nv_bfloat16>::value)
     {
-        static_assert(s_type == trt_edgellm::marlin_dtypes::kBFloat16);
+        assert(s_type == trt_edgellm::marlin_dtypes::kBFloat16);
     }
-    else if constexpr (std::is_same<scalar_t, half>::value)
+    else IF_CONSTEXPR(std::is_same<scalar_t, half>::value)
     {
-        static_assert(s_type == trt_edgellm::marlin_dtypes::kFloat16);
+        assert(s_type == trt_edgellm::marlin_dtypes::kFloat16);
     }
 
-    constexpr bool is_a_8bit = a_type.size_bits() == 8;
-    if constexpr (!is_a_8bit)
+    constexpr bool is_a_8bit = trt_edgellm::marlin_dtypes::scalar_type_size_bits(a_type_id) == 8;
+    IF_CONSTEXPR(!is_a_8bit)
     {
-        static_assert(std::is_same<scalar_t, c_scalar_t>::value);
+        assert((std::is_same<scalar_t, c_scalar_t>::value));
     }
     // Edge-LLM: AWQ (kU4) zero point = 8 is now baked into dequant magic numbers
     // (see dequant.h), so we don't need explicit zero points for kU4.
@@ -319,7 +323,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
 
     constexpr bool has_act_order = group_blocks == 0;
 
-    constexpr int pack_factor = 32 / b_type.size_bits();
+    constexpr int pack_factor = 32 / trt_edgellm::marlin_dtypes::scalar_type_size_bits(b_type_id);
     static_assert(thread_m_blocks == 1 || !m_block_size_8);
     int const group_size = (!has_act_order && group_blocks == -1) ? prob_k : prob_k / num_groups;
     int const scales_expert_stride
@@ -351,7 +355,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
 
     int iters = div_ceil(k_tiles * part2_mn_tiles, gridDim.x);
 
-    if constexpr (!has_act_order && group_blocks != -1)
+    IF_CONSTEXPR(!has_act_order && group_blocks != -1)
     {
         if (group_blocks >= thread_k_blocks)
         {
@@ -439,14 +443,14 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
 
-            if constexpr (moe_block_size >= 16)
-                local_count += __shfl_down_sync(0xFFFFFFFF, local_count, 16);
-            if constexpr (moe_block_size >= 8)
-                local_count += __shfl_down_sync(0xFFFFFFFF, local_count, 8);
-            if constexpr (moe_block_size >= 4)
-                local_count += __shfl_down_sync(0xFFFFFFFF, local_count, 4);
-            if constexpr (moe_block_size >= 2)
-                local_count += __shfl_down_sync(0xFFFFFFFF, local_count, 2);
+            IF_CONSTEXPR(moe_block_size >= 16)
+            local_count += __shfl_down_sync(0xFFFFFFFF, local_count, 16);
+            IF_CONSTEXPR(moe_block_size >= 8)
+            local_count += __shfl_down_sync(0xFFFFFFFF, local_count, 8);
+            IF_CONSTEXPR(moe_block_size >= 4)
+            local_count += __shfl_down_sync(0xFFFFFFFF, local_count, 4);
+            IF_CONSTEXPR(moe_block_size >= 2)
+            local_count += __shfl_down_sync(0xFFFFFFFF, local_count, 2);
 
             local_count += __shfl_down_sync(0xFFFFFFFF, local_count, 1);
             block_num_valid_tokens = local_count;
@@ -467,8 +471,8 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
             {
                 idx = idx < prob_m_top_k ? idx : 0;
                 c_scalar_t2 topk_weight_val = Cdtype::num2num2(Cdtype::float2num(topk_weights_ptr[idx]));
-                if constexpr (b_type == trt_edgellm::marlin_dtypes::kFE2M1f
-                    && s_type == trt_edgellm::marlin_dtypes::kFE4M3fn)
+                IF_CONSTEXPR(
+                    b_type == trt_edgellm::marlin_dtypes::kFE2M1f && s_type == trt_edgellm::marlin_dtypes::kFE4M3fn)
                 {
                     topk_weight_val = __hmul2(topk_weight_val, global_scale);
                 }
@@ -492,7 +496,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
         block_id = par_id;
         expert_id = expert_ids_ptr[block_id];
 
-        if constexpr (b_type == trt_edgellm::marlin_dtypes::kFE2M1f && s_type == trt_edgellm::marlin_dtypes::kFE4M3fn)
+        IF_CONSTEXPR(b_type == trt_edgellm::marlin_dtypes::kFE2M1f && s_type == trt_edgellm::marlin_dtypes::kFE4M3fn)
         {
             uint16_t val = global_scale_ptr[expert_id];
             global_scale = Cdtype::num2num2(*reinterpret_cast<c_scalar_t*>(&val));
@@ -501,7 +505,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
         B_expert_off = expert_id * prob_n * prob_k / (pack_factor * 4);
         scales_ptr += (expert_id - old_expert_id) * scales_expert_stride;
 
-        if constexpr (has_act_order)
+        IF_CONSTEXPR(has_act_order)
         {
             g_idx += (expert_id - old_expert_id) * prob_k;
         }
@@ -654,7 +658,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
     // B sizes/strides
     int b_gl_stride = 16 * prob_n / (pack_factor * (is_a_8bit ? 2 : 4));
     constexpr int b_sh_stride = ((thread_n_blocks * 16) * 16 / pack_factor) / (is_a_8bit ? 2 : 4);
-    constexpr int b_thread_vecs = b_type.size_bits() == 4 ? 1 : 2;
+    constexpr int b_thread_vecs = trt_edgellm::marlin_dtypes::scalar_type_size_bits(b_type_id) == 4 ? 1 : 2;
     constexpr int b_sh_stride_threads = b_sh_stride / b_thread_vecs;
 
     int b_gl_rd_delta_o = b_gl_stride * thread_k_blocks / (is_a_8bit ? 2 : 1);
@@ -715,13 +719,13 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
 
     // No act_order
     int s_gl_rd;
-    if constexpr (!has_act_order)
+    IF_CONSTEXPR(!has_act_order)
     {
-        if constexpr (group_blocks == -1)
+        IF_CONSTEXPR(group_blocks == -1)
         {
             s_gl_rd = s_sh_stride * slice_col + threadIdx.x;
         }
-        else if constexpr (group_blocks >= thread_k_blocks)
+        else IF_CONSTEXPR(group_blocks >= thread_k_blocks)
         {
             s_gl_rd
                 = s_gl_stride * ((thread_k_blocks * slice_row) / group_blocks) + s_sh_stride * slice_col + threadIdx.x;
@@ -739,19 +743,17 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
     // we scale a `half2` tile in column-major layout in the former and in
     // row-major in the latter case.
     int s_sh_rd;
-    if constexpr (is_a_8bit)
+    IF_CONSTEXPR(is_a_8bit)
     {
         s_sh_rd = 4 * ((threadIdx.x / 32) % tb_n_warps) + (threadIdx.x % 4);
     }
-    else if constexpr (group_blocks != -1)
-        s_sh_rd = 8 * ((threadIdx.x / 32) % tb_n_warps) + (threadIdx.x % 32) / 4;
-    else if constexpr (group_blocks == -1 && (m_block_size_8 || (has_zp && !dequant_skip_flop)))
-        s_sh_rd = 8 * ((threadIdx.x / 32) % tb_n_warps) + (threadIdx.x % 32) / 8;
-    else
-        s_sh_rd = 8 * ((threadIdx.x / 32) % tb_n_warps) + (threadIdx.x % 32) % 4;
+    else IF_CONSTEXPR(group_blocks != -1) s_sh_rd = 8 * ((threadIdx.x / 32) % tb_n_warps) + (threadIdx.x % 32) / 4;
+    else IF_CONSTEXPR(group_blocks == -1 && (m_block_size_8 || (has_zp && !dequant_skip_flop))) s_sh_rd
+        = 8 * ((threadIdx.x / 32) % tb_n_warps) + (threadIdx.x % 32) / 8;
+    else s_sh_rd = 8 * ((threadIdx.x / 32) % tb_n_warps) + (threadIdx.x % 32) % 4;
 
     int bias_sh_rd;
-    if constexpr (m_block_size_8)
+    IF_CONSTEXPR(m_block_size_8)
     {
         bias_sh_rd = 8 * ((threadIdx.x / 32) % tb_n_warps) + (threadIdx.x % 32) / 8;
     }
@@ -822,7 +824,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
     FragS frag_bias[2][4];
     FragS act_frag_s[2][4][4]; // For act-order
 
-    if constexpr (is_a_8bit && group_blocks != -1)
+    IF_CONSTEXPR(is_a_8bit && group_blocks != -1)
     {
 #pragma unroll
         for (int j = 0; j < 2; j++)
@@ -924,7 +926,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
 
             b_gl_rd += b_gl_rd_delta_o;
 
-            if constexpr (has_act_order)
+            IF_CONSTEXPR(has_act_order)
             {
                 // Fetch g_idx thread-block portion
                 int full_pipe = a_off;
@@ -943,7 +945,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
             }
             else
             {
-                if constexpr (group_blocks != -1)
+                IF_CONSTEXPR(group_blocks != -1)
                 {
                     int4* sh_s_stage = sh_s + s_sh_stage * pipe;
 
@@ -1002,7 +1004,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
     int same_group_id[stages];
 
     auto init_same_group = [&](int pipe) {
-        if constexpr (!has_act_order)
+        IF_CONSTEXPR(!has_act_order)
         {
             return;
         }
@@ -1023,10 +1025,10 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
         using IT0 = typename std::conditional_t<is_a_8bit, int, int2>;
         constexpr int group_blocks2 = div_ceil(group_blocks, is_a_8bit ? 2 : 1);
 
-        if constexpr (!has_act_order)
+        IF_CONSTEXPR(!has_act_order)
         {
             // No act-order case
-            if constexpr (group_blocks == -1)
+            IF_CONSTEXPR(group_blocks == -1)
             {
                 // load only when starting a new slice
                 if (k == 0 && full_pipe == 0 && dequant_skip_flop)
@@ -1035,9 +1037,9 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
                     reinterpret_cast<int4*>(&frag_s)[1] = sh_s[s_sh_rd + 4];
                 }
             }
-            else if constexpr (group_blocks != -1)
+            else IF_CONSTEXPR(group_blocks != -1)
             {
-                if constexpr (group_blocks >= thread_k_blocks)
+                IF_CONSTEXPR(group_blocks >= thread_k_blocks)
                 {
                     constexpr int g = group_blocks / thread_k_blocks;
                     if (pipe % g == 0)
@@ -1063,7 +1065,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
 
                     int4* sh_s_stage = sh_s + s_sh_stage * pipe;
 
-                    if constexpr (b_type_id != trt_edgellm::marlin_dtypes::kFE2M1f.id())
+                    IF_CONSTEXPR(b_type_id != trt_edgellm::marlin_dtypes::kFE2M1f.id())
                     {
                         reinterpret_cast<int4*>(&frag_s[k % 2])[0] = sh_s_stage[s_sh_rd + cur_group_id * s_sh_stride];
                     }
@@ -1075,7 +1077,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
                 }
                 else if (group_blocks >= b_sh_wr_iters)
                 {
-                    if constexpr (b_type_id != trt_edgellm::marlin_dtypes::kFE2M1f.id())
+                    IF_CONSTEXPR(b_type_id != trt_edgellm::marlin_dtypes::kFE2M1f.id())
                     {
                         reinterpret_cast<int4*>(&frag_s[1])[0] = reinterpret_cast<int4*>(&frag_s[0])[0];
                     }
@@ -1158,7 +1160,8 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
     };
 
     auto dequant_data = [&](int q, scalar_32bit_t* frag_b_ptr) {
-        if constexpr (a_type.size_bits() != b_type.size_bits())
+        IF_CONSTEXPR(trt_edgellm::marlin_dtypes::scalar_type_size_bits(a_type_id)
+            != trt_edgellm::marlin_dtypes::scalar_type_size_bits(b_type_id))
         {
             dequant<scalar_32bit_t, b_type_id, dequant_skip_flop>(q, frag_b_ptr);
         }
@@ -1173,7 +1176,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
         constexpr int g = group_blocks > 0 ? div_ceil(group_blocks, thread_k_blocks) : 1;
 
 #if SUPPORTS_FP8
-        if constexpr (b_type == trt_edgellm::marlin_dtypes::kFE2M1f)
+        IF_CONSTEXPR(b_type == trt_edgellm::marlin_dtypes::kFE2M1f)
         {
             int s_quant_0 = reinterpret_cast<int*>(frag_s[k2])[0];
             int s_quant_1 = reinterpret_cast<int*>(frag_s[k2])[1];
@@ -1192,19 +1195,19 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
             FragB frag_b1;
             int b_quant_0, b_quant_1;
 
-            if constexpr (b_type_id == trt_edgellm::marlin_dtypes::kFE2M1f.id())
+            IF_CONSTEXPR(b_type_id == trt_edgellm::marlin_dtypes::kFE2M1f.id())
             {
                 b_quant_1 = frag_b_quant[k2][0][j];
                 b_quant_0 = b_quant_1 << 8;
             }
-            else if constexpr (b_type.size_bits() == 4)
+            else IF_CONSTEXPR(trt_edgellm::marlin_dtypes::scalar_type_size_bits(b_type_id) == 4)
             {
                 b_quant_0 = frag_b_quant[k2][0][j];
                 b_quant_1 = b_quant_0 >> 8;
             }
             else
             {
-                static_assert(b_type.size_bits() == 8);
+                assert(trt_edgellm::marlin_dtypes::scalar_type_size_bits(b_type_id) == 8);
                 int* frag_b_quant_ptr = reinterpret_cast<int*>(frag_b_quant[k2]);
                 b_quant_0 = frag_b_quant_ptr[j * 2 + 0];
                 b_quant_1 = frag_b_quant_ptr[j * 2 + 1];
@@ -1214,15 +1217,15 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
             dequant_data(b_quant_1, reinterpret_cast<scalar_32bit_t*>(&frag_b1));
 
             // Apply scale to frag_b0
-            if constexpr (has_act_order && !is_a_8bit)
+            IF_CONSTEXPR(has_act_order && !is_a_8bit)
             {
-                static_assert(group_blocks != -1);
+                assert(group_blocks != -1);
                 scale4<a_type_id>(
                     frag_b0, act_frag_s[k2][0][j], act_frag_s[k2][1][j], act_frag_s[k2][2][j], act_frag_s[k2][3][j], 0);
                 scale4<a_type_id>(
                     frag_b1, act_frag_s[k2][0][j], act_frag_s[k2][1][j], act_frag_s[k2][2][j], act_frag_s[k2][3][j], 1);
             }
-            else if constexpr (group_blocks != -1 && !is_a_8bit)
+            else IF_CONSTEXPR(group_blocks != -1 && !is_a_8bit)
             {
                 scale<a_type_id>(frag_b0, frag_s[k2][j], 0);
                 scale<a_type_id>(frag_b1, frag_s[k2][j], 1);
@@ -1231,7 +1234,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
 #pragma unroll
             for (int i = 0; i < thread_m_blocks; i++)
             {
-                if constexpr (m_block_size_8)
+                IF_CONSTEXPR(m_block_size_8)
                 {
                     mma_trans<a_type_id>(frag_a[k2][i], frag_b0, frag_b1, frag_c[i][j][0]);
                 }
@@ -1251,7 +1254,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
         {
             FragB frag_b[2];
 
-            if (is_a_8bit && b_type.size_bits() == 4)
+            if (is_a_8bit && trt_edgellm::marlin_dtypes::scalar_type_size_bits(b_type_id) == 4)
             {
                 dequant_data(frag_b_quant[k2][0][j * 2], reinterpret_cast<scalar_32bit_t*>(&frag_b));
                 dequant_data(frag_b_quant[k2][0][j * 2 + 1], reinterpret_cast<scalar_32bit_t*>(&frag_b) + 2);
@@ -1269,11 +1272,11 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
                 mma<a_type_id, 32>(frag_a[k2][i], frag_b[1], (group_blocks == -1 ? frag_c : frag_c_tmp)[i][j][1]);
             }
 
-            if constexpr (group_blocks != -1)
+            IF_CONSTEXPR(group_blocks != -1)
             {
                 if (group_blocks == 2 || k == 1)
                 {
-                    if constexpr (a_type == trt_edgellm::marlin_dtypes::kS8)
+                    IF_CONSTEXPR(a_type == trt_edgellm::marlin_dtypes::kS8)
                     {
                         int2 s_vals[2];
                         s_vals[0] = {(int) reinterpret_cast<uint16_t*>(&frag_s[k2][j * 2][0])[0],
@@ -1306,9 +1309,10 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
                     else
                     {
                         float2 s_vals[2];
-                        if constexpr (s_type_id != trt_edgellm::marlin_dtypes::kFE8M0fnu.id())
+                        IF_CONSTEXPR(s_type_id != trt_edgellm::marlin_dtypes::kFE8M0fnu.id())
                         {
-                            static_assert(a_type.size_bits() == 16 || s_type.size_bits() == 16);
+                            assert(trt_edgellm::marlin_dtypes::scalar_type_size_bits(a_type_id) == 16
+                                || trt_edgellm::marlin_dtypes::scalar_type_size_bits(s_type_id) == 16);
                             s_vals[0] = Cdtype::num22float2(frag_s[k2][j * 2][0]);
                             s_vals[1] = Cdtype::num22float2(frag_s[k2][j * 2 + 1][0]);
                         }
@@ -1426,7 +1430,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
         int c_gl_wr_delta_o = 8 * c_gl_stride;
         int c_gl_wr_delta_i = 4 * (active_threads / 32);
         int c_gl_wr;
-        if constexpr (m_block_size_8)
+        IF_CONSTEXPR(m_block_size_8)
         {
             c_gl_wr = c_gl_stride * ((threadIdx.x % 4) * 2) + 4 * (threadIdx.x / 32) + (threadIdx.x % 32) / 8;
             c_gl_wr += (2 * thread_n_blocks) * slice_col;
@@ -1446,15 +1450,14 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
             for (int i = 0; i < (m_block_size_8 ? 2 : thread_m_blocks * 4); i++)
             {
                 int c_idx;
-                if constexpr (m_block_size_8)
-                    c_idx = c_gl_wr + i * c_gl_stride + (threadIdx.x % 8) / 4 * c_gl_wr_delta_i;
-                else
-                    c_idx = c_gl_wr + c_gl_wr_delta_o * (i / 2) + c_gl_wr_delta_i * (i % 2);
+                IF_CONSTEXPR(m_block_size_8)
+                c_idx = c_gl_wr + i * c_gl_stride + (threadIdx.x % 8) / 4 * c_gl_wr_delta_i;
+                else c_idx = c_gl_wr + c_gl_wr_delta_o * (i / 2) + c_gl_wr_delta_i * (i % 2);
                 if (c_idx / c_gl_stride < block_num_valid_tokens)
                 {
                     int64_t sorted_row = sh_block_sorted_ids[c_idx / c_gl_stride];
                     int64_t true_idx = sorted_row * c_gl_stride + c_idx % c_gl_stride;
-                    if constexpr (is_a_8bit)
+                    IF_CONSTEXPR(is_a_8bit)
                     {
                         int2* sh_red_int2 = reinterpret_cast<int2*>(sh_red);
                         int2* c_int2 = reinterpret_cast<int2*>(C);
@@ -1474,7 +1477,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
             if (!first)
             {
                 c_scalar_t* c_red_f16;
-                if constexpr (is_a_8bit)
+                IF_CONSTEXPR(is_a_8bit)
                 {
                     int2 tmp = reinterpret_cast<int2*>(sh_red)[c_sh_wr + i * c_sh_wr_delta];
                     c_red_f16 = reinterpret_cast<c_scalar_t*>(&tmp);
@@ -1488,7 +1491,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
                 for (int j = 0; j < 2 * (is_a_8bit ? 2 : 4); j++)
                 {
                     int delta = 0;
-                    if constexpr (m_block_size_8)
+                    IF_CONSTEXPR(m_block_size_8)
                     {
                         delta = j % 2 == 1 ? -2 : 0;
                     }
@@ -1503,7 +1506,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
                 for (int j = 0; j < 2 * (is_a_8bit ? 2 : 4); j++)
                 {
                     int delta = 0;
-                    if constexpr (m_block_size_8)
+                    IF_CONSTEXPR(m_block_size_8)
                     {
                         delta = j % 2 == 1 ? -2 : 0;
                     }
@@ -1512,15 +1515,14 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
                 }
 
                 int c_idx;
-                if constexpr (m_block_size_8)
-                    c_idx = c_gl_wr + i * c_gl_stride + (threadIdx.x % 8) / 4 * c_gl_wr_delta_i;
-                else
-                    c_idx = c_gl_wr + c_gl_wr_delta_o * (i / 2) + c_gl_wr_delta_i * (i % 2);
+                IF_CONSTEXPR(m_block_size_8)
+                c_idx = c_gl_wr + i * c_gl_stride + (threadIdx.x % 8) / 4 * c_gl_wr_delta_i;
+                else c_idx = c_gl_wr + c_gl_wr_delta_o * (i / 2) + c_gl_wr_delta_i * (i % 2);
                 if (c_idx / c_gl_stride < block_num_valid_tokens)
                 {
                     int64_t sorted_row = sh_block_sorted_ids[c_idx / c_gl_stride];
                     int64_t true_idx = sorted_row * c_gl_stride + c_idx % c_gl_stride;
-                    if constexpr (is_a_8bit)
+                    IF_CONSTEXPR(is_a_8bit)
                     {
                         int2* c_int2 = reinterpret_cast<int2*>(C);
                         c_int2[true_idx] = *reinterpret_cast<int2*>(c_f16);
@@ -1561,7 +1563,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
 #pragma unroll
             for (int k = 0; k < th_size; k++)
             {
-                if constexpr (m_block_size_8)
+                IF_CONSTEXPR(m_block_size_8)
                 {
                     if (k % 2)
                         continue;
@@ -1589,7 +1591,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
 #pragma unroll
             for (int k = 0; k < th_size; k++)
             {
-                if constexpr (m_block_size_8)
+                IF_CONSTEXPR(m_block_size_8)
                 {
                     if (k % 2)
                         continue;
@@ -1617,7 +1619,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
         int c_gl_wr = c_gl_stride * (threadIdx.x / (2 * thread_n_blocks)) + (threadIdx.x % (2 * thread_n_blocks));
         c_gl_wr += (2 * thread_n_blocks) * slice_col;
         int c_sh_wr;
-        if constexpr (m_block_size_8)
+        IF_CONSTEXPR(m_block_size_8)
         {
             c_sh_wr = (8 * c_sh_stride) * ((threadIdx.x % 32) % 4 * 2) + (threadIdx.x % 32) / 4;
             c_sh_wr += 64 * (threadIdx.x / 32);
@@ -1637,19 +1639,20 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
 
             // For per-column quantization we finally apply the scale here (only for
             // 4-bit)
-            if constexpr (!has_act_order && group_blocks == -1 && !is_a_8bit && b_type.size_bits() == 4
+            IF_CONSTEXPR(!has_act_order && group_blocks == -1 && !is_a_8bit
+                && trt_edgellm::marlin_dtypes::scalar_type_size_bits(b_type_id) == 4
                 && (has_zp && dequant_skip_flop || !has_zp))
             {
                 c_scalar_t2 tmp_scale = s[0];
-                if constexpr (m_block_size_8)
+                IF_CONSTEXPR(m_block_size_8)
                 {
                     tmp_scale = Cdtype::num2num2(reinterpret_cast<scalar_t*>(&s[0])[(threadIdx.x % 8) / 4]);
                 }
                 res = __hmul2(res, tmp_scale);
             }
 
-            if constexpr (b_type == trt_edgellm::marlin_dtypes::kFE2M1f
-                && s_type == trt_edgellm::marlin_dtypes::kFE4M3fn)
+            IF_CONSTEXPR(
+                b_type == trt_edgellm::marlin_dtypes::kFE2M1f && s_type == trt_edgellm::marlin_dtypes::kFE4M3fn)
             {
                 if (!mul_topk_weights)
                 {
@@ -1659,14 +1662,14 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
             if (has_bias && last)
             {
                 c_scalar_t2 tmp_bias = b_bias[0];
-                if constexpr (m_block_size_8)
+                IF_CONSTEXPR(m_block_size_8)
                 {
                     tmp_bias = Cdtype::num2num2(reinterpret_cast<scalar_t*>(&b_bias[0])[(threadIdx.x % 8) / 4]);
                 }
                 res = __hadd2(res, tmp_bias);
             }
 
-            if constexpr (m_block_size_8)
+            IF_CONSTEXPR(m_block_size_8)
             {
                 ((c_scalar_t*) sh_red)[idx] = res.x;
                 ((c_scalar_t*) sh_red)[idx + 8 * c_sh_stride] = res.y;
@@ -1685,7 +1688,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
 #pragma unroll
                 for (int j = 0; j < (is_a_8bit ? 2 : 4); j++)
                 {
-                    if constexpr (m_block_size_8)
+                    IF_CONSTEXPR(m_block_size_8)
                     {
                         int wr = c_sh_wr + 16 * j;
                         write(wr, frag_c[i][j][0][0], frag_c[i][j][0][1], frag_s[j / 2][2 * (j % 2) + 0],
@@ -1784,7 +1787,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
         fetch_to_registers(0, 0);
         fetch_scales_to_registers(0, 0);
         a_gl_rd_col += a_gl_rd_delta_o * (stages - 1);
-        if constexpr (has_act_order)
+        IF_CONSTEXPR(has_act_order)
         {
             slice_k_start_shared_fetch += tb_k * (stages - 1);
         }
@@ -1818,13 +1821,13 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
                     init_same_group(pipe % stages);
                 }
 
-                if constexpr (!is_a_8bit)
+                IF_CONSTEXPR(!is_a_8bit)
                 {
                     matmul(k, pipe - (k >= b_sh_wr_iters - 2 ? 1 : 0));
                 }
                 else
                 {
-                    static_assert(group_blocks != 0 && group_blocks != 1);
+                    assert(group_blocks != 0 && group_blocks != 1);
                     matmul_a8(k);
                 }
             }
@@ -1837,7 +1840,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
 
         a_gl_rd_col += a_gl_rd_delta_o * stages;
 
-        if constexpr (has_act_order)
+        IF_CONSTEXPR(has_act_order)
         {
             slice_k_start += tb_k * stages;
 
@@ -1865,7 +1868,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
         if (slice_iters == 0)
         {
             // convert fp16 accum to fp32 for reduction
-            if constexpr (use_fp16_accum)
+            IF_CONSTEXPR(use_fp16_accum)
             {
 #pragma unroll
                 for (int i = 0; i < (thread_m_blocks * (is_a_8bit ? 2 : 4) * 2); i++)
@@ -1881,7 +1884,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
                 }
             }
 
-            if constexpr (is_a_8bit)
+            IF_CONSTEXPR(is_a_8bit)
             {
                 float frag_a_s[2 * thread_m_blocks];
 
@@ -1899,7 +1902,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
                         {
                             float c_val = frag_c[i][j][0][g];
 
-                            if constexpr (a_type == trt_edgellm::marlin_dtypes::kS8)
+                            IF_CONSTEXPR(a_type == trt_edgellm::marlin_dtypes::kS8)
                             {
                                 c_val = __int2float_rn(*reinterpret_cast<int32_t*>(&c_val));
                             }
@@ -1911,7 +1914,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
                         {
                             float c_val = frag_c[i][j][1][g];
 
-                            if constexpr (a_type == trt_edgellm::marlin_dtypes::kS8)
+                            IF_CONSTEXPR(a_type == trt_edgellm::marlin_dtypes::kS8)
                             {
                                 c_val = __int2float_rn(*reinterpret_cast<int32_t*>(&c_val));
                             }
@@ -1926,9 +1929,10 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
             bool last = slice_idx == slice_count - 1;
             // For per-column scales, we only fetch them here in the final step before
             // write-out
-            if constexpr (!has_act_order && group_blocks == -1 && (has_zp && dequant_skip_flop || !has_zp))
+            IF_CONSTEXPR(!has_act_order && group_blocks == -1 && (has_zp && dequant_skip_flop || !has_zp))
             {
-                if (b_type.size_bits() == 8 || (last || use_atomic_add) || is_a_8bit)
+                if (trt_edgellm::marlin_dtypes::scalar_type_size_bits(b_type_id) == 8 || (last || use_atomic_add)
+                    || is_a_8bit)
                 {
                     if (s_sh_wr_pred)
                     {
@@ -1947,9 +1951,9 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
                 cp_async_fence();
             }
 
-            if constexpr (!has_act_order && group_blocks == -1 && (has_zp && dequant_skip_flop || !has_zp || is_a_8bit))
+            IF_CONSTEXPR(!has_act_order && group_blocks == -1 && (has_zp && dequant_skip_flop || !has_zp || is_a_8bit))
             {
-                if constexpr (is_a_8bit)
+                IF_CONSTEXPR(is_a_8bit)
                 {
                     cp_async_wait<0>();
                     __syncthreads();
@@ -1958,7 +1962,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
                         reinterpret_cast<int4*>(&frag_s)[0] = sh_s[s_sh_rd + 0];
                     }
                 }
-                else if (b_type.size_bits() == 8 || (last || use_atomic_add))
+                else if (trt_edgellm::marlin_dtypes::scalar_type_size_bits(b_type_id) == 8 || (last || use_atomic_add))
                 {
                     cp_async_wait<0>();
                     __syncthreads();
@@ -1966,7 +1970,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
                     {
                         reinterpret_cast<int4*>(&frag_s)[0] = sh_s[s_sh_rd + 0];
                         reinterpret_cast<int4*>(&frag_s)[1] = sh_s[s_sh_rd + 4];
-                        if constexpr (m_block_size_8)
+                        IF_CONSTEXPR(m_block_size_8)
                         {
                             int idx = (threadIdx.x / 4) % 2;
                             c_scalar_t2* frag_s_half2 = reinterpret_cast<c_scalar_t2*>(frag_s);
@@ -1984,7 +1988,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
             // For 8-bit channelwise, we apply the scale before the global reduction
             // that converts the fp32 results to fp16 (so that we avoid possible
             // overflow in fp16)
-            if constexpr (!has_act_order && group_blocks == -1 && is_a_8bit)
+            IF_CONSTEXPR(!has_act_order && group_blocks == -1 && is_a_8bit)
             {
 #pragma unroll
                 for (int j = 0; j < 2; j++)
@@ -2012,7 +2016,8 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
                     }
                 }
             }
-            else if (!has_act_order && group_blocks == -1 && b_type.size_bits() == 8
+            else if (!has_act_order && group_blocks == -1
+                && trt_edgellm::marlin_dtypes::scalar_type_size_bits(b_type_id) == 8
                 && (has_zp && dequant_skip_flop || !has_zp))
             {
                 if (threadIdx.x / 32 < tb_n_warps)
@@ -2028,7 +2033,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
                             scale_float<c_type_id>(reinterpret_cast<float*>(&frag_c[i][j][0][2]),
                                 frag_s[j / 2][2 * (j % 2) + (m_block_size_8 ? 1 : 0)]);
 
-                            if constexpr (!m_block_size_8)
+                            IF_CONSTEXPR(!m_block_size_8)
                             {
                                 scale_float<c_type_id>(
                                     reinterpret_cast<float*>(&frag_c[i][j][1][0]), frag_s[j / 2][2 * (j % 2) + 1]);
@@ -2060,8 +2065,8 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
                 cp_async_wait<0>();
                 __syncthreads();
                 reinterpret_cast<int4*>(&frag_bias)[0] = sh_bias[bias_sh_rd];
-                if constexpr (!is_a_8bit)
-                    reinterpret_cast<int4*>(&frag_bias)[1] = sh_bias[bias_sh_rd + 4];
+                IF_CONSTEXPR(!is_a_8bit)
+                reinterpret_cast<int4*>(&frag_bias)[1] = sh_bias[bias_sh_rd + 4];
                 __syncthreads();
             }
 
@@ -2091,7 +2096,7 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
 
                 bias_gl_rd = (thread_n_blocks * 16 / 8) * slice_col + threadIdx.x;
                 // Update slice k/n for scales loading
-                if constexpr (has_act_order)
+                IF_CONSTEXPR(has_act_order)
                 {
                     slice_k_start = tb_k * slice_row;
                     slice_k_finish = slice_k_start + tb_k * slice_iters;
@@ -2100,11 +2105,11 @@ __global__ void Marlin(int4 const* __restrict__ A, // fp16 input matrix of shape
                 }
                 else
                 {
-                    if constexpr (group_blocks == -1)
+                    IF_CONSTEXPR(group_blocks == -1)
                     {
                         s_gl_rd = s_sh_stride * slice_col + threadIdx.x;
                     }
-                    else if constexpr (group_blocks >= thread_k_blocks)
+                    else IF_CONSTEXPR(group_blocks >= thread_k_blocks)
                     {
                         s_gl_rd = s_gl_stride * ((thread_k_blocks * slice_row) / group_blocks) + s_sh_stride * slice_col
                             + threadIdx.x;

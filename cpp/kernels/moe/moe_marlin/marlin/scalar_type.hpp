@@ -258,6 +258,18 @@ public:
 
 using ScalarTypeId = ScalarType::Id;
 
+// Standalone constexpr helper to extract size_bits directly from a ScalarType::Id
+// without calling member functions. This avoids CUDA 11.4 nvcc bugs with
+// constexpr member function calls in device template code.
+// Id bit layout: exponent(8) | mantissa(8) | signed_(1) | ...
+static inline constexpr int64_t scalar_type_size_bits(ScalarType::Id id)
+{
+    uint8_t exponent = static_cast<uint8_t>(id & 0xFF);
+    uint8_t mantissa = static_cast<uint8_t>((id >> 8) & 0xFF);
+    bool is_signed = static_cast<bool>((id >> 16) & 0x1);
+    return mantissa + exponent + (is_signed ? 1 : 0);
+}
+
 // "rust style" names generally following:
 //   https://github.com/pytorch/pytorch/blob/6d9f74f0af54751311f0dd71f7e5c01a93260ab3/torch/csrc/api/include/torch/types.h#L60-L70
 static inline constexpr auto kS4 = ScalarType::int_(4);

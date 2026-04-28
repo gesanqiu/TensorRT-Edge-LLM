@@ -230,7 +230,8 @@ class EdgeLLMAttentionTRTNative(nn.Module):
         bsz, q_len, _ = hidden_states.size()
 
         # Apply Q, K, V projections
-        query_states, key_states, value_states = self.qkv_proj(hidden_states)
+        query_states, key_states, value_states, gate_states = self.qkv_proj(
+            hidden_states)
 
         norm_shape = [bsz, q_len, -1, self.head_dim]
         query_states, key_states = self.qk_norm(query_states, key_states,
@@ -314,6 +315,9 @@ class EdgeLLMAttentionTRTNative(nn.Module):
 
         # Apply output projection
         attn_output = attn_output.to(io_type)
+        if gate_states is not None:
+            attn_output = attn_output * torch.sigmoid(
+                gate_states.to(attn_output.dtype))
         attn_output = self.o_proj(attn_output)
 
         return attn_output, present_k_cache, present_v_cache

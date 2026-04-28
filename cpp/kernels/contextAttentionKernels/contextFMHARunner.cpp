@@ -115,7 +115,7 @@ int32_t attentionInputLayoutToInt(AttentionInputLayout layout) noexcept
     switch (layout)
     {
     case AttentionInputLayout::PACKED_QKV: result = 0; break;
-    case AttentionInputLayout::CONTIGUOUS_Q_KV: result = 1; break;
+    case AttentionInputLayout::CONTIGUOUS_Q_KV: check::check(false, "CONTIGUOUS_Q_KV is no longer supported"); break;
     case AttentionInputLayout::Q_PAGED_KV: result = 2; break;
     case AttentionInputLayout::SEPARATE_Q_K_V: result = 3; break;
     }
@@ -399,25 +399,13 @@ void ContextFMHARunner::setupParams(FusedMultiheadAttentionParamsV2& params)
 
     params.o_stride_in_bytes = mNumHeads * mHeadSize * sizeof(half);
 
-    check::check(mLaunchParams.attention_input_layout == AttentionInputLayout::SEPARATE_Q_K_V
-            || mLaunchParams.attention_input_layout == AttentionInputLayout::CONTIGUOUS_Q_KV,
-        "Unsupported input layout");
-    if (mLaunchParams.attention_input_layout == AttentionInputLayout::SEPARATE_Q_K_V)
-    {
-        int64_t q_stride_in_bytes = mNumHeads * mHeadSize * sizeof(half);
-        int64_t kv_stride_in_bytes = mNumKVHeads * mHeadSize * sizeof(half);
-        params.q_stride_in_bytes = q_stride_in_bytes;
-        params.k_stride_in_bytes = kv_stride_in_bytes;
-        params.v_stride_in_bytes = kv_stride_in_bytes;
-    }
-    else
-    {
-        int64_t q_stride_in_bytes = mNumHeads * mHeadSize * sizeof(half);
-        int64_t kv_stride_in_bytes = (2 * mNumKVHeads) * mHeadSize * sizeof(half);
-        params.q_stride_in_bytes = q_stride_in_bytes;
-        params.k_stride_in_bytes = kv_stride_in_bytes;
-        params.v_stride_in_bytes = kv_stride_in_bytes;
-    }
+    check::check(mLaunchParams.attention_input_layout == AttentionInputLayout::SEPARATE_Q_K_V,
+        "Only SEPARATE_Q_K_V input layout is supported");
+    int64_t q_stride_in_bytes = mNumHeads * mHeadSize * sizeof(half);
+    int64_t kv_stride_in_bytes = mNumKVHeads * mHeadSize * sizeof(half);
+    params.q_stride_in_bytes = q_stride_in_bytes;
+    params.k_stride_in_bytes = kv_stride_in_bytes;
+    params.v_stride_in_bytes = kv_stride_in_bytes;
 }
 
 bool ContextFMHARunner::canImplement(int32_t headSize, [[maybe_unused]] int32_t sm, nvinfer1::DataType dataType,
@@ -430,7 +418,7 @@ bool ContextFMHARunner::canImplement(int32_t headSize, [[maybe_unused]] int32_t 
         return false;
     }
 
-    if (headSize == 64 || headSize == 128)
+    if (headSize == 64 || headSize == 128 || headSize == 256)
     {
         return true;
     }
@@ -449,7 +437,8 @@ bool ContextFMHARunner::canImplement(int32_t headSize, [[maybe_unused]] int32_t 
         return true;
     }
 
-    LOG_ERROR("ContextFMHARunner::canImplement() unsupported headSize=%d. Supported head sizes are 64, 72, 80, 128.",
+    LOG_ERROR(
+        "ContextFMHARunner::canImplement() unsupported headSize=%d. Supported head sizes are 64, 72, 80, 128, 256.",
         headSize);
     return false;
 }
@@ -462,18 +451,9 @@ bool ContextFMHARunner::loadContextFMHAKernels(int32_t smVersion, nvinfer1::Data
 
 void ContextFMHARunner::dispatchFMHAKernel(FusedMultiheadAttentionParamsV2& params, cudaStream_t const& stream)
 {
-    if (mLaunchParams.attention_input_layout == AttentionInputLayout::SEPARATE_Q_K_V)
-    {
-        check::check(params.q_ptr != nullptr && params.k_ptr != nullptr && params.v_ptr != nullptr
-                && params.o_ptr != nullptr && params.cu_q_seqlens != nullptr && params.cu_kv_seqlens != nullptr,
-            "Device pointers are supposed to be valid");
-    }
-    else // CONTIGUOUS_Q_KV
-    {
-        check::check(params.q_ptr != nullptr && params.kv_ptr != nullptr && params.o_ptr != nullptr
-                && params.cu_q_seqlens != nullptr && params.cu_kv_seqlens != nullptr,
-            "Device pointers are supposed to be valid");
-    }
+    check::check(params.q_ptr != nullptr && params.k_ptr != nullptr && params.v_ptr != nullptr
+            && params.o_ptr != nullptr && params.cu_q_seqlens != nullptr && params.cu_kv_seqlens != nullptr,
+        "Device pointers are supposed to be valid");
     FMHAKernelHashKey hashKey{trtToFMHADataType(mDataType), mPaddedSequenceLen, mHeadSize, mLaunchParams.force_unroll,
         mLaunchParams.force_fp32_acc, mLaunchParams.flash_attention,
         attentionMaskTypeToInt(mLaunchParams.attention_mask_type), mLaunchParams.use_granular_tiling,

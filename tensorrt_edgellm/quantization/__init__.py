@@ -18,9 +18,15 @@ Quantization utilities for TensorRT Edge-LLM.
 This module provides functions for quantizing LLM and visual models using NVIDIA ModelOpt.
 """
 
+# FP8 (E4M3) quantization constants
+# Max finite value representable by NVIDIA FP8 E4M3 format; used to derive per-tensor KV cache scale.
+# NOTE: This constant must be defined BEFORE any imports to avoid circular import issues.
+FP8_E4M3_MAX: float = 448.0
+
 from .llm_quantization import quantize_and_save_draft, quantize_and_save_llm
 
 __all__ = [
     "quantize_and_save_llm",
     "quantize_and_save_draft",
+    "FP8_E4M3_MAX",
 ]

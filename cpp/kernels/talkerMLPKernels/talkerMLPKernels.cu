@@ -17,76 +17,15 @@
 
 #include "talkerMLPKernels.h"
 
+#ifdef CUTE_DSL_GEMM_ENABLED
+#include "cuteDslGemmRunner.h"
+#endif
+
 #include "common/checkMacros.h"
 #include "common/cudaUtils.h"
 #include "common/logger.h"
 
 #include <cuda_fp16.h>
-#include <dlfcn.h>
-
-// ============================================================================
-// cuBLAS dynamic loading (avoids compile-time cublas dependency for edgellmCore)
-// ============================================================================
-
-// cuBLAS function pointer types (use int to avoid cublas header dependency)
-using CublasSetStreamFn = int (*)(void*, cudaStream_t);
-using CublasGemmExFn = int (*)(void*, int, int, int, int, int, void const*, void const*, cudaDataType_t, int,
-    void const*, cudaDataType_t, int, void const*, void*, cudaDataType_t, int, int, int);
-
-class CublasLoader
-{
-public:
-    CublasLoader(CublasLoader const&) = delete;
-    CublasLoader& operator=(CublasLoader const&) = delete;
-    CublasLoader(CublasLoader&&) = delete;
-    CublasLoader& operator=(CublasLoader&&) = delete;
-
-    static CublasLoader& getInstance()
-    {
-        static CublasLoader instance;
-        return instance;
-    }
-
-    void* libHandle{nullptr};
-    CublasSetStreamFn setStream{nullptr};
-    CublasGemmExFn gemmEx{nullptr};
-
-private:
-    CublasLoader()
-    {
-        libHandle = dlopen("libcublas.so", RTLD_LAZY);
-        if (!libHandle)
-        {
-            return;
-        }
-        setStream = reinterpret_cast<CublasSetStreamFn>(dlsym(libHandle, "cublasSetStream_v2"));
-        gemmEx = reinterpret_cast<CublasGemmExFn>(dlsym(libHandle, "cublasGemmEx"));
-        if (!setStream || !gemmEx)
-        {
-            dlclose(libHandle);
-            libHandle = nullptr;
-        }
-    }
-
-    ~CublasLoader()
-    {
-        if (libHandle)
-        {
-            dlclose(libHandle);
-        }
-    }
-};
-
-// cuBLAS constants (match cublas_api.h values)
-constexpr int kCUBLAS_OP_N = 0;
-constexpr int kCUBLAS_OP_T = 1;
-constexpr int kCUBLAS_STATUS_SUCCESS = 0;
-// WAR: Use CUBLAS_COMPUTE_32F (FP32 accumulation) instead of CUBLAS_COMPUTE_16F.
-// FP16 accumulation overflows when Thinker layer-14 hidden states have large values
-// (e.g. maxAbs ~8912). The 2560-dim dot product partial sums exceed FP16 max (65504)
-// even though the final result fits in FP16.
-constexpr int kCUBLAS_COMPUTE_FP32 = 4;            // CUBLAS_COMPUTE_32F
-constexpr int kCUBLAS_GEMM_DEFAULT_TENSOR_OP = 99; // CUBLAS_GEMM_DEFAULT_TENSOR_OP
 
 namespace trt_edgellm
 {
@@ -338,10 +277,9 @@ void invokeAddBias(rt::Tensor& data, rt::Tensor const& bias, cudaStream_t stream
 
 } // namespace
 
-// Host function implementations
-void invokeTalkerMLP(void* cublasHandle, rt::Tensor const& input, rt::Tensor const& fc1Weight,
-    rt::Tensor const& fc1Bias, rt::Tensor const& fc2Weight, rt::Tensor const& fc2Bias, rt::Tensor& output,
-    rt::Tensor& workspace, cudaStream_t stream)
+void invokeTalkerMLP(rt::Tensor const& input, rt::Tensor const& fc1Weight, rt::Tensor const& fc1Bias,
+    rt::Tensor const& fc2Weight, rt::Tensor const& fc2Bias, rt::Tensor& output, rt::Tensor& workspace,
+    cudaStream_t stream)
 {
     auto inputShape = input.getShape();
     auto outputShape = output.getShape();
@@ -364,91 +302,49 @@ void invokeTalkerMLP(void* cublasHandle, rt::Tensor const& input, rt::Tensor con
         return;
     }
 
-    int64_t const numTokens = inputShape[0];
-    int64_t const inputDim = inputShape[1];
-    int64_t const hiddenDim = fc1WeightShape[0];
-    int64_t const outputDim = fc2WeightShape[0];
+    int32_t const numTokens = static_cast<int32_t>(inputShape[0]);
+    int32_t const inputDim = static_cast<int32_t>(inputShape[1]);
+    int32_t const hiddenDim = static_cast<int32_t>(fc1WeightShape[0]);
+    int32_t const outputDim = static_cast<int32_t>(fc2WeightShape[0]);
 
-    if (fc1WeightShape[0] != hiddenDim || fc1WeightShape[1] != inputDim)
+    if (fc1WeightShape[1] != inputDim)
     {
-        LOG_ERROR("FC1 weight shape mismatch: expected [%ld, %ld], got [%ld, %ld]", hiddenDim, inputDim,
-            fc1WeightShape[0], fc1WeightShape[1]);
+        LOG_ERROR("FC1 weight shape mismatch: expected [*, %d], got [%ld, %ld]", inputDim, fc1WeightShape[0],
+            fc1WeightShape[1]);
         return;
     }
 
-    if (fc2WeightShape[0] != outputDim || fc2WeightShape[1] != hiddenDim)
+    if (fc2WeightShape[1] != hiddenDim)
     {
-        LOG_ERROR("FC2 weight shape mismatch: expected [%ld, %ld], got [%ld, %ld]", outputDim, hiddenDim,
-            fc2WeightShape[0], fc2WeightShape[1]);
+        LOG_ERROR("FC2 weight shape mismatch: expected [*, %d], got [%ld, %ld]", hiddenDim, fc2WeightShape[0],
+            fc2WeightShape[1]);
         return;
     }
 
-    if (outputShape[1] != outputDim)
+#ifdef CUTE_DSL_GEMM_ENABLED
+    // FC1: workspace = SiLU(input @ fc1Weight^T + fc1Bias)
+    if (!CuteDslGemmRunner::runBiasSiLU(input.rawPointer(), fc1Weight.rawPointer(), workspace.rawPointer(),
+            fc1Bias.rawPointer(), numTokens, hiddenDim, inputDim, stream))
     {
-        LOG_ERROR("Output dimension mismatch: expected %ld, got %ld", outputDim, outputShape[1]);
+        LOG_ERROR("FC1 GEMM+bias+SiLU failed");
         return;
     }
 
-    if (outputShape[0] != numTokens || workspaceShape[0] != numTokens)
+    // FC2: output = workspace @ fc2Weight^T + fc2Bias
+    if (!CuteDslGemmRunner::runBias(workspace.rawPointer(), fc2Weight.rawPointer(), output.rawPointer(),
+            fc2Bias.rawPointer(), numTokens, outputDim, hiddenDim, stream))
     {
-        LOG_ERROR("Batch size mismatch: output[0]=%ld, workspace[0]=%ld, expected=%ld", outputShape[0],
-            workspaceShape[0], numTokens);
+        LOG_ERROR("FC2 GEMM+bias failed");
         return;
     }
-
-    if (workspaceShape[1] != hiddenDim)
-    {
-        LOG_ERROR("Workspace dimension mismatch: expected [%ld, %ld], got [%ld, %ld]", numTokens, hiddenDim,
-            workspaceShape[0], workspaceShape[1]);
-        return;
-    }
-
-    auto& cublas = CublasLoader::getInstance();
-    if (!cublas.libHandle)
-    {
-        LOG_ERROR("cuBLAS not available (dlopen failed)");
-        return;
-    }
-
-    cublas.setStream(cublasHandle, stream);
-
-    // PyTorch Linear: output = input @ weight.T + bias
-    // cuBLAS column-major: treat as output^T = weight @ input^T
-    // Use CUBLAS_OP_T on weight (stored row-major) to get weight @ input^T
-    float const alphaF32 = 1.0f;
-    float const betaF32 = 0.0f;
-
-    // FC1 GEMM: workspace = input @ fc1Weight.T
-    int status = cublas.gemmEx(cublasHandle, kCUBLAS_OP_T, kCUBLAS_OP_N, hiddenDim, numTokens, inputDim, &alphaF32,
-        fc1Weight.rawPointer(), CUDA_R_16F, inputDim, input.rawPointer(), CUDA_R_16F, inputDim, &betaF32,
-        workspace.rawPointer(), CUDA_R_16F, hiddenDim, kCUBLAS_COMPUTE_FP32, kCUBLAS_GEMM_DEFAULT_TENSOR_OP);
-
-    if (status != kCUBLAS_STATUS_SUCCESS)
-    {
-        LOG_ERROR("FC1 GEMM failed with status %d", status);
-        return;
-    }
-
-    // Bias + SiLU activation
-    invokeBiasAndSiLU(workspace, fc1Bias, stream);
-
-    // FC2 GEMM: output = workspace @ fc2Weight.T
-    status = cublas.gemmEx(cublasHandle, kCUBLAS_OP_T, kCUBLAS_OP_N, outputDim, numTokens, hiddenDim, &alphaF32,
-        fc2Weight.rawPointer(), CUDA_R_16F, hiddenDim, workspace.rawPointer(), CUDA_R_16F, hiddenDim, &betaF32,
-        output.rawPointer(), CUDA_R_16F, outputDim, kCUBLAS_COMPUTE_FP32, kCUBLAS_GEMM_DEFAULT_TENSOR_OP);
-
-    if (status != kCUBLAS_STATUS_SUCCESS)
-    {
-        LOG_ERROR("FC2 GEMM failed with status %d", status);
-        return;
-    }
-
-    // Add FC2 bias
-    invokeAddBias(output, fc2Bias, stream);
+#else
+    LOG_ERROR("CuTe DSL GEMM not compiled. Rebuild with -DENABLE_CUTE_DSL=gemm (or ALL).");
+    return;
+#endif
 }
 
-void invokeLinearLayer(void* cublasHandle, rt::Tensor const& input, rt::Tensor const& weight, rt::Tensor const& bias,
-    rt::Tensor& output, cudaStream_t stream)
+void invokeLinearLayer(
+    rt::Tensor const& input, rt::Tensor const& weight, rt::Tensor const& bias, rt::Tensor& output, cudaStream_t stream)
 {
     auto inputShape = input.getShape();
     auto outputShape = output.getShape();
@@ -467,42 +363,28 @@ void invokeLinearLayer(void* cublasHandle, rt::Tensor const& input, rt::Tensor c
         return;
     }
 
-    int64_t const numTokens = inputShape[0];
-    int64_t const inputDim = inputShape[1];
-    int64_t const outputDim = weightShape[0];
+    int32_t const numTokens = static_cast<int32_t>(inputShape[0]);
+    int32_t const inputDim = static_cast<int32_t>(inputShape[1]);
+    int32_t const outputDim = static_cast<int32_t>(weightShape[0]);
 
     if (weightShape[1] != inputDim)
     {
-        LOG_ERROR("Weight shape mismatch: expected [%ld, %ld], got [%ld, %ld]", outputDim, inputDim, weightShape[0],
-            weightShape[1]);
+        LOG_ERROR("Weight shape mismatch: expected [*, %d], got [%ld, %ld]", inputDim, weightShape[0], weightShape[1]);
         return;
     }
 
-    auto& cublas = CublasLoader::getInstance();
-    if (!cublas.libHandle)
+#ifdef CUTE_DSL_GEMM_ENABLED
+    // output = input @ weight^T + bias
+    if (!CuteDslGemmRunner::runBias(input.rawPointer(), weight.rawPointer(), output.rawPointer(), bias.rawPointer(),
+            numTokens, outputDim, inputDim, stream))
     {
-        LOG_ERROR("cuBLAS not available (dlopen failed)");
+        LOG_ERROR("Linear layer GEMM+bias failed");
         return;
     }
-
-    cublas.setStream(cublasHandle, stream);
-
-    float const alphaF32 = 1.0f;
-    float const betaF32 = 0.0f;
-
-    // GEMM: output = input @ weight.T
-    // cuBLAS column-major: output^T = weight @ input^T
-    int status = cublas.gemmEx(cublasHandle, kCUBLAS_OP_T, kCUBLAS_OP_N, outputDim, numTokens, inputDim, &alphaF32,
-        weight.rawPointer(), CUDA_R_16F, inputDim, input.rawPointer(), CUDA_R_16F, inputDim, &betaF32,
-        output.rawPointer(), CUDA_R_16F, outputDim, kCUBLAS_COMPUTE_FP32, kCUBLAS_GEMM_DEFAULT_TENSOR_OP);
-
-    if (status != kCUBLAS_STATUS_SUCCESS)
-    {
-        LOG_ERROR("Linear layer GEMM failed with status %d", status);
-        return;
-    }
-
-    invokeAddBias(output, bias, stream);
+#else
+    LOG_ERROR("CuTe DSL GEMM not compiled. Rebuild with -DENABLE_CUTE_DSL=gemm (or ALL).");
+    return;
+#endif
 }
 
 void invokeGather(rt::Tensor const& source, rt::Tensor const& indices, rt::Tensor& output, cudaStream_t stream)

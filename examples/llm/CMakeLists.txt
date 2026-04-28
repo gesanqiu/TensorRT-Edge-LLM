@@ -17,16 +17,24 @@ target_include_directories(llm_build PRIVATE ${ONNX_PARSER_INCLUDE_DIR}
 add_cross_build_link_options(llm_build)
 
 add_executable(llm_inference llm_inference.cpp)
-target_link_libraries(llm_inference PRIVATE edgellmCore edgellmTokenizer
-                                            exampleUtils commonLibraryExt)
+target_link_libraries(llm_inference PRIVATE edgellmCore exampleUtils
+                                            commonLibraryExt)
 target_include_directories(
   llm_inference PRIVATE ${COMMON_INCLUDE_DIRS}
                         ${CMAKE_SOURCE_DIR}/examples/utils)
 add_cross_build_link_options(llm_inference)
+
+add_executable(llm_stream llm_stream.cpp)
+target_link_libraries(llm_stream PRIVATE edgellmCore exampleUtils
+                                         commonLibraryExt)
+target_include_directories(
+  llm_stream PRIVATE ${COMMON_INCLUDE_DIRS} ${CMAKE_SOURCE_DIR}/examples/utils)
+add_cross_build_link_options(llm_stream)
 
 add_executable(llm_bench llm_bench.cpp)
 target_link_libraries(llm_bench PRIVATE commonLibraryExt edgellmCore
                                         exampleUtils)
 target_include_directories(llm_bench PRIVATE ${COMMON_INCLUDE_DIRS}
                                              ${CMAKE_SOURCE_DIR}/examples/utils)
+target_compile_options(llm_bench PRIVATE -Wno-psabi)
 add_cross_build_link_options(llm_bench)

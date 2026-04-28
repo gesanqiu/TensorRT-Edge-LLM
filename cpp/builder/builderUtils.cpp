@@ -142,7 +142,7 @@ std::string printNetworkInfo(nvinfer1::INetworkDefinition const* network, std::s
 }
 
 //! Print detailed information about an optimization profile.
-//! Shows the min, optimal, and max dimensions for each input in the profile.
+//! Shows the min, optimal, and max dimensions for each dynamic input in the profile.
 //! @param profile Optimization profile to analyze
 //! @param profileName Name of the profile for display purposes
 //! @param network TensorRT network definition for input analysis
@@ -153,11 +153,33 @@ std::string printOptimizationProfile(nvinfer1::IOptimizationProfile const* profi
     std::ostringstream oss;
     oss << "Optimization Profile: " << profileName << "\n";
 
-    // Print dimensions for each input in this profile
+    // Print dimensions for each dynamic input in this profile
     for (int j = 0; j < network->getNbInputs(); ++j)
     {
-        char const* inputName = network->getInput(j)->getName();
-        if (inputName != nullptr)
+        auto* input = network->getInput(j);
+        if (input == nullptr)
+        {
+            continue;
+        }
+
+        char const* inputName = input->getName();
+        if (inputName == nullptr)
+        {
+            continue;
+        }
+
+        nvinfer1::Dims const dims = input->getDimensions();
+        bool hasDynamic = false;
+        for (int k = 0; k < dims.nbDims; k++)
+        {
+            if (dims.d[k] == -1)
+            {
+                hasDynamic = true;
+                break;
+            }
+        }
+
+        if (hasDynamic)
         {
             auto minDims = profile->getDimensions(inputName, nvinfer1::OptProfileSelector::kMIN);
             auto optDims = profile->getDimensions(inputName, nvinfer1::OptProfileSelector::kOPT);
@@ -184,6 +206,20 @@ std::string printOptimizationProfile(nvinfer1::IOptimizationProfile const* profi
             maxStr += ")";
 
             oss << "  " << inputName << ": MIN=" << minStr << ", OPT=" << optStr << ", MAX=" << maxStr << "\n";
+        }
+        else
+        {
+            std::string dimStr = "(";
+            for (int k = 0; k < dims.nbDims; ++k)
+            {
+                if (k > 0)
+                {
+                    dimStr += ", ";
+                }
+                dimStr += std::to_string(dims.d[k]);
+            }
+            dimStr += ")";
+            oss << "  " << inputName << ": " << dimStr << "\n";
         }
     }
     return oss.str();

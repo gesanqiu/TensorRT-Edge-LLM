@@ -83,13 +83,20 @@ bool LLMBuilder::build()
     // Print network information
     LOG_DEBUG("%s", printNetworkInfo(network.get(), "LLM").c_str());
 
-    LOG_DEBUG("ONNX parsing complete. mNbKVCacheInputs=%d, mNumMambaLayers=%d", mNbKVCacheInputs, mNumMambaLayers);
+    LOG_DEBUG(
+        "ONNX parsing complete. mNbKVCacheInputs=%d, mNumLinearAttnLayers=%d", mNbKVCacheInputs, mNumLinearAttnLayers);
 
     // Create builder config
     auto config = createBuilderConfig(builder.get());
     if (!config)
     {
         return false;
+    }
+
+    if (mBuilderConfig.profilingDetailed)
+    {
+        config->setProfilingVerbosity(nvinfer1::ProfilingVerbosity::kDETAILED);
+        LOG_INFO("Profiling verbosity set to DETAILED");
     }
 
     LOG_DEBUG("Builder config created. Setting up optimization profiles...");
@@ -215,15 +222,15 @@ bool LLMBuilder::parseConfig()
         mRotaryDim = mHeadSize;
     }
 
-    mNumMambaLayers = mModelConfig.value("num_mamba_layers", 0);
-    mMambaNumHeads = mModelConfig.value("mamba_num_heads", 0);
-    mMambaHeadDim = mModelConfig.value("mamba_head_dim", 0);
-    mSSMStateSize = mModelConfig.value("ssm_state_size", 0);
+    mNumLinearAttnLayers = mModelConfig.value("num_linear_attn_layers", 0);
+    mRecurrentStateNumHeads = mModelConfig.value("recurrent_state_num_heads", 0);
+    mRecurrentStateHeadDim = mModelConfig.value("recurrent_state_head_dim", 0);
+    mRecurrentStateSize = mModelConfig.value("recurrent_state_size", 0);
     mConvDim = mModelConfig.value("conv_dim", 0);
     mConvKernel = mModelConfig.value("conv_kernel", 0);
 
     // For hybrid models, only attention layers have KV caches
-    if (mNumMambaLayers > 0)
+    if (mNumLinearAttnLayers > 0)
     {
         mNbKVCacheInputs = mModelConfig.value("num_attention_layers", mModelConfig["num_hidden_layers"].get<int32_t>());
     }
@@ -319,13 +326,13 @@ bool LLMBuilder::setupCommonProfiles(
     // KV cache profiles
     LOG_DEBUG("Setting up KV cache profiles for %d layers...", mNbKVCacheInputs);
     result &= setupKVCacheProfiles(contextProfile, generationProfile);
-    LOG_DEBUG("KV cache profiles done. Setting up SSM state profiles for %d Mamba layers...", mNumMambaLayers);
+    LOG_DEBUG("KV cache profiles done. Setting up recurrent state profiles for %d layers...", mNumLinearAttnLayers);
 
-    // SSM state profiles for Mamba layers
-    result &= setupSSMStateProfiles(&contextProfile, &generationProfile);
+    // Recurrent state profiles for hybrid layers
+    result &= setupRecurrentStateProfiles(&contextProfile, &generationProfile);
 
-    LOG_DEBUG("SSM state profiles done. Setting up Conv state profiles...");
-    // Conv state profiles for Mamba causal conv1d layers
+    LOG_DEBUG("Recurrent state profiles done. Setting up Conv state profiles...");
+    // Conv state profiles for recurrent causal conv1d layers
     result &= setupConvStateProfiles(&contextProfile, &generationProfile);
     LOG_DEBUG("Conv state profiles done.");
 
@@ -654,39 +661,41 @@ bool LLMBuilder::setupKVCacheProfiles(
     return result;
 }
 
-bool LLMBuilder::setupSSMStateProfiles(
+bool LLMBuilder::setupRecurrentStateProfiles(
     nvinfer1::IOptimizationProfile* const contextProfile, nvinfer1::IOptimizationProfile* const generationProfile)
 {
-    if (mNumMambaLayers == 0)
+    if (mNumLinearAttnLayers == 0)
     {
         return true;
     }
 
     bool result = true;
 
-    // SSM state shape: [batch, mamba_num_heads, mamba_head_dim, ssm_state_size]
-    nvinfer1::Dims minSSMShape = createDims({1, mMambaNumHeads, mMambaHeadDim, mSSMStateSize});
-    nvinfer1::Dims optSSMShape
-        = createDims({mBuilderConfig.maxBatchSize, mMambaNumHeads, mMambaHeadDim, mSSMStateSize});
-    nvinfer1::Dims maxSSMShape
-        = createDims({mBuilderConfig.maxBatchSize, mMambaNumHeads, mMambaHeadDim, mSSMStateSize});
+    // Recurrent state shape: [batch, recurrentNumHeads, recurrentHeadDim, recurrentStateSize]
+    nvinfer1::Dims minRecurrentShape
+        = createDims({1, mRecurrentStateNumHeads, mRecurrentStateHeadDim, mRecurrentStateSize});
+    nvinfer1::Dims optRecurrentShape = createDims(
+        {mBuilderConfig.maxBatchSize, mRecurrentStateNumHeads, mRecurrentStateHeadDim, mRecurrentStateSize});
+    nvinfer1::Dims maxRecurrentShape = createDims(
+        {mBuilderConfig.maxBatchSize, mRecurrentStateNumHeads, mRecurrentStateHeadDim, mRecurrentStateSize});
 
-    for (int32_t i = 0; i < mNumMambaLayers; ++i)
+    for (int32_t i = 0; i < mNumLinearAttnLayers; ++i)
     {
-        std::string const ssmStateName = binding_names::formatSSMStateName(i, /*isPast=*/true);
-        result &= setOptimizationProfile(contextProfile, ssmStateName.c_str(), minSSMShape, optSSMShape, maxSSMShape);
-        result
-            &= setOptimizationProfile(generationProfile, ssmStateName.c_str(), minSSMShape, optSSMShape, maxSSMShape);
+        std::string const recurrentStateName = binding_names::formatRecurrentStateName(i, /*isPast=*/true);
+        result &= setOptimizationProfile(
+            contextProfile, recurrentStateName.c_str(), minRecurrentShape, optRecurrentShape, maxRecurrentShape);
+        result &= setOptimizationProfile(
+            generationProfile, recurrentStateName.c_str(), minRecurrentShape, optRecurrentShape, maxRecurrentShape);
     }
 
-    LOG_DEBUG("Set up SSM state optimization profiles for %d Mamba layers", mNumMambaLayers);
+    LOG_DEBUG("Set up recurrent state optimization profiles for %d recurrent layers", mNumLinearAttnLayers);
     return result;
 }
 
 bool LLMBuilder::setupConvStateProfiles(
     nvinfer1::IOptimizationProfile* const contextProfile, nvinfer1::IOptimizationProfile* const generationProfile)
 {
-    if (mNumMambaLayers == 0 || mConvDim == 0 || mConvKernel == 0)
+    if (mNumLinearAttnLayers == 0 || mConvDim == 0 || mConvKernel == 0)
     {
         return true;
     }
@@ -698,7 +707,7 @@ bool LLMBuilder::setupConvStateProfiles(
     nvinfer1::Dims optConvShape = createDims({mBuilderConfig.maxBatchSize, mConvDim, mConvKernel});
     nvinfer1::Dims maxConvShape = createDims({mBuilderConfig.maxBatchSize, mConvDim, mConvKernel});
 
-    for (int32_t i = 0; i < mNumMambaLayers; ++i)
+    for (int32_t i = 0; i < mNumLinearAttnLayers; ++i)
     {
         std::string const convStateName = binding_names::formatConvStateName(i, /*isPast=*/true);
         result
@@ -707,7 +716,7 @@ bool LLMBuilder::setupConvStateProfiles(
             generationProfile, convStateName.c_str(), minConvShape, optConvShape, maxConvShape);
     }
 
-    LOG_DEBUG("Set up conv state optimization profiles for %d Mamba layers", mNumMambaLayers);
+    LOG_DEBUG("Set up conv state optimization profiles for %d recurrent layers", mNumLinearAttnLayers);
     return result;
 }
 

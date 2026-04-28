@@ -28,7 +28,6 @@
 
 #include "moeMarlin.h"
 #include <cuda_runtime.h>
-#if defined(CUDA_VERSION) && CUDA_VERSION >= 11080
 
 #include "common/checkMacros.h"
 #include "common/cudaUtils.h"
@@ -205,32 +204,3 @@ int64_t getMoeMarlinWorkspaceSize(int64_t numTokensPadded, int64_t outDim, int64
 
 } // namespace kernel
 } // namespace trt_edgellm
-
-#else // CUDA_VERSION < 11080
-
-// Stub implementations when CUDA < 11.8 (Marlin deps unavailable).
-// Throws at runtime if INT4 MoE is used; allows plugin to link on older CUDA.
-#include <stdexcept>
-
-namespace trt_edgellm
-{
-namespace kernel
-{
-
-void moeAwqW4A16MarlinGemm(rt::Tensor const&, rt::Tensor&, rt::Tensor const&, rt::Tensor const&, rt::Tensor const&,
-    rt::Tensor const&, rt::Tensor const&, rt::Tensor const&, rt::Tensor&, int64_t, int64_t, bool, cudaStream_t)
-{
-    throw std::runtime_error(
-        "INT4 MoE Marlin GEMM requires CUDA 11.8 or later. Please use CUDA 11.8+ for INT4 MoE support.");
-}
-
-int64_t getMoeMarlinWorkspaceSize(int64_t, int64_t, int64_t, int64_t)
-{
-    throw std::runtime_error(
-        "INT4 MoE Marlin GEMM requires CUDA 11.8 or later. Please use CUDA 11.8+ for INT4 MoE support.");
-}
-
-} // namespace kernel
-} // namespace trt_edgellm
-
-#endif // CUDA_VERSION >= 11080

@@ -147,38 +147,38 @@ inline constexpr char const* kPresentVCacheTemplate = "present_v_cache";
 
 /*! @} */
 
-/*! @name SSM (Mamba) State Bindings
+/*! @name Recurrent State Bindings (Mamba / GDN / linear-attention layers)
  * @{
  */
 
 /*!
- * @brief Past SSM state tensor template for Mamba layers
+ * @brief Past recurrent state tensor template
  *
- * Template: "ssm_state_{mamba_layer_idx}"
- * Shape: [batch_size, mamba_num_heads, mamba_head_dim, ssm_state_size] (FLOAT16)
+ * Template: "recurrent_state_{recurrent_layer_idx}"
+ * Shape: [batch_size, recurrentNumHeads, recurrentHeadDim, recurrentStateSize]
  */
-inline constexpr char const* kSSMStateTemplate = "ssm_state";
+inline constexpr char const* kRecurrentStateTemplate = "recurrent_state";
 
 /*!
- * @brief Present SSM state tensor template for Mamba layers
+ * @brief Present recurrent state tensor template
  *
- * Template: "present_ssm_state_{mamba_layer_idx}"
- * Shape: [batch_size, mamba_num_heads, mamba_head_dim, ssm_state_size] (FLOAT16)
+ * Template: "present_recurrent_state_{recurrent_layer_idx}"
+ * Shape: [batch_size, recurrentNumHeads, recurrentHeadDim, recurrentStateSize]
  */
-inline constexpr char const* kPresentSSMStateTemplate = "present_ssm_state";
+inline constexpr char const* kPresentRecurrentStateTemplate = "present_recurrent_state";
 
 /*!
- * @brief Past conv state tensor template for Mamba layers
+ * @brief Past conv state tensor template for recurrent layers
  *
- * Template: "conv_state_{mamba_layer_idx}"
+ * Template: "conv_state_{recurrent_layer_idx}"
  * Shape: [batch_size, conv_dim, conv_kernel_size] (FLOAT16)
  */
 inline constexpr char const* kConvStateTemplate = "conv_state";
 
 /*!
- * @brief Present conv state tensor template for Mamba layers
+ * @brief Present conv state tensor template for recurrent layers
  *
- * Template: "present_conv_state_{mamba_layer_idx}"
+ * Template: "present_conv_state_{recurrent_layer_idx}"
  * Shape: [batch_size, conv_dim, conv_kernel_size] (FLOAT16)
  */
 inline constexpr char const* kPresentConvStateTemplate = "present_conv_state";
@@ -473,39 +473,41 @@ inline std::string formatVCacheName(int32_t layerIdx, bool isPast = true)
 }
 
 /*!
- * @brief Format SSM state binding name for a specific Mamba layer
+ * @brief Format recurrent state binding name for a specific recurrent layer
  *
- * @param mambaLayerIdx The Mamba layer index (0-based, only counting Mamba layers)
- * @param isPast Whether this is past (true) or present (false) SSM state
- * @return Formatted binding name like "ssm_state_0" or "present_ssm_state_0"
+ * @param recurrentLayerIdx The recurrent layer index (0-based, only counting recurrent layers)
+ * @param isPast Whether this is past (true) or present (false) recurrent state
+ * @return Formatted binding name like "recurrent_state_0" or "present_recurrent_state_0"
  */
-inline std::string formatSSMStateName(int32_t mambaLayerIdx, bool isPast = true)
+inline std::string formatRecurrentStateName(int32_t recurrentLayerIdx, bool isPast = true)
 {
-    return std::string(isPast ? kSSMStateTemplate : kPresentSSMStateTemplate) + "_" + std::to_string(mambaLayerIdx);
+    return std::string(isPast ? kRecurrentStateTemplate : kPresentRecurrentStateTemplate) + "_"
+        + std::to_string(recurrentLayerIdx);
 }
 
 /*!
- * @brief Check if a binding name is an SSM state tensor
+ * @brief Check if a binding name is a recurrent state tensor
  *
  * @param bindingName The tensor binding name to check
- * @return True if the binding is an SSM state tensor
+ * @return True if the binding is a recurrent state tensor
  */
-inline bool isSSMStateBinding(std::string const& bindingName)
+inline bool isRecurrentStateBinding(std::string const& bindingName)
 {
-    return bindingName.find(kSSMStateTemplate) != std::string::npos
-        || bindingName.find(kPresentSSMStateTemplate) != std::string::npos;
+    return bindingName.find(kRecurrentStateTemplate) != std::string::npos
+        || bindingName.find(kPresentRecurrentStateTemplate) != std::string::npos;
 }
 
 /*!
- * @brief Format conv state binding name for a specific Mamba layer
+ * @brief Format conv state binding name for a specific recurrent layer
  *
- * @param mambaLayerIdx The Mamba layer index (0-based, only counting Mamba layers)
+ * @param recurrentLayerIdx The recurrent layer index (0-based, only counting recurrent layers)
  * @param isPast Whether this is past (true) or present (false) conv state
  * @return Formatted binding name like "conv_state_0" or "present_conv_state_0"
  */
-inline std::string formatConvStateName(int32_t mambaLayerIdx, bool isPast = true)
+inline std::string formatConvStateName(int32_t recurrentLayerIdx, bool isPast = true)
 {
-    return std::string(isPast ? kConvStateTemplate : kPresentConvStateTemplate) + "_" + std::to_string(mambaLayerIdx);
+    return std::string(isPast ? kConvStateTemplate : kPresentConvStateTemplate) + "_"
+        + std::to_string(recurrentLayerIdx);
 }
 
 /*!

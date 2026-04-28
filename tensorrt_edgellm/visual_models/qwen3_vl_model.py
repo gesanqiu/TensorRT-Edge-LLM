@@ -15,40 +15,45 @@
 """
 Qwen3-VL visual model wrapper and export functionality.
 
-This module provides wrapper classes and export functions for Qwen3-VL visual models,
-enabling ONNX export with proper attention mechanism handling.
+This module provides wrapper classes and export functions for Qwen3-family vision encoders
+(``qwen3_vl``, ``qwen3_omni``, ``qwen3_5`` vision encoder), enabling ONNX
+export with proper attention mechanism handling. Deepstack side outputs are included only when
+the checkpoint defines ``deepstack_visual_indexes`` and matching merger modules.
 
 TODO: Input/output names have been aligned with the old multimodal_export.py for compatibility.
       Future refactoring should consider more descriptive names while maintaining backward compatibility.
 """
 
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import torch
-from transformers.models.qwen3_vl.modeling_qwen3_vl import (
-    Qwen3VLVisionAttention, Qwen3VLVisionModel, apply_rotary_pos_emb_vision)
+import torch.nn as nn
+from transformers.models.qwen3_vl.modeling_qwen3_vl import \
+    apply_rotary_pos_emb_vision
 
 from ..llm_models.layers.attention_plugin import (
     register_attention_plugin_onnx_symbolic_functions, vit_attention_plugin)
 from ..onnx_export.onnx_utils import export_onnx
 
 
-class Qwen3VLVisionAttentionPatch(Qwen3VLVisionAttention):
+class Qwen3VLVisionAttentionPatch(nn.Module):
     """
     Patched version of Qwen3-VL vision attention for ONNX export.
     Uses vit attention plugin to support ragged attention via cu_seqlens.
     """
 
-    def __init__(self, attention_module: Qwen3VLVisionAttention) -> None:
+    def __init__(self, attention_module: nn.Module) -> None:
         """
         Initialize the patched attention module.
         
         Args:
             attention_module: Original attention module to extract components from
         """
-        super().__init__(attention_module.config)
+        super().__init__()
         self.qkv = attention_module.qkv
         self.proj = attention_module.proj
+        self.num_heads = attention_module.num_heads
+        self.head_dim = attention_module.head_dim
 
     def forward(
         self,
@@ -102,36 +107,52 @@ class Qwen3VLVisionAttentionPatch(Qwen3VLVisionAttention):
         return attn_output
 
 
-class Qwen3VLVisionModelPatch(Qwen3VLVisionModel):
+class Qwen3VLVisionModelPatch(nn.Module):
     """
-    Patched version of Qwen3VLVisionModel for ONNX export.
-    
-    This class provides a wrapper around the original Qwen3-VL vision transformer
-    with custom blocks that are compatible with ONNX export.
+    Patched vision tower for ONNX export.
+
+    Wraps Hugging Face Qwen3-family vision modules (e.g. ``Qwen3VLVisionModel``,
+    ``Qwen3OmniVisionEncoder``, ``Qwen3_5VisionModel``) while reusing weights and replacing
+    attention with :class:`Qwen3VLVisionAttentionPatch`.
     """
 
-    def __init__(self, original_model: Qwen3VLVisionModel) -> None:
+    def __init__(self, original_model: nn.Module) -> None:
         """
         Initialize the patched vision transformer from original model.
         
         Args:
-            original_model: Original Qwen3VLVisionModel instance
+            original_model: Loaded Qwen3-family vision encoder (see module docstring).
         """
-        super().__init__(original_model.config)
+        super().__init__()
+        self.config = original_model.config
+        self.num_grid_per_side = original_model.num_grid_per_side
 
         # Reuse all original components
         self.patch_embed = original_model.patch_embed
         self.pos_embed = original_model.pos_embed
         self.blocks = original_model.blocks
         self.merger = original_model.merger
-        if original_model.config.model_type == 'qwen3_omni_vision_encoder':
-            self.deepstack_merger_list = original_model.merger_list
-        else:
-            self.deepstack_merger_list = original_model.deepstack_merger_list
+
+        self.deepstack_visual_indexes = list(
+            getattr(original_model, "deepstack_visual_indexes", []))
+        if self.deepstack_visual_indexes:
+            if hasattr(original_model, "deepstack_merger_list"):
+                self.deepstack_merger_list = original_model.deepstack_merger_list
+            elif hasattr(original_model, "merger_list"):
+                # qwen3_omni exposes deepstack mergers as merger_list.
+                self.deepstack_merger_list = original_model.merger_list
+            else:
+                raise ValueError(
+                    "Deepstack visual indexes exist but no deepstack merger list was found."
+                )
 
         # Replace attention modules, reusing existing components to preserve quantization
         for block in self.blocks:
             block.attn = Qwen3VLVisionAttentionPatch(block.attn)
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
 
     def fast_pos_embed_interpolate_optimized(self, grid_thw):
         """
@@ -210,7 +231,7 @@ class Qwen3VLVisionModelPatch(Qwen3VLVisionModel):
         max_seqlen_carrier: torch.Tensor,
         fast_pos_embed_idx: torch.Tensor,
         fast_pos_embed_weight: torch.Tensor,
-    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]:
         """
         Forward pass through the vision transformer.
         
@@ -224,7 +245,7 @@ class Qwen3VLVisionModelPatch(Qwen3VLVisionModel):
 
         Returns:
             `torch.Tensor`: hidden_states.
-            list of `torch.Tensor`: deepstack_feature_lists.
+            (Optional) list of `torch.Tensor`: deepstack_feature_lists.
         """
         hidden_states = self.patch_embed(hidden_states)
 
@@ -246,7 +267,7 @@ class Qwen3VLVisionModelPatch(Qwen3VLVisionModel):
                 max_seqlen_carrier=max_seqlen_carrier,
                 position_embeddings=position_embeddings,
             )
-            if layer_num in self.deepstack_visual_indexes:
+            if self.deepstack_visual_indexes and layer_num in self.deepstack_visual_indexes:
                 deepstack_feature = self.deepstack_merger_list[
                     self.deepstack_visual_indexes.index(layer_num)](
                         hidden_states)
@@ -254,6 +275,8 @@ class Qwen3VLVisionModelPatch(Qwen3VLVisionModel):
 
         hidden_states = self.merger(hidden_states)
 
+        if not self.deepstack_visual_indexes:
+            return hidden_states
         return hidden_states, deepstack_feature_lists
 
 
@@ -263,16 +286,17 @@ def export_qwen3_vl_visual(
     torch_dtype: torch.dtype,
 ) -> None:
     """
-    Export Qwen3-VL visual model to ONNX format.
+    Export Qwen3-family visual model to ONNX format.
     
-    This function takes a patched Qwen3-VL visual model, prepares dummy inputs 
-    for ONNX export, and saves the model in ONNX format.
+    This function takes a patched vision encoder, prepares dummy inputs for ONNX export,
+    and saves the model in ONNX format.
     
     Args:
-        model: Patched Qwen3-VL vision transformer model
+        model: Patched Qwen3-family vision transformer model
         output_dir: Directory to save the exported ONNX model
         torch_dtype: PyTorch data type for the model
     """
+    num_deepstack = len(model.deepstack_visual_indexes)
 
     # Prepare dummy inputs for ONNX export
     hw = 16  # Height * width for the input
@@ -309,10 +333,8 @@ def export_qwen3_vl_visual(
         "input", "rotary_pos_emb", "cu_seqlens", "max_seqlen_carrier",
         "fast_pos_embed_idx", "fast_pos_embed_weight"
     ]
-    # In Qwen3-VL 2B, 4B and 8B, there are 3 deepstack features
-    output_names = [
-        "output", "deepstack_features_0", "deepstack_features_1",
-        "deepstack_features_2"
+    output_names = ["output"] + [
+        f"deepstack_features_{i}" for i in range(num_deepstack)
     ]
 
     # Define dynamic axes for variable input sizes
@@ -340,16 +362,9 @@ def export_qwen3_vl_visual(
         'output': {
             0: 'image_token_len'
         },
-        'deepstack_features_0': {
-            0: 'image_token_len'
-        },
-        'deepstack_features_1': {
-            0: 'image_token_len'
-        },
-        'deepstack_features_2': {
-            0: 'image_token_len'
-        },
     }
+    for i in range(num_deepstack):
+        dynamic_axes[f"deepstack_features_{i}"] = {0: 'image_token_len'}
 
     register_attention_plugin_onnx_symbolic_functions()
     export_onnx(model, inputs, output_dir, input_names, output_names,

@@ -1,0 +1,353 @@
+{
+    "batch_size": 1,
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": 50,
+    "max_generate_length": 128,
+    "requests": [
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "A vision-language model received no image in this request. Explain what tasks it can still perform in one short paragraph."
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "image": "examples/multimodal/pics/woman_and_dog.jpeg"
+                        },
+                        {
+                            "type": "text",
+                            "text": "Please describe the image."
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a concise vision assistant. Answer in exactly two sentences."
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "image": "examples/multimodal/pics/woman_and_dog.jpeg"
+                        },
+                        {
+                            "type": "text",
+                            "text": "Please describe the image in two sentences and mention the interaction between the subjects."
+                        }
+                    ]
+                }
+            ],
+            "save_system_prompt_kv_cache": true
+        },
+        {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a concise vision assistant. Answer in exactly two sentences."
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "image": "examples/multimodal/pics/woman_and_dog.jpeg"
+                        },
+                        {
+                            "type": "text",
+                            "text": "Please describe the image in two sentences and mention the interaction between the subjects."
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "image": "examples/multimodal/pics/red_panda.jpeg"
+                        },
+                        {
+                            "type": "image",
+                            "image": "examples/multimodal/pics/giant_panda.jpeg"
+                        },
+                        {
+                            "type": "text",
+                            "text": "Please compare the following two images."
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "No image is attached. Explain in one paragraph what a multimodal runtime should do in this case."
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "image": "examples/multimodal/pics/red_panda.jpeg"
+                        },
+                        {
+                            "type": "text",
+                            "text": "Describe the animal, the visible environment, and the overall mood of the scene in one paragraph."
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "image": "examples/multimodal/pics/giant_panda.jpeg"
+                        },
+                        {
+                            "type": "text",
+                            "text": "Describe the panda and mention the background details in two to three sentences."
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "image": "examples/multimodal/pics/database_er.jpeg"
+                        },
+                        {
+                            "type": "text",
+                            "text": "Describe this diagram and summarize the main entities and relationships."
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "image": "examples/multimodal/pics/woman_and_dog.jpeg"
+                        },
+                        {
+                            "type": "image",
+                            "image": "examples/multimodal/pics/database_er.jpeg"
+                        },
+                        {
+                            "type": "text",
+                            "text": "Compare the two images and explain how a natural scene differs from a schematic diagram."
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "image": "examples/multimodal/pics/woman_and_dog.jpeg"
+                        },
+                        {
+                            "type": "text",
+                            "text": "Describe the image in one paragraph and focus on the interaction between the subjects."
+                        }
+                    ]
+                }
+            ],
+            "disable_spec_decode": true
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "image": "examples/multimodal/pics/red_panda.jpeg"
+                        },
+                        {
+                            "type": "image",
+                            "image": "examples/multimodal/pics/giant_panda.jpeg"
+                        },
+                        {
+                            "type": "text",
+                            "text": "Compare the two panda images in one paragraph and mention the habitat cues."
+                        }
+                    ]
+                }
+            ],
+            "disable_spec_decode": true
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Explain how a vision-language runtime should profile a text-only request when no image tokens are present."
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "image": "examples/multimodal/pics/red_panda.jpeg"
+                        },
+                        {
+                            "type": "image",
+                            "image": "examples/multimodal/pics/giant_panda.jpeg"
+                        },
+                        {
+                            "type": "text",
+                            "text": "Produce a more detailed comparison of the two panda images, covering color, posture, and environment."
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Answer in exactly two concise sentences."
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "image": "examples/multimodal/pics/red_panda.jpeg"
+                        },
+                        {
+                            "type": "text",
+                            "text": "Describe the image and mention the most visually distinctive features."
+                        }
+                    ]
+                }
+            ],
+            "save_system_prompt_kv_cache": true
+        },
+        {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Answer in exactly two concise sentences."
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "image": "examples/multimodal/pics/red_panda.jpeg"
+                        },
+                        {
+                            "type": "text",
+                            "text": "Describe the image and mention the most visually distinctive features."
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Without any image attached, explain how the runtime should avoid leaking stale visual embeddings from previous requests."
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "image": "examples/multimodal/pics/database_er.jpeg"
+                        },
+                        {
+                            "type": "text",
+                            "text": "Summarize the likely purpose of this database diagram in three sentences."
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "image": "examples/multimodal/pics/database_er.jpeg"
+                        },
+                        {
+                            "type": "image",
+                            "image": "examples/multimodal/pics/woman_and_dog.jpeg"
+                        },
+                        {
+                            "type": "text",
+                            "text": "Compare the abstract structure in the first image with the real-world scene in the second."
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "image": "examples/multimodal/pics/woman_and_dog.jpeg"
+                        },
+                        {
+                            "type": "text",
+                            "text": "Describe the people, the dog, and the setting. Keep the answer to exactly two sentences."
+                        }
+                    ]
+                }
+            ]
+        }
+    ]
+}

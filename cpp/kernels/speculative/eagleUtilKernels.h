@@ -18,6 +18,8 @@
 #pragma once
 
 #include "common/tensor.h"
+#include "kernels/speculative/batchEvictKernels.h" // KVLayerInfo
+#include <NvInferRuntime.h>                        // nvinfer1::DataType
 #include <cstdint>
 
 namespace trt_edgellm
@@ -162,23 +164,52 @@ void prepareEagleBaseTreeDecodingInputsTrtNative(rt::Tensor const& baseTreeDecod
     rt::Tensor const& sequenceStartIndices, rt::Tensor& trtNativeAttentionMask, rt::Tensor& tensorPositionIndices,
     rt::Tensor& selectTokenIndices, rt::Tensor& sequenceContextLengths, cudaStream_t stream);
 
-//! The kernel will commit KVCache and assemble the hidden state inplace according to the accepted indices and accept lengths.
-//! The hidden state will be updated inplace from [batch, verify-tree-size, hidden-dim] to [batch, max-accept-depth, hidden-dim].
-//! This is safe because max-accept-depth << verify-tree-size, so output positions never overwrite unread input data.
+//! Per-head-dim-group batched commit of accepted tokens into the KVCache.
+//!
+//! One launch covers every layer in a single head-dim group. Each layer's storage
+//! is read through `deviceLayerInfos[i]`, which carries the per-layer device pointer,
+//! `numKVHeads`, and `maxSeqLen`. Layers with fewer KV heads than the group's
+//! `maxKVHeads` early-exit on the extra grid columns.
+//!
+//! Callers with hybrid (heterogeneous head-dim) cache layouts should invoke this once
+//! per `HybridCacheManager::KVHeadDimGroupView`. Uniform models invoke it once total.
+//!
 //! Inputs:
-//!     acceptedIndices [GPU, Int32]: The accepted indices with shape [batch, max-depth].
-//!     acceptLengths [GPU, Int32]: The accept lengths with shape [batch].
-//!     kvCacheBuffer [GPU, Half/FP8]: The KVCache buffer with shape [num-layers, max-batch-size, 2, num-heads, max-seq-len, hidden-size-per-head].
-//!     kvCacheLengths [GPU, Int32]: The KVCache lengths with shape [batch].
-//!     hiddenState [GPU, Half]: The hidden state with shape [batch, num-tokens, base-hidden-dim].
-//!     stream: The CUDA stream to execute the kernel.
-//! Outputs:
-//!     kvCacheBuffer [GPU, Half/FP8]: The updated KVCache buffer.
-//!     hiddenState [GPU, Half]: The in-place updated hidden state by the selected tokens.
+//!     acceptedIndices [GPU, Int32]: Accepted indices, shape [batch, max-depth].
+//!     acceptLengths [GPU, Int32]: Accept lengths, shape [batch].
+//!     kvCacheLengths [GPU, Int32]: KVCache lengths, shape [batch].
+//!     deviceLayerInfos: Device-resident array of `KVLayerInfo` (size == numLayers) with each
+//!         entry's `data` pointing to a per-layer buffer of shape
+//!         [maxBatch, 2, numKVHeads_i, maxSeqLen_i, headDim].
+//!     numLayers: Number of KV layers in this head-dim group.
+//!     headDim: Head dimension shared by all layers in this group (currently 64 or 128).
+//!     maxKVHeads: Largest `numKVHeads` across the group's layers (used for grid sizing).
+//!     activeBatchSize: Number of active sequences in the batch.
+//!     maxDepth: max-depth of acceptedIndices (acceptedIndices.shape[1]).
+//!     kvCacheType: Storage dtype of the per-layer buffers (kHALF or kFP8).
+//!     stream: CUDA stream to execute the kernel.
 //!
 //! @throws std::runtime_error if tensors are not located on the GPU, or if datatypes are invalid
-void eagleBaseCommitKVCacheAndAssembleHiddenState(rt::Tensor const& acceptedIndices, rt::Tensor const& acceptLengths,
-    rt::Tensor const& kvCacheLengths, rt::Tensor& kvCacheBuffer, rt::Tensor& hiddenState, cudaStream_t stream);
+void eagleBaseCommitKVCache(rt::Tensor const& acceptedIndices, rt::Tensor const& acceptLengths,
+    rt::Tensor const& kvCacheLengths, KVLayerInfo const* deviceLayerInfos, int32_t numLayers, int32_t headDim,
+    int32_t maxKVHeads, int32_t activeBatchSize, int32_t maxDepth, nvinfer1::DataType kvCacheType,
+    cudaStream_t stream);
+
+//! In-place compact the hidden-state buffer to keep only the accepted tokens.
+//!
+//! Updates `hiddenState` inplace from [batch, verify-tree-size, hidden-dim] to
+//! [batch, max-accept-depth, hidden-dim]. Safe because max-accept-depth << verify-tree-size,
+//! so output positions never overwrite unread input data. Layer-agnostic.
+//!
+//! Inputs:
+//!     acceptedIndices [GPU, Int32]: Accepted indices, shape [batch, max-depth].
+//!     acceptLengths [GPU, Int32]: Accept lengths, shape [batch].
+//!     hiddenState [GPU, Half]: Hidden state, shape [batch, num-tokens, base-hidden-dim].
+//!     stream: CUDA stream to execute the kernel.
+//!
+//! @throws std::runtime_error if tensors are not located on the GPU, or if datatypes are invalid
+void eagleBaseAssembleHiddenState(rt::Tensor const& acceptedIndices, rt::Tensor const& acceptLengths,
+    rt::Tensor& hiddenState, cudaStream_t stream);
 
 //! The kernel will initialize the draft table for a new round of drafting. 
 //! Draft token ids will be translated towards full vocab size. During eagle spec-decode draft tree construction,

@@ -91,11 +91,15 @@ python3 -m venv venv
 source venv/bin/activate
 ```
 
-Then just install the software:
+Then install the dependencies and package:
 
 ```bash
-# Install package with all dependencies
-pip3 install .
+# Install dependencies for legacy tools, quantization, and llm_loader export
+pip3 install -r requirements.txt
+pip3 install -r experimental/llm_loader/requirements.txt
+
+# Install TensorRT Edge-LLM command-line tools
+pip3 install --no-deps .
 ```
 
 This installs all required Python dependencies including:
@@ -103,14 +107,27 @@ This installs all required Python dependencies including:
 - Transformers
 - NVIDIA Model Optimizer
 - ONNX
+- ONNX Script and ONNX GraphSurgeon
 - And all other required dependencies
 
-> **Note:** For specific version requirements, please refer to `requirements.txt` and `pyproject.toml` in the repository root.
+> **Note:** For specific version requirements, please refer to `requirements.txt`, `experimental/llm_loader/requirements.txt`, and `pyproject.toml`.
 
 **3. Verify Installation**
 
+Use a fresh virtual environment for this checkout. The installed dependencies support both the legacy `tensorrt_edgellm` commands and the recommended `experimental.quantization` -> `llm_loader` workflow; do not mix packages from older release branches into the same environment.
+
+The recommended export path uses the checkpoint-based loader (`llm_loader`). Use the quantization package only when you need to create a unified quantized checkpoint from an FP16/BF16 source checkpoint before export:
+
 ```bash
-# Test export tools
+# Verify the recommended quantization and export modules
+export PYTHONPATH=/path/to/TensorRT-Edge-LLM:/path/to/TensorRT-Edge-LLM/experimental:$PYTHONPATH
+python -m experimental.quantization.cli --help
+python -m llm_loader.export_all_cli --help
+```
+
+The legacy export tools are separate compatibility tools; they are not automatically mapped to `llm_loader`. The `tensorrt_edgellm/` folder will be removed in 0.8.0, with full feature parity provided by the `experimental/quantization` -> `experimental/llm_loader` workflow for all models and features.
+
+```bash
 tensorrt-edgellm-export-llm --help
 tensorrt-edgellm-quantize-llm --help
 ```
@@ -121,7 +138,7 @@ Some models on HuggingFace require you to accept terms before downloading. This 
 
 **Models that require HuggingFace login:**
 - Llama family (Llama 3.x)
-- Phi-4 and Phi-4-Multimodal
+- Phi-4-Multimodal
 - Other models marked as "gated" on HuggingFace
 
 **To configure access:**
@@ -224,19 +241,23 @@ cmake .. \
 
 | Option | Description | Default |
 |:-------|:------------|:--------|
-| `TRT_PACKAGE_DIR` | Path to TensorRT installation | Required |
+| `TRT_PACKAGE_DIR` | Path to TensorRT installation. Auto-detected; manual hint to disambiguate multiple versions. | N/A |
 | `CMAKE_TOOLCHAIN_FILE` | **Required for Edge devices**: Use `cmake/aarch64_linux_toolchain.cmake` for Edge device builds. **Not needed for GPU builds** | N/A |
 | `EMBEDDED_TARGET` | **Required for Edge devices**: `jetson-thor` (Jetson) or `auto-thor` (DRIVE / DriveOS). **Not needed for GPU builds** | N/A |
 | `CUDA_CTK_VERSION` | CUDA Toolkit version (such as 13.0). Important for matching target platform. | 13.0 |
 | `BUILD_UNIT_TESTS` | Build unit tests | OFF |
 | `ENABLE_COVERAGE` | Enable gcov code coverage instrumentation (see [Code Coverage](../../developer_guide/testing/code-coverage.md)) | OFF |
-| `ENABLE_CUTE_DSL_FMHA` | Enable CuTe DSL FMHA kernels (SM100/SM110 only, see below) | OFF |
+| `ENABLE_CUTE_DSL` | Enable prebuilt CuTe DSL kernels: `OFF` (default), `ALL`, or a group list such as `gdn`, `fmha`, `gemm`, or `ssd` | OFF |
+| `CUTE_DSL_ARTIFACT_TAG` | Optional artifact tag under `cpp/kernels/cuteDSLArtifact/<arch>/`, for example `sm_110` or `sm_121`. Required when multiple local artifact tags exist for the same CPU architecture. | auto |
 
-**Building with CuTe DSL FMHA (Optional, Blackwell/Thor only)**
+**Building with CuTe DSL Kernels (Optional)**
 
-If **`cuteDSLArtifact/<arch>/`** already contains the static library and headers (`aarch64` for embedded builds, `x86_64` for native x86), add **`-DENABLE_CUTE_DSL_FMHA=ON`** to CMake. Otherwise run **`build_static_lib.py`** as described in **`kernelSrcs/fmha_cutedsl_blackwell/README.md`**, then enable the same option.
+CuTe DSL binaries are prebuilt and shipped with the repository. Add `-DENABLE_CUTE_DSL=ALL` (or a group selection such as `gdn`, `fmha`, `gemm`, or `ssd`) to the CMake configure command when a model or kernel path needs them. Qwen3.5 GDN requires `-DENABLE_CUTE_DSL=gdn` or `-DENABLE_CUTE_DSL=ALL`.
 
-> **For supported GPU architectures and compute capabilities**, see [Supported Models - Platform Compatibility](supported-models.md#platform-compatibility)
+If you have multiple local artifact tags for the same CPU architecture, also
+pass `-DCUTE_DSL_ARTIFACT_TAG=<tag>`.
+
+> **For supported model families, precisions, and hardware notes**, see [Supported Models](supported-models.md).
 
 **5. Build Project**
 

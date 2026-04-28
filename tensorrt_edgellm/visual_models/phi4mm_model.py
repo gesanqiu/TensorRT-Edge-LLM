@@ -52,7 +52,7 @@ class Phi4MMVisionModel(nn.Module):
         # replace the forward function of the embeddings module
         emb = self.vision_model.img_processor.embeddings
 
-        def custom_forward(self, pixel_values):
+        def custom_forward(self, pixel_values, patch_attention_mask=None):
             batch_size = pixel_values.size(0)
             patch_embeds = self.patch_embedding(pixel_values)
             embeddings = patch_embeds.flatten(2).transpose(1, 2)

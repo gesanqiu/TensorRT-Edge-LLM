@@ -155,7 +155,7 @@ void TestContextAttentionAccuracy(std::vector<int32_t> const& cuSeqlens, int32_t
         {
             numCloseWithin1E_3++;
         }
-        if (__hisnan(outHost[i]))
+        if (isnan(__half2float(outHost[i])))
         {
             NanValueDetected = true;
         }
@@ -202,6 +202,8 @@ TEST(ContextAttentionTest, accuracyKVRatio1_Causal)
     TestContextAttentionAccuracy(1, 512, 8, 8, 128, true);
     TestContextAttentionAccuracy(2, 256, 16, 16, 64, true);
     TestContextAttentionAccuracy(4, 512, 4, 4, 128, true);
+    TestContextAttentionAccuracy(1, 512, 4, 4, 256, true);
+    TestContextAttentionAccuracy(1, 64, 4, 4, 256, true);
 }
 
 TEST(ContextAttentionTest, accuracyKVRatio3_Causal)
@@ -217,6 +219,8 @@ TEST(ContextAttentionTest, accuracyKVRatio4_Causal)
     TestContextAttentionAccuracy(1, 132, 32, 8, 64, true);
     TestContextAttentionAccuracy(2, 260, 32, 8, 128, true);
     TestContextAttentionAccuracy(4, 520, 16, 4, 128, true);
+    TestContextAttentionAccuracy(1, 512, 16, 4, 256, true);
+    TestContextAttentionAccuracy(2, 48, 16, 4, 256, true);
 }
 
 TEST(ContextAttentionTest, accuracyKVRatio7_Causal)
@@ -233,6 +237,7 @@ TEST(ContextAttentionTest, accuracyKVRatio8_Causal)
     TestContextAttentionAccuracy(1, 128, 32, 4, 64, true);
     TestContextAttentionAccuracy(2, 256, 16, 2, 128, true);
     TestContextAttentionAccuracy(4, 512, 16, 2, 128, true);
+    TestContextAttentionAccuracy(2, 256, 16, 2, 256, true);
 }
 
 // Long sequence tests
@@ -241,6 +246,7 @@ TEST(ContextAttentionTest, longSequence_Causal)
     TestContextAttentionAccuracy(1, 1024, 12, 4, 128, true);
     TestContextAttentionAccuracy(1, 1024, 12, 2, 128, true);
     TestContextAttentionAccuracy(1, 2048, 24, 3, 64, true);
+    TestContextAttentionAccuracy(1, 1024, 8, 2, 256, true);
 }
 
 // Convenience wrapper for compact layout (variable sequence lengths, non-causal)

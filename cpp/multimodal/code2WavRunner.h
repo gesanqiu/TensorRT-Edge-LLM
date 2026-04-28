@@ -99,9 +99,8 @@ private:
     bool validateAndFillConfig(std::string const& engineDir);
 
     //! \brief Allocate buffers for inference
-    //! \param[in] stream CUDA stream for execution
     //! \return True if allocation succeeded, false otherwise
-    bool allocateBuffer(cudaStream_t stream);
+    bool allocateBuffer();
 
     //! \brief Prepare codes for inference (reshape and copy to device)
     //! \param[in] codes Input RVQ codes [numQuantizers][seqLen]

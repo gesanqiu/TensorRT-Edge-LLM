@@ -29,6 +29,7 @@
 
 #include "preTokenizer.h"
 #include "runtime/llmRuntimeUtils.h"
+#include "runtime/streaming.h"
 #include "tokenEncoder.h"
 
 namespace trt_edgellm
@@ -152,9 +153,24 @@ public:
      * @brief Decode token IDs back to text
      * @param tokens Vector of token IDs
      * @param skipSpecialTokens Whether to skip special tokens in output
-     * @return Decoded text string
+     * @return Decoded text string (well-formed UTF-8; invalid byte sequences
+     *         are replaced with U+FFFD via sanitizeUtf8Streaming/Flush)
      */
     std::string decode(std::vector<Rank> const& tokens, bool skipSpecialTokens = false) const;
+
+    /**
+     * @brief Single-token piece lookup for the streaming hot path.
+     *
+     * Forwards to TokenEncoder::getRankToken with the skip-special policy
+     * applied. Returns an empty string when the token is a special token and
+     * skipSpecialTokens=true, or when rank is unknown (matches the silent-skip
+     * semantics of decode()).
+     *
+     * @param token           Token ID (Rank).
+     * @param skipSpecialTokens Skip special tokens (BOS/EOS/etc).
+     * @return Raw piece bytes (possibly not independently valid UTF-8) or "".
+     */
+    std::string idToPiece(Rank token, bool skipSpecialTokens = true) const;
 
     /**
      * @brief Load tokenizer from HuggingFace model directory
@@ -344,6 +360,36 @@ protected:
     // State
     bool mInitialized; //!< Whether tokenizer is initialized
 };
+
+/*!
+ * @brief Streaming emit: consume newly-arrived token ids and produce valid UTF-8 delta text.
+ *
+ * Looks up the piece bytes for each token in `allTokenIds[s.sentTokenCount..end)`, prepends
+ * `s.pendingBytes`, and passes the concatenated buffer through `sanitizeUtf8Streaming`.
+ * Invalid byte sequences become U+FFFD; trailing incomplete codepoints are held in
+ * `s.pendingBytes` for the next call. `s.sentTokenCount` is advanced unconditionally.
+ *
+ * Contract:
+ *   - Must be called once per iteration per slot, after the iteration has appended its tokens.
+ *   - Output is always well-formed UTF-8.
+ *   - Works for both vanilla (1 new token) and spec-decode (N new tokens) paths.
+ *
+ * @param s             Slot state — modified in place.
+ * @param tok           Tokenizer used for piece lookup (Tokenizer::idToPiece).
+ * @param allTokenIds   Full token id sequence for this slot.
+ * @param skipSpecial   Skip special tokens (true for consumer-facing streaming).
+ * @return Delta text (may be empty if all new bytes were held as incomplete).
+ */
+std::string emitDelta(
+    rt::SlotStreamState& s, Tokenizer const& tok, std::vector<int32_t> const& allTokenIds, bool skipSpecial);
+
+/*!
+ * @brief Final-iteration flush: convert any held incomplete bytes to U+FFFD and clear.
+ *
+ * Called once per slot at finish time when `finishedStates[i]` flips to 1.
+ * Output is well-formed UTF-8 (one U+FFFD per held byte).
+ */
+std::string emitDeltaFlush(rt::SlotStreamState& s);
 
 } // namespace tokenizer
 } // namespace trt_edgellm

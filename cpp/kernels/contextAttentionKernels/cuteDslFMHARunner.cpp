@@ -19,6 +19,7 @@
 
 #include "cuteDslFMHARunner.h"
 
+#include "common/checkMacros.h"
 #include "common/logger.h"
 
 #include <climits>
@@ -31,11 +32,16 @@ namespace trt_edgellm
 // Static member initialization
 // =====================================================================
 
-// LLM
+// LLM (FP16)
 fmha_d64_Kernel_Module_t CuteDslFMHARunner::sLLM_d64 = {};
 fmha_d128_Kernel_Module_t CuteDslFMHARunner::sLLM_d128 = {};
 fmha_d64_sw_Kernel_Module_t CuteDslFMHARunner::sLLM_d64_sw = {};
 fmha_d128_sw_Kernel_Module_t CuteDslFMHARunner::sLLM_d128_sw = {};
+// LLM (FP8 input, FP16 output)
+fmha_d64_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d64_fp8 = {};
+fmha_d128_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d128_fp8 = {};
+fmha_d64_sw_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d64_sw_fp8 = {};
+fmha_d128_sw_fp8_Kernel_Module_t CuteDslFMHARunner::sLLM_d128_sw_fp8 = {};
 bool CuteDslFMHARunner::sLLMLoaded = false;
 std::mutex CuteDslFMHARunner::sLLMMutex;
 
@@ -64,8 +70,12 @@ bool CuteDslFMHARunner::loadLLMKernelModule()
         fmha_d128_Kernel_Module_Load(&sLLM_d128);
         fmha_d64_sw_Kernel_Module_Load(&sLLM_d64_sw);
         fmha_d128_sw_Kernel_Module_Load(&sLLM_d128_sw);
+        fmha_d64_fp8_Kernel_Module_Load(&sLLM_d64_fp8);
+        fmha_d128_fp8_Kernel_Module_Load(&sLLM_d128_fp8);
+        fmha_d64_sw_fp8_Kernel_Module_Load(&sLLM_d64_sw_fp8);
+        fmha_d128_sw_fp8_Kernel_Module_Load(&sLLM_d128_sw_fp8);
         sLLMLoaded = true;
-        LOG_DEBUG("CuTe DSL LLM FMHA kernel modules loaded");
+        LOG_DEBUG("CuTe DSL LLM FMHA kernel modules loaded (FP16 + FP8)");
         return true;
     }
     catch (...)
@@ -84,6 +94,10 @@ void CuteDslFMHARunner::unloadLLMKernelModule()
         fmha_d128_Kernel_Module_Unload(&sLLM_d128);
         fmha_d64_sw_Kernel_Module_Unload(&sLLM_d64_sw);
         fmha_d128_sw_Kernel_Module_Unload(&sLLM_d128_sw);
+        fmha_d64_fp8_Kernel_Module_Unload(&sLLM_d64_fp8);
+        fmha_d128_fp8_Kernel_Module_Unload(&sLLM_d128_fp8);
+        fmha_d64_sw_fp8_Kernel_Module_Unload(&sLLM_d64_sw_fp8);
+        fmha_d128_sw_fp8_Kernel_Module_Unload(&sLLM_d128_sw_fp8);
         sLLMLoaded = false;
     }
 }
@@ -150,33 +164,11 @@ CuteDslFMHARunner::CuteDslFMHARunner(
 {
 }
 
-// =====================================================================
-// LLM run: batched Q + combined KV cache
-// =====================================================================
-
-void CuteDslFMHARunner::run(void const* qPtr, void const* kvPtr, void* oPtr, int32_t const* cuKVSeqLens,
-    cudaStream_t stream, int32_t slidingWindowSize)
-{
-    if (!sLLMLoaded)
-    {
-        LOG_ERROR("CuTe DSL LLM FMHA kernel module not loaded.");
-        return;
-    }
-
-    float const softmaxScale = 1.0f / std::sqrt(static_cast<float>(mHeadDim));
-    float const scaleSoftmaxLog2 = softmaxScale * static_cast<float>(M_LOG2E);
-    float const scaleOutput = 1.0f;
-
-    int32_t const batchSize = mBatchSize;
-    int32_t const seqLenQ = mSeqLenQ;
-    int32_t const numQHeads = mNumHeadsQ;
-    int32_t const numKVHeads = mNumHeadsK;
-    int32_t const headDim = mHeadDim;
-    int32_t const capacity = mKVCacheCapacity;
-
-    bool const useSlidingWindow = (slidingWindowSize < INT_MAX);
-
-    // clang-format off
+// Macro shared by run() and runFp8() — sets up Q/KV/O/cumSeqlenK tensor structs
+// and calls the CuTe DSL wrapper. Relies on local variables: batchSize, seqLenQ,
+// numQHeads, numKVHeads, headDim, capacity, qPtr, kvPtr, oPtr, cuKVSeqLens,
+// scaleQ, scaleK, scaleV, invScaleO, ret.
+// clang-format off
 #define CALL_LLM_FMHA(PREFIX, MODULE, WSL)                                                                             \
     do                                                                                                                 \
     {                                                                                                                  \
@@ -218,49 +210,83 @@ void CuteDslFMHARunner::run(void const* qPtr, void const* kvPtr, void* oPtr, int
                                                                                                                        \
         ret = cute_dsl_##PREFIX##_wrapper(                                                                              \
             &(MODULE), &qTensor, &kvTensor, &oTensor, &cumSeqlenK, (WSL),                                              \
-            scaleSoftmaxLog2, softmaxScale, scaleOutput, stream);                                                       \
+            scaleQ, scaleK, scaleV, invScaleO, stream);                                                                 \
     } while (0)
-    // clang-format on
+// clang-format on
+
+// =====================================================================
+// LLM run: batched Q + combined KV cache (FP16 / FP8→FP16 / FP8→FP8)
+// =====================================================================
+
+void CuteDslFMHARunner::run(void const* qPtr, void const* kvPtr, void* oPtr, int32_t const* cuKVSeqLens,
+    cudaStream_t stream, int32_t slidingWindowSize, bool fp8Input, float qScale, float kScale, float vScale)
+{
+    if (!sLLMLoaded)
+    {
+        LOG_ERROR("CuTe DSL LLM FMHA kernel module not loaded.");
+        return;
+    }
+
+    float const scaleQ = qScale;
+    float const scaleK = kScale;
+    float const scaleV = vScale;
+    float const invScaleO = 1.0f;
+
+    int32_t const batchSize = mBatchSize;
+    int32_t const seqLenQ = mSeqLenQ;
+    int32_t const numQHeads = mNumHeadsQ;
+    int32_t const numKVHeads = mNumHeadsK;
+    int32_t const headDim = mHeadDim;
+    int32_t const capacity = mKVCacheCapacity;
+
+    bool const useSlidingWindow = (slidingWindowSize < INT_MAX);
 
     int32_t ret = -1;
     int32_t constexpr kNoLimit = 1 << 30;
     int32_t const windowSizeLeft = useSlidingWindow ? slidingWindowSize : kNoLimit;
 
-    if (headDim == 64)
-    {
-        if (useSlidingWindow)
-        {
-            CALL_LLM_FMHA(fmha_d64_sw, sLLM_d64_sw, windowSizeLeft);
-        }
-        else
-        {
-            CALL_LLM_FMHA(fmha_d64, sLLM_d64, windowSizeLeft);
-        }
+// Dispatch helper: selects the kernel module pair (non-SW / SW) for a given head dim.
+#define DISPATCH_HEADD(D, NO_SW_PREFIX, NO_SW_MOD, SW_PREFIX, SW_MOD)                                                  \
+    if (headDim == D)                                                                                                  \
+    {                                                                                                                  \
+        if (useSlidingWindow)                                                                                          \
+        {                                                                                                              \
+            CALL_LLM_FMHA(SW_PREFIX, SW_MOD, windowSizeLeft);                                                          \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            CALL_LLM_FMHA(NO_SW_PREFIX, NO_SW_MOD, windowSizeLeft);                                                    \
+        }                                                                                                              \
     }
-    else if (headDim == 128)
+
+    if (fp8Input)
     {
-        if (useSlidingWindow)
+        DISPATCH_HEADD(64, fmha_d64_fp8, sLLM_d64_fp8, fmha_d64_sw_fp8, sLLM_d64_sw_fp8)
+        else DISPATCH_HEADD(128, fmha_d128_fp8, sLLM_d128_fp8, fmha_d128_sw_fp8, sLLM_d128_sw_fp8) else
         {
-            CALL_LLM_FMHA(fmha_d128_sw, sLLM_d128_sw, windowSizeLeft);
-        }
-        else
-        {
-            CALL_LLM_FMHA(fmha_d128, sLLM_d128, windowSizeLeft);
+            LOG_ERROR("CuTe DSL LLM FMHA: unsupported head_dim=%d", headDim);
+            return;
         }
     }
     else
     {
-        LOG_ERROR("CuTe DSL LLM FMHA: unsupported head_dim=%d", headDim);
-        return;
+        DISPATCH_HEADD(64, fmha_d64, sLLM_d64, fmha_d64_sw, sLLM_d64_sw)
+        else DISPATCH_HEADD(128, fmha_d128, sLLM_d128, fmha_d128_sw, sLLM_d128_sw) else
+        {
+            LOG_ERROR("CuTe DSL LLM FMHA: unsupported head_dim=%d", headDim);
+            return;
+        }
     }
 
-#undef CALL_LLM_FMHA
+#undef DISPATCH_HEADD
 
     if (ret != 0)
     {
-        LOG_ERROR("CuTe DSL LLM FMHA kernel (d=%d, sw=%s) failed with error code: %d", headDim,
-            useSlidingWindow ? "true" : "false", ret);
+        LOG_ERROR("CuTe DSL LLM FMHA kernel (d=%d, sw=%s, fp8in=%s) failed with error code: %d", headDim,
+            useSlidingWindow ? "true" : "false", fp8Input ? "true" : "false", ret);
     }
+
+#undef CALL_LLM_FMHA
 }
 
 // =====================================================================

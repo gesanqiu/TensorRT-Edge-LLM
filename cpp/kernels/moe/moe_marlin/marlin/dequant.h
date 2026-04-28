@@ -86,6 +86,8 @@ where `scale_factor * multiplier` can be computed at weight loading.
 */
 
 #pragma once
+#include "common/cudaMacros.h"
+
 #include "marlin_dtypes.cuh"
 
 namespace MARLIN_NAMESPACE_NAME

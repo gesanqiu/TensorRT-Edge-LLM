@@ -1,0 +1,378 @@
+{
+    "batch_size": 1,
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": 50,
+    "max_generate_length": 128,
+    "requests": [
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Explain in two concise paragraphs how speculative decoding differs from standard autoregressive decoding for LLM inference."
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Provide a numbered list of five runtime invariants that should hold during prompt ingestion, prefill, and decode."
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a strict runtime test assistant. Answer with exactly three bullet points."
+                },
+                {
+                    "role": "user",
+                    "content": "Why are repeated prompts useful when validating system prompt KV cache reuse?"
+                }
+            ],
+            "save_system_prompt_kv_cache": true
+        },
+        {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a strict runtime test assistant. Answer with exactly three bullet points."
+                },
+                {
+                    "role": "user",
+                    "content": "Why are repeated prompts useful when validating system prompt KV cache reuse?"
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "In one short paragraph, explain why a runtime may intentionally disable speculative decoding for a request."
+                }
+            ],
+            "disable_spec_decode": true
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Explain why a low draft-token acceptance rate can be informative rather than a bug. Keep the answer to one short paragraph."
+                }
+            ],
+            "disable_spec_decode": true
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Respond in compact JSON with keys stage, risk, and mitigation. Explain one runtime risk in the prefill stage."
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Write a short release note for runtime engineers describing why batching can improve throughput, and end with a one-line caution about latency tradeoffs."
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Answer in exactly two sentences."
+                },
+                {
+                    "role": "user",
+                    "content": "How should a runtime verify that reused prompt state does not change model outputs?"
+                }
+            ],
+            "save_system_prompt_kv_cache": true
+        },
+        {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Answer in exactly two sentences."
+                },
+                {
+                    "role": "user",
+                    "content": "How should a runtime verify that reused prompt state does not change model outputs?"
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Compare prefill and decode in a two-column markdown table with four rows: goal, dominant cost, state touched, and common failure mode."
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Explain batch eviction and index remapping in one paragraph. Mention why preserving original response order matters."
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Use exactly three items, with one sentence per item."
+                },
+                {
+                    "role": "user",
+                    "content": "Name three symptoms of context-length mismatches in an inference runtime."
+                }
+            ],
+            "save_system_prompt_kv_cache": true
+        },
+        {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Use exactly three items, with one sentence per item."
+                },
+                {
+                    "role": "user",
+                    "content": "Name three symptoms of context-length mismatches in an inference runtime."
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Why is greedy decoding useful for runtime parity tests? Answer in one paragraph."
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "List three reasons allocator churn can distort latency measurements in an inference runtime."
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a runtime reviewer. Answer with exactly four bullet points."
+                },
+                {
+                    "role": "user",
+                    "content": "What should be checked before saving a system prompt KV cache for later reuse?"
+                }
+            ],
+            "save_system_prompt_kv_cache": true
+        },
+        {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a runtime reviewer. Answer with exactly four bullet points."
+                },
+                {
+                    "role": "user",
+                    "content": "What should be checked before saving a system prompt KV cache for later reuse?"
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Provide four bullet points that distinguish invalid test inputs from true runtime defects."
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Describe why top-k, top-p, and temperature dispatch should be deterministic in runtime regression tests."
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Summarize why a request-level fallback path still needs parity coverage with the normal runtime path."
+                }
+            ],
+            "disable_spec_decode": true
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Explain parity expectations between vanilla decode and the EAGLE runtime when speculative decoding is disabled for a request."
+                }
+            ],
+            "disable_spec_decode": true
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Give a six-item checklist for same-process reuse testing in an LLM runtime."
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Output exactly the phrase: runtime-path-ok"
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Answer in YAML with keys summary, risk, and next_step."
+                },
+                {
+                    "role": "user",
+                    "content": "Describe a runtime bug caused by stale batch-dependent state."
+                }
+            ],
+            "save_system_prompt_kv_cache": true
+        },
+        {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Answer in YAML with keys summary, risk, and next_step."
+                },
+                {
+                    "role": "user",
+                    "content": "Describe a runtime bug caused by stale batch-dependent state."
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Explain in one paragraph why replacing stale state with a zero-volume tensor can be safer than leaving old indices in place."
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "In two concise paragraphs, describe how stale multimodal state could affect a text-only request if the runtime fails to reset request-scoped state."
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Respond with a JSON array of exactly three short strings naming runtime checks for system prompt cache validation."
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Compare verify tree size and draft step in EAGLE speculative decoding. Keep the answer under 120 words."
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Explain why long prompts need explicit maxInputLen checks even when KV cache capacity is larger."
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Write a short incident note describing a CLI crash caused by assuming formatted requests exist after an early validation failure."
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Give exactly three bullet points describing how to isolate failure-path bugs in request serialization."
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Write one sentence each for prefill, decode, and batch eviction. Keep it to exactly three sentences total."
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Give an eight-item numbered list of checks for a runtime smoke-validation pass."
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Why must response serialization handle early failures where no generated text exists yet?"
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "In one paragraph, explain why LoRA adapter name plumbing still needs validation even when most tests use an empty adapter name."
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Compare batch-size validation failures and input-length validation failures, and explain why they should produce clean user-facing errors."
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "End your answer with a final line that starts with 'Runtime summary:' and briefly states the main risk in long-running same-process tests."
+                }
+            ]
+        },
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Return a single sentence explaining why sequential requests are useful for runtime validation."
+                }
+            ]
+        }
+    ]
+}

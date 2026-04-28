@@ -69,7 +69,8 @@ std::vector<std::pair<int64_t, int64_t>> getAllSupportedAspectRatios(int64_t min
 std::tuple<int64_t, int64_t> computeBestBlockGridForResize(int64_t height, int64_t width,
     int64_t minImageTokensPerImage, int64_t maxImageTokensPerImage, int64_t blockImageSizeH, int64_t blockImageSizeW)
 {
-    // -1 because we add a thumbnail image for each image
+    // -1 to reserve space for a potential thumbnail (always added for Phi4MM; skipped for single-block images in
+    // InternVL)
     int64_t const minImageTiles = std::max<int64_t>(1, minImageTokensPerImage / 256 - 1);
     int64_t const maxImageTiles = std::max<int64_t>(1, maxImageTokensPerImage / 256 - 1);
     auto const targetRatios = getAllSupportedAspectRatios(minImageTiles, maxImageTiles);

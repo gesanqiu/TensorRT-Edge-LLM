@@ -33,6 +33,7 @@ Usage:
 import argparse
 import os
 import sys
+from typing import Tuple
 
 # Add the parent directory to the Python path to import example_datasets
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -48,8 +49,11 @@ from example_datasets.mmmu import (convert_mmmu_dataset,
                                    convert_mmmu_pro_dataset)
 from example_datasets.mmstar import convert_mmstar_dataset
 from example_datasets.mtbench import convert_mtbench_dataset
+from example_datasets.omnibench import convert_omnibench_dataset
+from example_datasets.tts_eval import (convert_minimax_multilingual_dataset,
+                                       convert_seed_tts_eval_dataset)
 
-# Default dataset mappings
+# Default dataset mappings (HuggingFace repo ID or local path)
 DEFAULT_DATASETS = {
     "AIME": "Maxwell-Jia/AIME_2024",
     "GSM8K": "openai/gsm8k",
@@ -61,7 +65,18 @@ DEFAULT_DATASETS = {
     "MMMU_VLMEvalkit": "MMMU/MMMU",
     "MMMU_Pro": "MMMU/MMMU_Pro",
     "MMStar": "Lin-Chen/MMStar",
-    "MTBench": "philschmid/mt-bench"
+    "MTBench": "philschmid/mt-bench",
+    "MiniMaxMultilingual": "MiniMaxAI/TTS-Multilingual-Test-Set",
+    "OmniBench": "m-a-p/OmniBench",
+}
+
+# Datasets that require manual download — no HuggingFace auto-download.
+# Values are user-facing error messages with download instructions.
+LOCAL_ONLY_DATASETS = {
+    "SeedTTSEval":
+    ("SeedTTSEval requires --dataset_name_or_dir pointing to a .lst file "
+     "(e.g. zh/meta.lst, en/meta.lst). Download from: "
+     "https://drive.google.com/file/d/1GlSjVfSHkW3-leKKBlfrjuuTGqQ_xaLP"),
 }
 
 # Default max_generate_length for each dataset
@@ -76,7 +91,10 @@ DEFAULT_MAX_GENERATE_LENGTHS = {
     "MMMU_VLMEvalkit": 8192,
     "MMMU_Pro": 1,
     "MMStar": 512,
-    "MTBench": 512
+    "MTBench": 512,
+    "SeedTTSEval": 2048,
+    "MiniMaxMultilingual": 2048,
+    "OmniBench": 128,
 }
 
 
@@ -84,11 +102,11 @@ def get_dataset_path(dataset_type: str,
                      dataset_name_or_dir: str = None) -> str:
     """
     Determine the dataset path to use, checking for local cache first.
-    
+
     Args:
         dataset_type: Type of dataset (AIME, GSM8K, HumanEval, MATH500, MMLU, MMLU_Pro, MMMU, MMMU_Pro, MMStar, MTBench)
         dataset_name_or_dir: User-specified dataset name or directory
-        
+
     Returns:
         Dataset path to use (local directory or HuggingFace dataset name)
     """
@@ -96,14 +114,41 @@ def get_dataset_path(dataset_type: str,
     if dataset_name_or_dir:
         return dataset_name_or_dir
 
+    # Local-only datasets have no HF default — give a helpful error
+    if dataset_type in LOCAL_ONLY_DATASETS:
+        raise ValueError(LOCAL_ONLY_DATASETS[dataset_type])
+
     # Get default dataset name
     default_name = DEFAULT_DATASETS.get(dataset_type)
     if not default_name:
-        raise ValueError(f"No default dataset name for {dataset_type}")
+        raise ValueError(f"Unknown dataset type: {dataset_type}")
 
     # Fall back to default HuggingFace dataset name
     print(f"Using HuggingFace dataset: {default_name}")
     return default_name
+
+
+def get_default_sampling_params(dataset_type: str) -> Tuple[float, float, int]:
+    """Return (temperature, top_p, top_k) defaults for a given dataset."""
+    if dataset_type in {"OmniBench", "SeedTTSEval", "MiniMaxMultilingual"}:
+        return 0.0, 1.0, 1
+    return 1.0, 1.0, 50
+
+
+def build_dataset_config(args, dataset_type: str) -> DatasetConfig:
+    """Build DatasetConfig with dataset-specific defaults and CLI overrides."""
+    default_temperature, default_top_p, default_top_k = get_default_sampling_params(
+        dataset_type)
+    max_generate_length = (args.max_generate_length
+                           or DEFAULT_MAX_GENERATE_LENGTHS[dataset_type])
+    return DatasetConfig(
+        batch_size=args.batch_size,
+        temperature=(default_temperature
+                     if args.temperature is None else args.temperature),
+        top_p=(default_top_p if args.top_p is None else args.top_p),
+        top_k=(default_top_k if args.top_k is None else args.top_k),
+        max_generate_length=max_generate_length,
+    )
 
 
 def main():
@@ -117,7 +162,8 @@ def main():
                         choices=[
                             "AIME", "GSM8K", "HumanEval", "MATH500", "MMLU",
                             "MMLU_Pro", "MMMU", "MMMU_VLMEvalkit", "MMMU_Pro",
-                            "MMStar", "MTBench"
+                            "MMStar", "MTBench", "SeedTTSEval",
+                            "MiniMaxMultilingual", "OmniBench"
                         ],
                         help="Dataset type to convert")
 
@@ -161,21 +207,24 @@ def main():
 
     parser.add_argument("--temperature",
                         type=float,
-                        default=1.0,
+                        default=None,
                         required=False,
-                        help="Sampling temperature (0.0-2.0)")
+                        help="Sampling temperature (0.0-2.0). Uses the "
+                        "dataset-specific default if not provided.")
 
     parser.add_argument("--top_p",
                         type=float,
-                        default=1.0,
+                        default=None,
                         required=False,
-                        help="Nucleus sampling parameter (0.0-1.0)")
+                        help="Nucleus sampling parameter (0.0-1.0). Uses the "
+                        "dataset-specific default if not provided.")
 
     parser.add_argument("--top_k",
                         type=int,
-                        default=50,
+                        default=None,
                         required=False,
-                        help="Top-k sampling parameter")
+                        help="Top-k sampling parameter (>0). Uses the "
+                        "dataset-specific default if not provided.")
 
     parser.add_argument(
         "--max_generate_length",
@@ -184,6 +233,21 @@ def main():
         help=
         "Maximum number of tokens to generate (uses dataset default if not provided)"
     )
+
+    parser.add_argument(
+        "--language",
+        type=str,
+        default="en",
+        required=False,
+        help="Language for audio benchmarks. SeedTTSEval accepts "
+        "'zh'/'en' or 'chinese'/'english'; MiniMaxMultilingual also accepts "
+        "short codes like 'ja' and dataset names like 'japanese'.")
+
+    parser.add_argument("--max_samples",
+                        type=int,
+                        default=None,
+                        required=False,
+                        help="Limit number of samples for quick testing")
 
     args = parser.parse_args()
 
@@ -197,83 +261,36 @@ def main():
 
         print(f"Dataset source: {dataset_path}")
         print(f"Output directory: {args.output_dir}")
+        config = build_dataset_config(args, args.dataset)
 
         if args.dataset == "AIME":
-            # Create config for AIME
-            max_generate_length = args.max_generate_length or DEFAULT_MAX_GENERATE_LENGTHS[
-                "AIME"]
-            config = DatasetConfig(batch_size=args.batch_size,
-                                   temperature=args.temperature,
-                                   top_p=args.top_p,
-                                   top_k=args.top_k,
-                                   max_generate_length=max_generate_length)
             convert_aime_dataset(config=config,
                                  dataset_name_or_dir=dataset_path,
                                  output_dir=args.output_dir)
 
         elif args.dataset == "GSM8K":
-            # Create config for GSM8K
-            max_generate_length = args.max_generate_length or DEFAULT_MAX_GENERATE_LENGTHS[
-                "GSM8K"]
-            config = DatasetConfig(batch_size=args.batch_size,
-                                   temperature=args.temperature,
-                                   top_p=args.top_p,
-                                   top_k=args.top_k,
-                                   max_generate_length=max_generate_length)
             convert_gsm8k_dataset(config=config,
                                   dataset_name_or_dir=dataset_path,
                                   output_dir=args.output_dir)
 
         elif args.dataset == "MMLU":
-            # Create config for MMLU
-            max_generate_length = args.max_generate_length or DEFAULT_MAX_GENERATE_LENGTHS[
-                "MMLU"]
-            config = DatasetConfig(batch_size=args.batch_size,
-                                   temperature=args.temperature,
-                                   top_p=args.top_p,
-                                   top_k=args.top_k,
-                                   max_generate_length=max_generate_length)
             convert_mmlu_dataset(config=config,
                                  dataset_name_or_dir=dataset_path,
                                  output_dir=args.output_dir,
                                  num_shot=args.num_shot)
 
         elif args.dataset == "MMLU_Pro":
-            # Create config for MMLU-Pro
-            max_generate_length = args.max_generate_length or DEFAULT_MAX_GENERATE_LENGTHS[
-                "MMLU_Pro"]
-            config = DatasetConfig(batch_size=args.batch_size,
-                                   temperature=args.temperature,
-                                   top_p=args.top_p,
-                                   top_k=args.top_k,
-                                   max_generate_length=max_generate_length)
             convert_mmlu_pro_dataset(config=config,
                                      dataset_name_or_dir=dataset_path,
                                      output_dir=args.output_dir,
                                      num_shot=args.num_shot)
 
         elif args.dataset == "MMMU":
-            # Create config for MMMU
-            max_generate_length = args.max_generate_length or DEFAULT_MAX_GENERATE_LENGTHS[
-                "MMMU"]
-            config = DatasetConfig(batch_size=args.batch_size,
-                                   temperature=args.temperature,
-                                   top_p=args.top_p,
-                                   top_k=args.top_k,
-                                   max_generate_length=max_generate_length)
             convert_mmmu_dataset(config=config,
                                  dataset_name_or_dir=dataset_path,
                                  output_dir=args.output_dir)
 
         elif args.dataset == "MMMU_VLMEvalkit":
-            # Create config for MMMU
-            max_generate_length = args.max_generate_length or DEFAULT_MAX_GENERATE_LENGTHS[
-                "MMMU_VLMEvalkit"]
-            config = DatasetConfig(batch_size=args.batch_size,
-                                   temperature=args.temperature,
-                                   top_p=args.top_p,
-                                   top_k=args.top_k,
-                                   max_generate_length=max_generate_length)
             convert_mmmu_dataset(config=config,
                                  dataset_name_or_dir=dataset_path,
                                  output_dir=args.output_dir,
@@ -281,70 +298,63 @@ def main():
 
         elif args.dataset == "MMMU_Pro":
             print(f"Using subset: {args.subset}")
-            # Create config for MMMU_Pro
-            max_generate_length = args.max_generate_length or DEFAULT_MAX_GENERATE_LENGTHS[
-                "MMMU_Pro"]
-            config = DatasetConfig(batch_size=args.batch_size,
-                                   temperature=args.temperature,
-                                   top_p=args.top_p,
-                                   top_k=args.top_k,
-                                   max_generate_length=max_generate_length)
             convert_mmmu_pro_dataset(config=config,
                                      dataset_name_or_dir=dataset_path,
                                      output_dir=args.output_dir,
                                      subset=args.subset)
 
         elif args.dataset == "HumanEval":
-            # Create config for HumanEval
-            max_generate_length = args.max_generate_length or DEFAULT_MAX_GENERATE_LENGTHS[
-                "HumanEval"]
-            config = DatasetConfig(batch_size=args.batch_size,
-                                   temperature=args.temperature,
-                                   top_p=args.top_p,
-                                   top_k=args.top_k,
-                                   max_generate_length=max_generate_length)
             convert_humaneval_dataset(config=config,
                                       dataset_name_or_dir=dataset_path,
                                       output_dir=args.output_dir)
 
         elif args.dataset == "MATH500":
-            # Create config for MATH500
-            max_generate_length = args.max_generate_length or DEFAULT_MAX_GENERATE_LENGTHS[
-                "MATH500"]
-            config = DatasetConfig(batch_size=args.batch_size,
-                                   temperature=args.temperature,
-                                   top_p=args.top_p,
-                                   top_k=args.top_k,
-                                   max_generate_length=max_generate_length)
             convert_math500_dataset(config=config,
                                     dataset_name_or_dir=dataset_path,
                                     output_dir=args.output_dir)
 
         elif args.dataset == "MMStar":
-            # Create config for MMStar
-            max_generate_length = args.max_generate_length or DEFAULT_MAX_GENERATE_LENGTHS[
-                "MMStar"]
-            config = DatasetConfig(batch_size=args.batch_size,
-                                   temperature=args.temperature,
-                                   top_p=args.top_p,
-                                   top_k=args.top_k,
-                                   max_generate_length=max_generate_length)
             convert_mmstar_dataset(config=config,
                                    dataset_name_or_dir=dataset_path,
                                    output_dir=args.output_dir)
 
         elif args.dataset == "MTBench":
-            # Create config for MTBench
-            max_generate_length = args.max_generate_length or DEFAULT_MAX_GENERATE_LENGTHS[
-                "MTBench"]
-            config = DatasetConfig(batch_size=args.batch_size,
-                                   temperature=args.temperature,
-                                   top_p=args.top_p,
-                                   top_k=args.top_k,
-                                   max_generate_length=max_generate_length)
             convert_mtbench_dataset(config=config,
                                     dataset_name_or_dir=dataset_path,
                                     output_dir=args.output_dir)
+
+        elif args.dataset == "SeedTTSEval":
+            if not args.dataset_name_or_dir:
+                raise ValueError(
+                    "SeedTTSEval requires --dataset_name_or_dir pointing to "
+                    "a .lst file (e.g. zh/meta.lst, en/meta.lst)")
+            convert_seed_tts_eval_dataset(config=config,
+                                          dataset_name_or_dir=dataset_path,
+                                          output_dir=args.output_dir,
+                                          language=args.language,
+                                          max_samples=args.max_samples)
+
+        elif args.dataset == "MiniMaxMultilingual":
+            # Auto-download from HuggingFace when no local path is given.
+            if not args.dataset_name_or_dir:
+                from huggingface_hub import snapshot_download
+                dataset_path = snapshot_download(
+                    DEFAULT_DATASETS["MiniMaxMultilingual"],
+                    repo_type="dataset")
+                print(f"Auto-downloaded MiniMaxMultilingual to: "
+                      f"{dataset_path}")
+            convert_minimax_multilingual_dataset(
+                config=config,
+                dataset_name_or_dir=dataset_path,
+                output_dir=args.output_dir,
+                language=args.language,
+                max_samples=args.max_samples)
+
+        elif args.dataset == "OmniBench":
+            convert_omnibench_dataset(config=config,
+                                      dataset_name_or_dir=dataset_path,
+                                      output_dir=args.output_dir,
+                                      max_samples=args.max_samples)
     except Exception as e:
         print(f"Error converting dataset: {e}", file=sys.stderr)
         sys.exit(1)

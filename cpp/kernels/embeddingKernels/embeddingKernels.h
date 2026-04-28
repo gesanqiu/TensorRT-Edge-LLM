@@ -27,26 +27,37 @@ namespace trt_edgellm
 namespace kernel
 {
 
-//! \brief Standard embedding lookup kernel
+//! \brief Unified embedding lookup kernel (supports FP16 and FP8 tables)
+//!
+//! Automatically dispatches to FP16 or FP8 implementation based on the embedding table's datatype.
+//! For FP8 tables, scales must be provided for per-group dequantization.
 //!
 //! \param[in] inputIds Input token IDs with shape [batchSize, seqLen]
-//! \param[in] embeddingTable Embedding table with shape [vocabSize, hiddenSize]
+//! \param[in] embeddingTable Embedding table with shape [vocabSize, hiddenSize] (FP16 or FP8)
+//! \param[in] scales FP32 per-group scales with shape [vocabSize, hiddenSize / blockSize]
+//!                   Required when embeddingTable is FP8, std::nullopt for FP16
 //! \param[out] output Hidden states with shape [batchSize, seqLen, hiddenSize]
 //! \param[in] stream CUDA stream for execution
-//! \throws std::runtime_error if tensor shapes or data types are invalid
-void embeddingLookup(
-    rt::Tensor const& inputIds, rt::Tensor const& embeddingTable, rt::Tensor& output, cudaStream_t stream);
+//! \throws std::runtime_error if tensor shapes or data types are invalid, or FP8 is not supported
+void embeddingLookup(rt::Tensor const& inputIds, rt::Tensor const& embeddingTable, rt::OptionalInputTensor scales,
+    rt::Tensor& output, cudaStream_t stream);
 
-//! \brief Embedding lookup with image embedding insertion following PromptTuningEmbedding logic
+//! \brief Unified embedding lookup with image embedding insertion (supports FP16 and FP8 tables)
+//!
+//! For legacy multimodal models (Qwen2-VL, InternVL) where tokenId > vocabSize indicates image tokens.
+//! Automatically dispatches to FP16 or FP8 implementation based on the embedding table's datatype.
+//! Text tokens use the embedding table, image tokens use FP16 imageEmbeds.
 //!
 //! \param[in] inputIds Input token IDs with shape [batchSize, seqLen]
-//! \param[in] embeddingTable Embedding table with shape [vocabSize, hiddenSize]
-//! \param[in] imageEmbeds Image embeddings with shape [imageTokenLen, hiddenSize]
+//! \param[in] embeddingTable Embedding table with shape [vocabSize, hiddenSize] (FP16 or FP8)
+//! \param[in] scales FP32 per-group scales with shape [vocabSize, hiddenSize / blockSize]
+//!                   Required when embeddingTable is FP8, std::nullopt for FP16
+//! \param[in] imageEmbeds Image embeddings with shape [imageTokenLen, hiddenSize], dtype FP16
 //! \param[out] output Hidden states with shape [batchSize, seqLen, hiddenSize]
 //! \param[in] stream CUDA stream for execution
-//! \throws std::runtime_error if tensor shapes or data types are invalid
+//! \throws std::runtime_error if tensor shapes, data types are invalid, or FP8 is not supported
 void embeddingLookupWithImageInsertion(rt::Tensor const& inputIds, rt::Tensor const& embeddingTable,
-    rt::Tensor const& imageEmbeds, rt::Tensor& output, cudaStream_t stream);
+    rt::OptionalInputTensor scales, rt::Tensor const& imageEmbeds, rt::Tensor& output, cudaStream_t stream);
 
 //! \brief Assemble deepstack embeddings by extracting image token embeddings from deepstack features
 //!
@@ -71,8 +82,9 @@ void assembleDeepstackEmbedding(rt::Tensor const& inputIds, rt::Tensor const& de
     rt::Tensor& deepstackEmbeds, cudaStream_t stream, int32_t imageTokenId = 0,
     rt::OptionalInputTensor multimodalIndices = std::nullopt);
 
-//! \brief Embedding lookup with optional image and audio embeddings for multimodal models
+//! \brief Unified embedding lookup with optional image and audio embeddings (supports FP16 and FP8 tables)
 //!
+//! Automatically dispatches to FP16 or FP8 implementation based on the embedding table's datatype.
 //! This kernel handles up to three types of tokens:
 //! - Normal text tokens (0 <= tokenId < vocabSize): lookup from embeddingTable
 //! - Image tokens (tokenId == imageTokenId): lookup from imageEmbeds using multimodalIndices (optional)
@@ -83,7 +95,9 @@ void assembleDeepstackEmbedding(rt::Tensor const& inputIds, rt::Tensor const& de
 //! To indicate the presence of a modality, both token ID and the corresponding embedding tensor must be provided.
 //!
 //! \param[in] inputIds Input token IDs with shape [batchSize, seqLen]
-//! \param[in] embeddingTable Text embedding table with shape [vocabSize, hiddenSize]
+//! \param[in] embeddingTable Text embedding table with shape [vocabSize, hiddenSize] (FP16 or FP8)
+//! \param[in] scales FP32 per-group scales with shape [vocabSize, hiddenSize / blockSize]
+//!                   Required when embeddingTable is FP8, std::nullopt for FP16
 //! \param[in] multimodalIndices Pre-computed indices for audio/image embeddings [batchSize, seqLen],
 //!                              can be std::nullopt if no image/audio inputs are provided
 //! \param[in] imageTokenId Special token ID for image (e.g., 151655 in Qwen3), or std::nullopt if no image
@@ -97,9 +111,11 @@ void assembleDeepstackEmbedding(rt::Tensor const& inputIds, rt::Tensor const& de
 //! \note Embeddings should contain data in the order specified by multimodalIndices
 //! \note When a modality is not needed, pass std::nullopt for both its tokenId and embeds
 //! \note multimodalIndices can be std::nullopt only when both imageEmbeds and audioEmbeds are std::nullopt
+//! \throws std::runtime_error if tensor shapes, data types are invalid, or FP8 is not supported
 void embeddingLookupMultimodal(rt::Tensor const& inputIds, rt::Tensor const& embeddingTable,
-    rt::OptionalInputTensor multimodalIndices, std::optional<int32_t> imageTokenId, rt::OptionalInputTensor imageEmbeds,
-    std::optional<int32_t> audioTokenId, rt::OptionalInputTensor audioEmbeds, rt::Tensor& output, cudaStream_t stream);
+    rt::OptionalInputTensor scales, rt::OptionalInputTensor multimodalIndices, std::optional<int32_t> imageTokenId,
+    rt::OptionalInputTensor imageEmbeds, std::optional<int32_t> audioTokenId, rt::OptionalInputTensor audioEmbeds,
+    rt::Tensor& output, cudaStream_t stream);
 
 } // namespace kernel
 } // namespace trt_edgellm

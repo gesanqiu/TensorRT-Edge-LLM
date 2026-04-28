@@ -19,8 +19,11 @@
 #include "common/mmapReader.h"
 #include "multimodal/audioRunner.h"
 #include "multimodal/internViTRunner.h"
+#include "multimodal/nemotronOmniAudioRunner.h"
+#include "multimodal/nemotronOmniViTRunner.h"
 #include "multimodal/phi4mmViTRunner.h"
 #include "multimodal/qwenViTRunner.h"
+#include "profiling/layerProfiler.h"
 #include "profiling/metrics.h"
 #include "profiling/timer.h"
 #include <algorithm>
@@ -47,13 +50,49 @@ MultimodalRunner::MultimodalRunner(std::string const& engineDir, cudaStream_t st
     mVisualEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
         mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
 
-    // Create context and set optimization profile
-    mContext = std::unique_ptr<nvinfer1::IExecutionContext>(mVisualEngine->createExecutionContext());
-    if (!mContext->setOptimizationProfileAsync(0, stream))
+    // Create context with user-managed memory (no device memory allocated here).
+    // The context object is needed by subclasses for tensor binding during initialization.
+    // Device memory must be provided via setContextMemory() before infer().
+    mVisualContext = std::unique_ptr<nvinfer1::IExecutionContext>(
+        mVisualEngine->createExecutionContext(nvinfer1::ExecutionContextAllocationStrategy::kUSER_MANAGED));
+    if (!mVisualContext->setOptimizationProfileAsync(0, stream))
     {
-        LOG_ERROR("Failed to set optimization profile to the engine");
-        throw std::runtime_error("Failed to set optimization profile to the engine");
+        throw std::runtime_error("Failed to set optimization profile for visual engine");
     }
+
+    if (trt_edgellm::layerProfiler::LayerProfiler::getInstance().isEnabled())
+    {
+        mVisualContext->setProfiler(&trt_edgellm::layerProfiler::LayerProfiler::getInstance());
+    }
+}
+
+int64_t MultimodalRunner::getRequiredContextMemorySize() const
+{
+    auto* engine = mAudioEngine ? mAudioEngine.get() : mVisualEngine.get();
+    return engine ? engine->getDeviceMemorySizeV2() : 0;
+}
+
+bool MultimodalRunner::setContextMemory(rt::Tensor& sharedContextMemory)
+{
+    // Pick the audio pair for audio-only runners, otherwise the visual pair.
+    // If neither is populated there is nothing to configure (e.g. default-constructed runner).
+    auto* engine = mAudioEngine ? mAudioEngine.get() : mVisualEngine.get();
+    auto* context = mAudioEngine ? mAudioContext.get() : mVisualContext.get();
+    if (!engine)
+    {
+        return true;
+    }
+
+    int64_t const requiredSize = getRequiredContextMemorySize();
+    if (sharedContextMemory.getMemoryCapacity() < requiredSize)
+    {
+        LOG_ERROR("Shared context memory (%zu bytes) is smaller than required (%zu bytes)",
+            static_cast<size_t>(sharedContextMemory.getMemoryCapacity()), static_cast<size_t>(requiredSize));
+        return false;
+    }
+
+    context->setDeviceMemoryV2(sharedContextMemory.rawPointer(), sharedContextMemory.getMemoryCapacity());
+    return true;
 }
 
 std::unique_ptr<MultimodalRunner> MultimodalRunner::create(std::string const& multimodalEngineDir,
@@ -84,7 +123,7 @@ std::unique_ptr<MultimodalRunner> MultimodalRunner::create(std::string const& mu
     multimodal::ModelType modelType = multimodal::stringToModelType(modelTypeStr);
 
     if (modelType == multimodal::ModelType::QWEN2_VL || modelType == multimodal::ModelType::QWEN2_5_VL
-        || modelType == multimodal::ModelType::QWEN3_VL)
+        || modelType == multimodal::ModelType::QWEN3_VL || modelType == multimodal::ModelType::QWEN3_5)
     {
         multimodalRunner
             = std::make_unique<QwenViTRunner>(multimodalEngineDir, llmMaxBatchSize, llmMaxPositionEmbeddings, stream);
@@ -106,6 +145,14 @@ std::unique_ptr<MultimodalRunner> MultimodalRunner::create(std::string const& mu
     else if (modelType == multimodal::ModelType::PHI4MM)
     {
         multimodalRunner = std::make_unique<Phi4MMViTRunner>(multimodalEngineDir, stream);
+    }
+    else if (modelType == multimodal::ModelType::NEMOTRON_OMNI_VISION_ENCODER)
+    {
+        multimodalRunner = std::make_unique<NemotronOmniViTRunner>(multimodalEngineDir, stream);
+    }
+    else if (modelType == multimodal::ModelType::NEMOTRON_OMNI_AUDIO_ENCODER)
+    {
+        multimodalRunner = std::make_unique<NemotronOmniAudioRunner>(multimodalEngineDir, stream);
     }
     else
     {

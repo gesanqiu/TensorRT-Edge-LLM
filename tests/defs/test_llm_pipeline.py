@@ -26,9 +26,11 @@ from conftest import EnvironmentConfig, RemoteConfig
 from pytest_helpers import timer_context
 
 from .config import ModelType, TaskType, TestConfig
-from .utils.command_execution import (execute_benchmark_test,
+from .utils.command_execution import (check_result_failures,
                                       execute_build_test,
-                                      execute_inference_test)
+                                      execute_e2e_bench_test,
+                                      execute_inference_test,
+                                      execute_kernel_bench_test)
 
 
 class TestLLMPipeline:
@@ -49,21 +51,40 @@ class TestLLMPipeline:
             if not result['success']:
                 pytest.fail(f"Build failed: {result['error']}")
 
-    def test_benchmark(self, test_param: str, executable_files: Dict[str, str],
+    def test_e2e_bench(self, test_param: str, executable_files: Dict[str, str],
                        remote_config: Optional[RemoteConfig],
                        test_logger: logging.Logger,
                        env_config: EnvironmentConfig) -> None:
-        """Test performance benchmarking for LLM models."""
+        """Test end-to-end benchmarking for LLM models."""
         config = TestConfig.from_param_string(test_param, ModelType.LLM,
-                                              TaskType.BENCHMARK, env_config)
+                                              TaskType.E2E_BENCH, env_config)
 
-        with timer_context(f"LLM benchmark for {config.model_name}",
+        with timer_context(f"LLM e2e_bench for {config.model_name}",
                            test_logger):
-            result = execute_benchmark_test(config, executable_files,
+            result = execute_e2e_bench_test(config, executable_files,
                                             remote_config, test_logger,
                                             env_config)
             if not result['success']:
-                pytest.fail(f"Benchmark failed: {result['error']}")
+                pytest.fail(f"e2e_bench failed: {result['error']}")
+            check_result_failures(result)
+
+    def test_kernel_bench(self, test_param: str, executable_files: Dict[str,
+                                                                        str],
+                          remote_config: Optional[RemoteConfig],
+                          test_logger: logging.Logger,
+                          env_config: EnvironmentConfig) -> None:
+        """Test kernel-level benchmarking with llm_bench."""
+        config = TestConfig.from_param_string(test_param, ModelType.LLM,
+                                              TaskType.KERNEL_BENCH,
+                                              env_config)
+
+        with timer_context(f"kernel_bench for {config.model_name}",
+                           test_logger):
+            result = execute_kernel_bench_test(config, executable_files,
+                                               remote_config, test_logger,
+                                               env_config)
+            if not result['success']:
+                pytest.fail(f"kernel_bench failed: {result['error']}")
 
     def test_inference(self, test_param: str, executable_files: Dict[str, str],
                        remote_config: Optional[RemoteConfig],
@@ -80,3 +101,4 @@ class TestLLMPipeline:
                                             env_config)
             if not result['success']:
                 pytest.fail(f"Inference failed: {result['error']}")
+            check_result_failures(result)

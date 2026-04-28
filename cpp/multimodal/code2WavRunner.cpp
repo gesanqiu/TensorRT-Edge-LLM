@@ -90,7 +90,7 @@ Code2WavRunner::Code2WavRunner(std::string const& engineDir, cudaStream_t stream
         throw;
     }
 
-    if (!allocateBuffer(stream))
+    if (!allocateBuffer())
     {
         throw std::runtime_error("Failed to allocate buffers");
     }
@@ -170,7 +170,7 @@ bool Code2WavRunner::validateAndFillConfig(std::string const& engineDir)
     return true;
 }
 
-bool Code2WavRunner::allocateBuffer(cudaStream_t stream)
+bool Code2WavRunner::allocateBuffer()
 {
     if (!mCode2WavEngine || !mCode2WavContext)
     {

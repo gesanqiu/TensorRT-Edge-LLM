@@ -43,32 +43,31 @@ namespace kernel
 //!     ↓
 //!   output [N, 1024]
 //!
-//! \param[in] cublasHandle cuBLAS handle for GEMM operations
-//! \param[in] input Input tensor with shape [numTokens, 2048] (FP16)
-//! \param[in] fc1Weight FC1 weight matrix with shape [2048, 2048] (FP16, column-major)
-//! \param[in] fc1Bias FC1 bias vector with shape [2048] (FP16)
-//! \param[in] fc2Weight FC2 weight matrix with shape [2048, 1024] (FP16, column-major)
-//! \param[in] fc2Bias FC2 bias vector with shape [1024] (FP16)
-//! \param[out] output Output tensor with shape [numTokens, 1024] (FP16)
-//! \param[in,out] workspace Workspace buffer for intermediate FC1 output [numTokens, 2048] (FP16)
-//! \param[in] stream CUDA stream for execution
+//! GEMM is performed via CuTe DSL compiled kernels (FP16 I/O, FP32 accumulation).
 //!
-//! \note Weight matrices are stored in column-major format (cuBLAS convention)
-//! \note Workspace must be pre-allocated with size [numTokens, 2048] * sizeof(half)
-void invokeTalkerMLP(void* cublasHandle, rt::Tensor const& input, rt::Tensor const& fc1Weight,
-    rt::Tensor const& fc1Bias, rt::Tensor const& fc2Weight, rt::Tensor const& fc2Bias, rt::Tensor& output,
-    rt::Tensor& workspace, cudaStream_t stream);
+//! \param[in] input Input tensor with shape [numTokens, inputDim] (FP16)
+//! \param[in] fc1Weight FC1 weight matrix with shape [hiddenDim, inputDim] (FP16, row-major)
+//! \param[in] fc1Bias FC1 bias vector with shape [hiddenDim] (FP16)
+//! \param[in] fc2Weight FC2 weight matrix with shape [outputDim, hiddenDim] (FP16, row-major)
+//! \param[in] fc2Bias FC2 bias vector with shape [outputDim] (FP16)
+//! \param[out] output Output tensor with shape [numTokens, outputDim] (FP16)
+//! \param[in,out] workspace Workspace buffer for intermediate FC1 output [numTokens, hiddenDim] (FP16)
+//! \param[in] stream CUDA stream for execution
+void invokeTalkerMLP(rt::Tensor const& input, rt::Tensor const& fc1Weight, rt::Tensor const& fc1Bias,
+    rt::Tensor const& fc2Weight, rt::Tensor const& fc2Bias, rt::Tensor& output, rt::Tensor& workspace,
+    cudaStream_t stream);
 
 //! \brief Single linear layer: output = input @ weight.T + bias
 //!
-//! \param[in] cublasHandle cuBLAS handle for GEMM operations
+//! GEMM is performed via CuTe DSL compiled kernels (FP16 I/O, FP32 accumulation).
+//!
 //! \param[in] input Input tensor with shape [N, inputDim] (FP16)
 //! \param[in] weight Weight matrix with shape [outputDim, inputDim] (FP16, row-major)
 //! \param[in] bias Bias vector with shape [outputDim] (FP16)
 //! \param[out] output Output tensor with shape [N, outputDim] (FP16)
 //! \param[in] stream CUDA stream for execution
-void invokeLinearLayer(void* cublasHandle, rt::Tensor const& input, rt::Tensor const& weight, rt::Tensor const& bias,
-    rt::Tensor& output, cudaStream_t stream);
+void invokeLinearLayer(
+    rt::Tensor const& input, rt::Tensor const& weight, rt::Tensor const& bias, rt::Tensor& output, cudaStream_t stream);
 
 //! \brief Gather operation: select rows from source tensor by indices
 //!

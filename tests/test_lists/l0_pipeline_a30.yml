@@ -1,27 +1,46 @@
-# L0 Pipeline Tests - Core pipeline functionality smoke tests  
+# L0 Pipeline Tests - A30 (SM80 Ampere)
+# Covers: FP16, INT4_AWQ, INT4_GPTQ, INT8_SQ precisions
+# Model families: Qwen2.5, Qwen3, Qwen3-VL, InternVL3
 
-# Core functionality tests
 tests:
   - tests/defs/test_common.py::test_build_project
   - tests/defs/test_common.py::test_unit_tests
-  # FP16 LLM tests
+
+  # === Qwen2.5-0.5B FP16 (base LLM: build + basic + MMLU + kernel_bench) ===
   - tests/defs/test_llm_pipeline.py::test_engine_build[Qwen2.5-0.5B-Instruct-fp16-mxsl4096-mxbs4-mxil2048]
   - tests/defs/test_llm_pipeline.py::test_inference[Qwen2.5-0.5B-Instruct-fp16-mxsl4096-mxbs4-mxil2048-llm_basic]
-  # FP16 LLM tests with LoRA
+  - tests/defs/test_llm_pipeline.py::test_inference[Qwen2.5-0.5B-Instruct-fp16-mxsl4096-mxbs4-mxil2048-mmlu_0-bs4]
+  - tests/defs/test_llm_pipeline.py::test_kernel_bench[Qwen2.5-0.5B-Instruct-fp16-mxsl4096-mxbs4-mxil2048-mode_prefill-il128]
+  - tests/defs/test_llm_pipeline.py::test_kernel_bench[Qwen2.5-0.5B-Instruct-fp16-mxsl4096-mxbs4-mxil2048-mode_decode-pkv128]
+
+  # === Qwen2.5-0.5B FP16 + LoRA ===
   - tests/defs/test_llm_pipeline.py::test_engine_build[Qwen2.5-0.5B-Instruct-fp16-mxsl4096-mxbs4-mxil2048-mxlr64]
   - tests/defs/test_llm_pipeline.py::test_inference[Qwen2.5-0.5B-Instruct-fp16-mxsl4096-mxbs4-mxil2048-mxlr64-llm_lora]
-  # MMLU accuracy tests for LLM
-  - tests/defs/test_llm_pipeline.py::test_inference[Qwen2.5-0.5B-Instruct-fp16-mxsl4096-mxbs4-mxil2048-mmlu_0-bs4]
-  # INT4 VLM tests (Qwen3-VL-2B)
-  - tests/defs/test_vlm_pipeline.py::test_engine_build[Qwen3-VL-2B-Instruct-int4_awq-mxsl8192-mxbs2-mxil8192-mnit128-mxit8192-mxpiit512]
-  - tests/defs/test_vlm_pipeline.py::test_inference[Qwen3-VL-2B-Instruct-int4_awq-mxsl8192-mxbs2-mxil8192-mnit128-mxit8192-mxpiit512-vlm_basic]
-  # INT4_GPTQ VLM tests (InternVL3-1B)
+
+  # === Qwen2.5-0.5B FP16 + TRT native attention (OOTB) ===
+  - tests/defs/test_llm_pipeline.py::test_engine_build[Qwen2.5-0.5B-Instruct-fp16-mxsl4096-mxbs2-mxil2048-ootb]
+  - tests/defs/test_llm_pipeline.py::test_inference[Qwen2.5-0.5B-Instruct-fp16-mxsl4096-mxbs2-mxil2048-ootb-llm_basic]
+
+  # === Qwen3-0.6B INT8_SQ (INT8 SmoothQuant + accuracy) ===
+  - tests/defs/test_llm_pipeline.py::test_engine_build[Qwen3-0.6B-INT8-SQ-int8_sq-mxsl8192-mxbs2-mxil8192]
+  - tests/defs/test_llm_pipeline.py::test_inference[Qwen3-0.6B-INT8-SQ-int8_sq-mxsl8192-mxbs2-mxil8192-mmlu_5-bs2]
+
+  # === Qwen3-VL-2B INT4_AWQ (VLM: Qwen3-VL architecture) ===
+  - tests/defs/test_vlm_pipeline.py::test_engine_build[Qwen3-VL-2B-Instruct-INT4-AWQ-int4_awq-mxsl8192-mxbs2-mxil8192-mnit128-mxit8192-mxpiit512]
+  - tests/defs/test_vlm_pipeline.py::test_inference[Qwen3-VL-2B-Instruct-INT4-AWQ-int4_awq-mxsl8192-mxbs2-mxil8192-mnit128-mxit8192-mxpiit512-vlm_basic]
+
+  # === InternVL3-1B INT4_GPTQ (VLM: InternVL architecture + MMMU accuracy) ===
   - tests/defs/test_vlm_pipeline.py::test_engine_build[InternVL3-1B-GPTQ-Int4-int4_gptq-mxsl12288-mxbs2-mxil12288-mnit256-mxit12288-mxpiit1792]
   - tests/defs/test_vlm_pipeline.py::test_inference[InternVL3-1B-GPTQ-Int4-int4_gptq-mxsl12288-mxbs2-mxil12288-mnit256-mxit12288-mxpiit1792-vlm_basic]
-  # INT8 LLM tests
-  - tests/defs/test_llm_pipeline.py::test_engine_build[Qwen3-0.6B-int8_sq-mxsl8192-mxbs2-mxil8192]
-  - tests/defs/test_llm_pipeline.py::test_inference[Qwen3-0.6B-int8_sq-mxsl8192-mxbs2-mxil8192-mmlu_5-bs2]
+  - tests/defs/test_vlm_pipeline.py::test_inference[InternVL3-1B-GPTQ-Int4-int4_gptq-mxsl12288-mxbs2-mxil12288-mnit256-mxit12288-mxpiit1792-mmmu-bs2]
 
-  # FP16 LLM tests with TRT native attention
-  - tests/defs/test_llm_pipeline.py::test_engine_build[Qwen2.5-0.5B-Instruct-fp16-mxsl4096-mxbs4-mxil2048-ootb]
-  - tests/defs/test_llm_pipeline.py::test_inference[Qwen2.5-0.5B-Instruct-fp16-mxsl4096-mxbs4-mxil2048-ootb-llm_basic]
+  # === Experimental Python Server (pybind E2E) ===
+  - tests/defs/test_server_pipeline.py::test_build_pybind
+  # Low-level pybind runtime tests (LLM + VLM + streaming)
+  - tests/defs/test_server_pipeline.py::TestServerPipeline::test_server_inference[Qwen2.5-0.5B-Instruct-fp16-mxsl4096-mxbs4-mxil2048-llm_basic]
+  - tests/defs/test_server_pipeline.py::TestServerPipeline::test_server_inference[Qwen3-VL-2B-Instruct-INT4-AWQ-int4_awq-mxsl8192-mxbs2-mxil8192-mnit128-mxit8192-mxpiit512-vlm_basic]
+  - tests/defs/test_server_pipeline.py::TestServerPipeline::test_server_streaming[Qwen2.5-0.5B-Instruct-fp16-mxsl4096-mxbs4-mxil2048-llm_basic]
+  # High-level API tests (LLM.generate + LLM.generate_stream)
+  - tests/defs/test_server_pipeline.py::TestHLAPI::test_hlapi_generate[Qwen2.5-0.5B-Instruct-fp16-mxsl4096-mxbs4-mxil2048-llm_basic]
+  - tests/defs/test_server_pipeline.py::TestHLAPI::test_hlapi_generate[Qwen3-VL-2B-Instruct-INT4-AWQ-int4_awq-mxsl8192-mxbs2-mxil8192-mnit128-mxit8192-mxpiit512-vlm_basic]
+  - tests/defs/test_server_pipeline.py::TestHLAPI::test_hlapi_streaming[Qwen2.5-0.5B-Instruct-fp16-mxsl4096-mxbs4-mxil2048-llm_basic]

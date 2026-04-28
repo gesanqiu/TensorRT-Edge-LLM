@@ -1,8 +1,51 @@
 # LoRA (Low-Rank Adaptation)
 
-## Overview
+TensorRT Edge-LLM supports LoRA through the checkpoint-based `llm_loader` path and through the legacy `tensorrt_edgellm` export tools. Use `llm_loader` for new dynamic LoRA workflows.
 
-TensorRT Edge-LLM supports two approaches for using LoRA adapters:
+## Recommended: Checkpoint-Based Loader
+
+This path exports the base checkpoint with `llm_loader`, inserts LoRA inputs into the ONNX graph, and processes HuggingFace adapter weights for runtime loading.
+
+```bash
+export PYTHONPATH=/path/to/TensorRT-Edge-LLM:/path/to/TensorRT-Edge-LLM/experimental:$PYTHONPATH
+
+# Step 1: Export base model
+python -m llm_loader.export_all_cli \
+  /path/to/model \
+  /tmp/onnx_output
+
+# Step 2: Insert LoRA support into ONNX (creates lora_model.onnx)
+python -m llm_loader.lora.insert_lora_cli \
+  --onnx_dir /tmp/onnx_output/llm
+
+# Step 3: Process each LoRA adapter
+python -m llm_loader.lora.process_lora_weights_cli \
+  --input_dir /path/to/adapter1 \
+  --output_dir /tmp/onnx_output/llm/lora_weights/adapter1
+
+python -m llm_loader.lora.process_lora_weights_cli \
+  --input_dir /path/to/adapter2 \
+  --output_dir /tmp/onnx_output/llm/lora_weights/adapter2
+
+# Step 4: Build engine with LoRA support
+./build/examples/llm/llm_build \
+  --onnxDir /tmp/onnx_output/llm \
+  --engineDir engines \
+  --maxBatchSize 1 \
+  --maxLoraRank 64
+
+# Step 5: Run inference with adapter selection (see Input Format below)
+./build/examples/llm/llm_inference \
+  --engineDir engines \
+  --inputFile input.json \
+  --outputFile output.json
+```
+
+---
+
+## Alternative: Legacy Export Tools
+
+The legacy `tensorrt_edgellm` tools remain available for compatibility. The `tensorrt_edgellm/` folder will be removed in 0.8.0 after the `experimental/quantization` -> `experimental/llm_loader` workflow reaches full feature parity for all models and features.
 
 | Approach | Scripts | Use Case |
 |----------|---------|----------|
@@ -93,8 +136,8 @@ Specify available adapters and select per-request:
 ```json
 {
     "available_lora_weights": {
-        "french": "/path/to/engines/lora_weights/french/processed_adapter_model.safetensors",
-        "medical": "/path/to/engines/lora_weights/medical/processed_adapter_model.safetensors"
+        "french": "/path/to/lora_weights/french/processed_adapter_model.safetensors",
+        "medical": "/path/to/lora_weights/medical/processed_adapter_model.safetensors"
     },
     "requests": [
         {
@@ -118,6 +161,27 @@ Specify available adapters and select per-request:
 ---
 
 ## Script Reference
+
+### `llm_loader.lora.insert_lora_cli`
+
+Inserts LoRA patterns into an exported `llm_loader` ONNX model, creating `lora_model.onnx`.
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `--onnx_dir` | Yes | Directory containing `model.onnx` |
+
+**Output**: Creates `lora_model.onnx` in the same directory.
+
+### `llm_loader.lora.process_lora_weights_cli`
+
+Processes HuggingFace LoRA adapter weights for runtime use with a `llm_loader` export.
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `--input_dir` | Yes | Directory with `adapter_config.json` and `adapter_model.safetensors` |
+| `--output_dir` | Yes | Output directory for processed weights |
+
+**Output**: Creates `processed_adapter_model.safetensors` and `config.json`.
 
 ### `tensorrt-edgellm-merge-lora`
 
@@ -152,7 +216,7 @@ Processes HuggingFace LoRA adapter weights for runtime use.
 **Output**: Creates `processed_adapter_model.safetensors` and `config.json`.
 
 **Processing**:
-- Converts bf16 → fp16
+- Converts bf16 -> fp16
 - Applies scaling: `lora_B *= lora_alpha / r`
 - Transposes tensors to correct shapes
 - Filters out norm and lm_head layers
@@ -173,5 +237,5 @@ When building with dynamic LoRA support:
 
 - Static merge is simpler but doesn't allow runtime switching
 - Dynamic LoRA adds slight overhead but enables multi-adapter deployments
-- All adapters must have rank ≤ `--maxLoraRank` specified at build time
+- All adapters must have rank <= `--maxLoraRank` specified at build time
 - CUDA graphs are captured separately for each LoRA configuration

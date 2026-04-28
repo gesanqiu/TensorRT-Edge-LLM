@@ -23,7 +23,7 @@
 #include "profiling/metrics.h"
 #include "profiling/nvtx_wrapper.h"
 #include "profiling/timer.h"
-#include "runtime/llmInferenceRuntime.h"
+#include "requestFileParser.h"
 #include "runtime/llmInferenceSpecDecodeRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "tokenizer/tokenizer.h"
@@ -333,300 +333,11 @@ bool parseLLMInferenceArgs(LLMInferenceArgs& args, int argc, char* argv[])
     return true;
 }
 
+// Thin wrapper around the shared parser in examples/utils/requestFileParser.h.
 std::pair<std::unordered_map<std::string, std::string>, std::vector<rt::LLMGenerationRequest>> parseInputFile(
     std::filesystem::path const& inputFilePath, int32_t batchSizeOverride = -1, int64_t maxGenerateLengthOverride = -1)
 {
-    std::vector<rt::LLMGenerationRequest> batchedRequests;
-
-    Json inputData;
-    std::ifstream inputFileStream(inputFilePath);
-    check::check(inputFileStream.is_open(), "Failed to open input file: " + inputFilePath.string());
-    try
-    {
-        inputData = Json::parse(inputFileStream);
-        inputFileStream.close();
-    }
-    catch (Json::parse_error const& e)
-    {
-        throw std::runtime_error(
-            format::fmtstr("Failed to parse input file %s with error: %s", inputFilePath.string().c_str(), e.what()));
-    }
-
-    // Extract global parameters
-    int batchSize = (batchSizeOverride != -1) ? batchSizeOverride : inputData.value("batch_size", 1);
-    check::check(batchSize > 0, format::fmtstr("Invalid batch_size value: %d (must be positive)", batchSize));
-
-    // Enforce input limits (defined in cpp/common/inputLimits.h) to prevent DoS attacks and
-    // excessive resource consumption. Requests exceeding these bounds are rejected early.
-    // The actual engine-specific limit will be checked after the runtime is fully initialized.
-    check::check(batchSize <= limits::security::kReasonableMaxBatchSize,
-        format::fmtstr("Input rejected: batch_size %d exceeds limit %d. Limit defined in %s.", batchSize,
-            limits::security::kReasonableMaxBatchSize, limits::kInputLimitsLocation));
-
-    float temperature = inputData.value("temperature", 1.0f);
-    float topP = inputData.value("top_p", 0.8f);
-    int64_t topK = inputData.value("top_k", 50);
-    int64_t maxGenerateLength
-        = (maxGenerateLengthOverride != -1) ? maxGenerateLengthOverride : inputData.value("max_generate_length", 256);
-    check::check(maxGenerateLength > 0,
-        format::fmtstr(
-            "Invalid max_generate_length value: %lld (must be positive)", static_cast<long long>(maxGenerateLength)));
-
-    // Read apply_chat_template flag (defaults to true)
-    bool applyChatTemplate = inputData.value("apply_chat_template", true);
-
-    // Read add_generation_prompt flag (defaults to true)
-    bool addGenerationPrompt = inputData.value("add_generation_prompt", true);
-
-    // Read enable_thinking flag (defaults to false)
-    bool enableThinking = inputData.value("enable_thinking", false);
-
-    std::unordered_map<std::string, std::string> loraWeightsMap;
-    if (inputData.contains("available_lora_weights") && inputData["available_lora_weights"].is_object())
-    {
-        auto const& availableLoraWeights = inputData["available_lora_weights"];
-        for (auto const& [loraName, loraPath] : availableLoraWeights.items())
-        {
-            check::check(loraPath.is_string(), "LoRA weight path for '" + loraName + "' must be a string");
-            check::check(loraWeightsMap.find(loraName) == loraWeightsMap.end(),
-                "Lora weights with name " + loraName + " already exists");
-            loraWeightsMap[loraName] = loraPath.get<std::string>();
-            LOG_INFO("Registered LoRA weights '%s' -> '%s'", loraName.c_str(), loraWeightsMap[loraName].c_str());
-        }
-    }
-
-    // Parse requests and create batched requests
-    if (inputData.contains("requests") && inputData["requests"].is_array())
-    {
-        auto& requestsArray = inputData["requests"];
-        size_t numRequests = requestsArray.size();
-
-        // Process requests in batches according to batchSize
-        for (size_t startIdx = 0; startIdx < numRequests; startIdx += batchSize)
-        {
-            rt::LLMGenerationRequest batchRequest;
-            batchRequest.temperature = temperature;
-            batchRequest.topP = topP;
-            batchRequest.topK = topK;
-            batchRequest.maxGenerateLength = maxGenerateLength;
-            batchRequest.applyChatTemplate = applyChatTemplate;
-            batchRequest.addGenerationPrompt = addGenerationPrompt;
-            batchRequest.enableThinking = enableThinking;
-
-            // Track LoRA weights for validation
-            std::string batchLoraWeightsName = "";
-            bool firstInBatch = true;
-
-            // Add requests to this batch (up to batchSize requests)
-            size_t endIdx = std::min(startIdx + batchSize, numRequests);
-            for (size_t requestIdx = startIdx; requestIdx < endIdx; ++requestIdx)
-            {
-                auto const& requestItem = requestsArray[requestIdx];
-
-                // Each request must be an object with "messages" key
-                check::check(requestItem.is_object(), "Each request must be an object with 'messages' key");
-
-                // These are request level property but currently we don't support the mechanism to group requests
-                // manually in the input file. Thus, we adopt simply philosophy that we enable the property for all
-                // requests in the batch if any request has set the property.
-                bool saveSystemPromptKVCache = requestItem.value("save_system_prompt_kv_cache", false);
-                if (saveSystemPromptKVCache)
-                {
-                    batchRequest.saveSystemPromptKVCache = true;
-                }
-                bool disableSpecDecode = requestItem.value("disable_spec_decode", false);
-                if (disableSpecDecode)
-                {
-                    batchRequest.disableSpecDecode = true;
-                }
-
-                check::check(requestItem.contains("messages") && requestItem["messages"].is_array(),
-                    "Each request object must contain a 'messages' array");
-
-                auto const& messagesArray = requestItem["messages"];
-
-                // Get per-conversation LoRA name if present
-                std::string requestLoraName = "";
-                if (requestItem.contains("lora_name") && !requestItem["lora_name"].is_null())
-                {
-                    requestLoraName = requestItem["lora_name"].get<std::string>();
-
-                    // Validate that the LoRA name exists in available_lora_weights
-                    check::check(
-                        requestLoraName.empty() || loraWeightsMap.find(requestLoraName) != loraWeightsMap.end(),
-                        "LoRA name '" + requestLoraName + "' not found in available_lora_weights");
-                }
-
-                // Validate that all requests in this batch use the same LoRA weights
-                if (firstInBatch)
-                {
-                    batchLoraWeightsName = requestLoraName;
-                    firstInBatch = false;
-                }
-                else
-                {
-                    check::check(requestLoraName == batchLoraWeightsName,
-                        "Different LoRA weights within the same batch are not supported");
-                }
-
-                // Parse messages into structured format
-                std::vector<rt::Message> chatMessages;
-                std::vector<rt::imageUtils::ImageData> imageBuffers;
-                std::vector<rt::audioUtils::AudioData> audioBuffers;
-
-                // Enforce message count limits
-                check::check(messagesArray.size() <= limits::security::kMaxMessagesPerRequest,
-                    format::fmtstr(
-                        "Input rejected: too many messages in request %zu: %zu (max: %zu). Limit defined in %s.",
-                        requestIdx, messagesArray.size(), limits::security::kMaxMessagesPerRequest,
-                        limits::kInputLimitsLocation));
-
-                for (auto const& messageJson : messagesArray)
-                {
-                    check::check(messageJson.contains("role") && messageJson.contains("content"),
-                        "Each message must have 'role' and 'content' fields");
-
-                    rt::Message chatMsg;
-                    chatMsg.role = messageJson["role"].get<std::string>();
-
-                    auto const& contentJson = messageJson["content"];
-
-                    // Support both string (simple text) and array (multimodal) formats
-                    if (contentJson.is_string())
-                    {
-                        // Simple string format - treat as text content
-                        std::string const& contentStr = contentJson.get<std::string>();
-
-                        // Enforce content size limits
-                        check::check(contentStr.size() <= limits::security::kMaxMessageContentSizeBytes,
-                            format::fmtstr(
-                                "Input rejected: message content too large in request %zu: %zu bytes (max: %zu). "
-                                "Limit defined in %s.",
-                                requestIdx, contentStr.size(), limits::security::kMaxMessageContentSizeBytes,
-                                limits::kInputLimitsLocation));
-
-                        rt::Message::MessageContent msgContent;
-                        msgContent.type = "text";
-                        msgContent.content = contentStr;
-                        chatMsg.contents.push_back(msgContent);
-                    }
-                    else if (contentJson.is_array())
-                    {
-                        // Array format - supports multimodal content
-                        // Enforce content item limits
-                        check::check(contentJson.size() <= limits::security::kMaxContentItemsPerMessage,
-                            format::fmtstr("Input rejected: too many content items in message %zu: %zu (max: %zu). "
-                                           "Limit defined in %s.",
-                                requestIdx, contentJson.size(), limits::security::kMaxContentItemsPerMessage,
-                                limits::kInputLimitsLocation));
-
-                        for (auto const& contentItemJson : contentJson)
-                        {
-                            check::check(
-                                contentItemJson.contains("type"), "Each content item must have a 'type' field");
-
-                            rt::Message::MessageContent msgContent;
-                            msgContent.type = contentItemJson["type"].get<std::string>();
-
-                            // Based on type, extract the appropriate field
-                            if (msgContent.type == "text")
-                            {
-                                std::string const& textContent = contentItemJson["text"].get<std::string>();
-
-                                // Enforce content size limits
-                                check::check(textContent.size() <= limits::security::kMaxMessageContentSizeBytes,
-                                    format::fmtstr(
-                                        "Input rejected: message content too large in request %zu: %zu bytes "
-                                        "(max: %zu). Limit defined in %s.",
-                                        requestIdx, textContent.size(), limits::security::kMaxMessageContentSizeBytes,
-                                        limits::kInputLimitsLocation));
-
-                                msgContent.content = textContent;
-                            }
-                            else if (msgContent.type == "image")
-                            {
-                                msgContent.content = contentItemJson["image"].get<std::string>();
-                                // TODO: Need to consider multi-turn conversation, and whether to load all images.
-                                auto image = rt::imageUtils::loadImageFromFile(msgContent.content);
-                                if (image.buffer != nullptr)
-                                {
-                                    imageBuffers.push_back(std::move(image));
-                                }
-                            }
-                            else if (msgContent.type == "audio")
-                            {
-                                // Audio content for Qwen3-Omni
-                                msgContent.content = contentItemJson["audio"].get<std::string>();
-                                rt::audioUtils::AudioData audio;
-                                std::string audioPath = msgContent.content;
-
-                                // Check file extension
-                                size_t dotPos = audioPath.find_last_of('.');
-                                std::string extension;
-                                if (dotPos != std::string::npos)
-                                {
-                                    extension = audioPath.substr(dotPos);
-                                }
-
-                                // Support mel-spectrogram .safetensors files directly
-                                if (extension == ".safetensors")
-                                {
-                                    audio.melSpectrogramPath = audioPath;
-                                    audio.melSpectrogramFormat = "safetensors";
-                                    audioBuffers.push_back(std::move(audio));
-                                    LOG_INFO("Loaded mel-spectrogram from: %s (safetensors format)", audioPath.c_str());
-                                }
-                                else
-                                {
-                                    LOG_WARNING(
-                                        "Unsupported audio format: %s (only .safetensors mel-spectrograms are "
-                                        "supported)",
-                                        audioPath.c_str());
-                                }
-                            }
-                            else
-                            {
-                                LOG_ERROR("Content type must be 'text', 'image', 'audio', but got: %s",
-                                    msgContent.type.c_str());
-                                throw std::runtime_error(
-                                    format::fmtstr("Content type must be 'text', 'image', 'audio', but got: %s",
-                                        msgContent.type.c_str()));
-                            }
-
-                            chatMsg.contents.push_back(msgContent);
-                        }
-                    }
-                    else
-                    {
-                        throw std::runtime_error("Message content must be a string or an array");
-                    }
-
-                    chatMessages.push_back(chatMsg);
-                }
-
-                // Create prompt structure with structured messages
-                rt::LLMGenerationRequest::Request request;
-                request.messages = std::move(chatMessages);
-                request.imageBuffers = std::move(imageBuffers);
-                request.audioBuffers = std::move(audioBuffers);
-                batchRequest.requests.push_back(std::move(request));
-            }
-
-            // Set the LoRA weights name for this batch (all requests in this batch use the same LoRA weights)
-            if (!batchLoraWeightsName.empty())
-            {
-                batchRequest.loraWeightsName = batchLoraWeightsName;
-            }
-
-            batchedRequests.push_back(std::move(batchRequest));
-        }
-    }
-    else
-    {
-        throw std::runtime_error("'requests' array not found in input file");
-    }
-
-    return std::make_pair(std::move(loraWeightsMap), std::move(batchedRequests));
+    return exampleUtils::parseRequestFile(inputFilePath, batchSizeOverride, maxGenerateLengthOverride);
 }
 
 int main(int argc, char* argv[])
@@ -674,9 +385,8 @@ int main(int argc, char* argv[])
         return EXIT_FAILURE;
     }
 
-    // Create runtime based on mode
-    std::unique_ptr<rt::LLMInferenceRuntime> llmInferenceRuntime{nullptr};
-    std::unique_ptr<rt::LLMInferenceSpecDecodeRuntime> eagleInferenceRuntime{nullptr};
+    // Create unified runtime (handles both vanilla and Eagle spec-decode modes)
+    std::unique_ptr<rt::LLMInferenceSpecDecodeRuntime> runtime{nullptr};
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
 
@@ -686,38 +396,33 @@ int main(int argc, char* argv[])
             args.eagleArgs.draftTopK, args.eagleArgs.draftStep, args.eagleArgs.verifyTreeSize};
         try
         {
-            eagleInferenceRuntime = std::make_unique<rt::LLMInferenceSpecDecodeRuntime>(
+            runtime = std::make_unique<rt::LLMInferenceSpecDecodeRuntime>(
                 args.engineDir, args.multimodalEngineDir, loraWeightsMap, draftingConfig, stream);
         }
         catch (std::exception const& e)
         {
-            LOG_ERROR("Failed to initialize LLMInferenceSpecDecodeRuntime: %s", e.what());
+            LOG_ERROR("Failed to initialize runtime with Eagle spec-decode: %s", e.what());
             return EXIT_FAILURE;
-        }
-
-        if (!eagleInferenceRuntime->captureDecodingCudaGraph(stream))
-        {
-            LOG_WARNING(
-                "Failed to capture CUDA graph for Eagle decoding usage, proceeding with normal engine execution.");
         }
     }
     else
     {
-        // Standard mode
+        // Standard vanilla-only mode (no draft model)
         try
         {
-            llmInferenceRuntime = std::make_unique<rt::LLMInferenceRuntime>(
+            runtime = std::make_unique<rt::LLMInferenceSpecDecodeRuntime>(
                 args.engineDir, args.multimodalEngineDir, loraWeightsMap, stream);
         }
         catch (std::exception const& e)
         {
-            LOG_ERROR("Failed to initialize LLMInferenceRuntime: %s", e.what());
+            LOG_ERROR("Failed to initialize runtime: %s", e.what());
             return EXIT_FAILURE;
         }
-        if (!llmInferenceRuntime->captureDecodingCUDAGraph(stream))
-        {
-            LOG_WARNING("Failed to capture CUDA graph for decoding usage, proceeding with normal engine execution.");
-        }
+    }
+
+    if (!runtime->captureDecodingCUDAGraph(stream))
+    {
+        LOG_WARNING("Failed to capture CUDA graph for decoding, proceeding with normal engine execution.");
     }
 
     // Perform warmup runs if requested
@@ -731,15 +436,7 @@ int main(int argc, char* argv[])
         for (int32_t warmupRun = 0; warmupRun < args.warmup; ++warmupRun)
         {
             rt::LLMGenerationResponse warmupResponse;
-            bool requestStatus = false;
-            if (args.eagleArgs.enabled)
-            {
-                requestStatus = eagleInferenceRuntime->handleRequest(firstRequest, warmupResponse, stream);
-            }
-            else
-            {
-                requestStatus = llmInferenceRuntime->handleRequest(firstRequest, warmupResponse, stream);
-            }
+            bool requestStatus = runtime->handleRequest(firstRequest, warmupResponse, stream);
 
             if (!requestStatus)
             {
@@ -779,15 +476,7 @@ int main(int argc, char* argv[])
                 100.0 * (requestIdx + 1) / batchedRequests.size());
         }
 
-        bool requestStatus = false;
-        if (args.eagleArgs.enabled)
-        {
-            requestStatus = eagleInferenceRuntime->handleRequest(request, response, stream);
-        }
-        else
-        {
-            requestStatus = llmInferenceRuntime->handleRequest(request, response, stream);
-        }
+        bool requestStatus = runtime->handleRequest(request, response, stream);
 
         if (requestStatus)
         {
@@ -813,7 +502,10 @@ int main(int argc, char* argv[])
         for (size_t batchIdx = 0; batchIdx < request.requests.size(); ++batchIdx)
         {
             nlohmann::json responseJson;
-            std::string outputText = requestStatus ? response.outputTexts[batchIdx] : errorMessage;
+            bool const hasOutputText = requestStatus && batchIdx < response.outputTexts.size();
+            std::string outputText = hasOutputText ? response.outputTexts[batchIdx] : errorMessage;
+            auto const* formattedRequest
+                = batchIdx < request.formattedRequests.size() ? &request.formattedRequests[batchIdx] : nullptr;
             // Validate UTF-8 for output text (inputs are always valid)
             // If invalid UTF-8 detected, error message is returned and original text is logged
             responseJson["output_text"] = sanitizeUtf8ForJson(outputText);
@@ -848,8 +540,9 @@ int main(int argc, char* argv[])
             }
             responseJson["messages"] = messagesJson;
             // Store formatted prompts for reference
-            responseJson["formatted_system_prompt"] = request.formattedRequests[batchIdx].formattedSystemPrompt;
-            responseJson["formatted_complete_request"] = request.formattedRequests[batchIdx].formattedCompleteRequest;
+            responseJson["formatted_system_prompt"] = formattedRequest ? formattedRequest->formattedSystemPrompt : "";
+            responseJson["formatted_complete_request"]
+                = formattedRequest ? formattedRequest->formattedCompleteRequest : "";
             outputData["responses"].push_back(responseJson);
         }
     }
@@ -874,25 +567,20 @@ int main(int argc, char* argv[])
         std::ostringstream profileOutput;
         profileOutput << std::endl;
         profileOutput << "=== Performance Summary ===" << std::endl;
+        auto prefillMetrics = runtime->getPrefillMetrics();
+        auto multimodalMetrics = runtime->getMultimodalMetrics();
+        outputPrefillProfile(profileOutput, prefillMetrics);
         if (args.eagleArgs.enabled)
         {
-            // Eagle runtime with detailed metrics
-            auto prefillMetrics = eagleInferenceRuntime->getPrefillMetrics();
-            auto eagleGenerationMetrics = eagleInferenceRuntime->getEagleGenerationMetrics();
-            auto multimodalMetrics = eagleInferenceRuntime->getMultimodalMetrics();
-            outputPrefillProfile(profileOutput, prefillMetrics);
+            auto eagleGenerationMetrics = runtime->getEagleGenerationMetrics();
             outputEagleGenerationProfile(profileOutput, eagleGenerationMetrics);
-            outputMultimodalProfile(profileOutput, multimodalMetrics);
-            outputMemoryProfile(profileOutput, memoryMonitor);
         }
         else
         {
-            auto multimodalMetrics = llmInferenceRuntime->getMultimodalMetrics();
-            outputPrefillProfile(profileOutput, llmInferenceRuntime->getPrefillMetrics());
-            outputGenerationProfile(profileOutput, llmInferenceRuntime->getGenerationMetrics());
-            outputMultimodalProfile(profileOutput, multimodalMetrics);
-            outputMemoryProfile(profileOutput, memoryMonitor);
+            outputGenerationProfile(profileOutput, runtime->getGenerationMetrics());
         }
+        outputMultimodalProfile(profileOutput, multimodalMetrics);
+        outputMemoryProfile(profileOutput, memoryMonitor);
         profileOutput << "=====================================" << std::endl;
         LOG_INFO("%s", profileOutput.str().c_str());
     }
@@ -904,39 +592,23 @@ int main(int argc, char* argv[])
         {
             nlohmann::json profileJson;
 
+            // Add high-level metrics from unified runtime
+            addJsonPrefillSummary(profileJson, runtime->getPrefillMetrics());
             if (args.eagleArgs.enabled)
             {
-                // Eagle runtime with detailed metrics
-                auto prefillMetrics = eagleInferenceRuntime->getPrefillMetrics();
-                auto eagleGenerationMetrics = eagleInferenceRuntime->getEagleGenerationMetrics();
-                auto multimodalMetrics = eagleInferenceRuntime->getMultimodalMetrics();
-
-                // Add high-level metrics
-                addJsonPrefillSummary(profileJson, prefillMetrics);
-                addJsonEagleGenerationSummary(profileJson, eagleGenerationMetrics);
-                addJsonMultimodalSummary(profileJson, multimodalMetrics);
-
-                // Add detailed timing stages
-                addJsonTimingStages(profileJson);
-
-                // Add memory usage
-                addJsonMemorySummary(profileJson, memoryMonitor);
+                addJsonEagleGenerationSummary(profileJson, runtime->getEagleGenerationMetrics());
             }
             else
             {
-                auto multimodalMetrics = llmInferenceRuntime->getMultimodalMetrics();
-
-                // Add high-level metrics
-                addJsonPrefillSummary(profileJson, llmInferenceRuntime->getPrefillMetrics());
-                addJsonGenerationSummary(profileJson, llmInferenceRuntime->getGenerationMetrics());
-                addJsonMultimodalSummary(profileJson, multimodalMetrics);
-
-                // Add detailed timing stages
-                addJsonTimingStages(profileJson);
-
-                // Add memory usage
-                addJsonMemorySummary(profileJson, memoryMonitor);
+                addJsonGenerationSummary(profileJson, runtime->getGenerationMetrics());
             }
+            addJsonMultimodalSummary(profileJson, runtime->getMultimodalMetrics());
+
+            // Add detailed timing stages
+            addJsonTimingStages(profileJson);
+
+            // Add memory usage
+            addJsonMemorySummary(profileJson, memoryMonitor);
 
             std::ofstream profileFile(args.profileOutputFile);
             if (profileFile.is_open())

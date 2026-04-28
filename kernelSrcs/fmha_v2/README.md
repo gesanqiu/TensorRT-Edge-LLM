@@ -27,6 +27,7 @@ make cubin_demobert -j$(nproc)
 
 # 3) Avoid overwrite
 mv generated generated_cuda128
+mv cubin cubin_cuda128
 ```
 ---
 
@@ -49,6 +50,7 @@ make cubin_demobert -j$(nproc)
 
 # 3) Avoid overwrite
 mv generated generated_cuda129
+mv cubin cubin_cuda129
 ```
 
 2.  **Merge the new CUBIN files:**

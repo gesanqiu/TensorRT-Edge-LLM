@@ -20,3 +20,10 @@ docs/build/
 docs/source/cpp_api/
 docs/source/cpp_api.rst
 docs/source/python_api.rst
+cpp/kernels/cuteDSLArtifact/
+# CuTe DSL prebuilt tarballs (override *.tar.gz ignore above)
+!kernelSrcs/cuteDSLPrebuilt/*.tar.gz
+# Virtual environment
+venv*/
+# .claude project commands are tracked; ignore only personal/local overrides
+.claude/settings.local.json

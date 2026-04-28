@@ -17,8 +17,8 @@ cmake_minimum_required(VERSION 3.20 FATAL_ERROR)
 
 project(
   tensorrt_edgellm_sdk
-  VERSION 0.6.1
-  LANGUAGES CXX CUDA)
+  VERSION 0.7.0
+  LANGUAGES C CXX CUDA)
 
 # Specify the C++ standard and flags
 set(CMAKE_CXX_STANDARD 17)
@@ -64,8 +64,14 @@ set_ifndef(CUDA_DIR /usr/local/cuda-${CUDA_CTK_VERSION})
 if(NOT DEFINED AARCH64_BUILD)
   set(CMAKE_CUDA_ARCHITECTURES 80;86;89)
   if(CUDA_CTK_VERSION VERSION_GREATER_EQUAL 12.8)
-    list(APPEND CMAKE_CUDA_ARCHITECTURES 100 120)
+    list(APPEND CMAKE_CUDA_ARCHITECTURES 100a 120)
   endif()
+endif()
+
+# Orin/JetPack cuda.h may lack cudaLibrary_t; GDN runner uses compat typedef
+# when this is set.
+if(DEFINED EMBEDDED_TARGET AND EMBEDDED_TARGET STREQUAL "jetson-orin")
+  add_compile_definitions(TRT_EDGELLM_CUDA_LIBRARY_T_COMPAT)
 endif()
 
 find_path(
@@ -120,37 +126,13 @@ else()
   set(NVTX_INCLUDE_DIR "")
 endif()
 
-# Set TensorRT header includes and library dependencies.
-if(NOT DEFINED TRT_PACKAGE_DIR)
-  message(
-    FATAL_ERROR "Please specify the -DTRT_PACKAGE_DIR when invoking CMake.")
-endif()
-
-find_path(
-  TRT_INCLUDE_DIR NvInfer.h
-  HINTS ${TRT_PACKAGE_DIR}
-  PATH_SUFFIXES include ${CMAKE_SYSTEM_PROCESSOR}-linux-gnu)
-find_path(ONNX_PARSER_INCLUDE_DIR NvOnnxParser.h HINTS ${TRT_INCLUDE_DIR})
-if(NOT ONNX_PARSER_INCLUDE_DIR)
-  message(
-    FATAL_ERROR
-      "NvOnnxParser.h not found in TensorRT headers, please specify the -DONNX_PARSER_INCLUDE_DIR when invoking CMake"
-  )
-endif()
-
-find_library(
-  NVINFER_LIB nvinfer
-  HINTS ${TRT_PACKAGE_DIR}
-  PATH_SUFFIXES lib lib64 ${CMAKE_SYSTEM_PROCESSOR}-linux-gnu)
-find_library(
-  NV_ONNX_PARSER_LIB nvonnxparser
-  HINTS ${TRT_PACKAGE_DIR}
-  PATH_SUFFIXES lib lib64 x86_64-linux-gnu)
+list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
+find_package(TensorRT REQUIRED COMPONENTS OnnxParser)
 
 # TRT and CUDA headers are treated as system includes so that the compiler
 # suppresses warnings originating from them (e.g. -Wunused-parameter in
 # NvInferRuntime.h virtual stubs).
-include_directories(SYSTEM ${CUDA_INCLUDE_DIR} ${TRT_INCLUDE_DIR})
+include_directories(SYSTEM ${CUDA_INCLUDE_DIR} ${TensorRT_INCLUDE_DIR})
 
 set(COMMON_INCLUDE_DIRS
     ${NVTX_INCLUDE_DIR}
@@ -160,7 +142,9 @@ set(COMMON_INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/3rdParty/stb)
 
 add_library(commonLibraryExt INTERFACE)
-target_link_libraries(commonLibraryExt INTERFACE ${NVINFER_LIB} ${CUDART_LIB})
+target_link_libraries(
+  commonLibraryExt INTERFACE TensorRT::TensorRT TensorRT::OnnxParser
+                             ${CUDART_LIB})
 # Workaround for aarch64 cross compilation where libvninfer.so links to
 # libnvdla_compilers. The libnvinfer dependencies shall be resolved at execution
 # time on an embedded board.
@@ -168,13 +152,24 @@ target_link_options(commonLibraryExt INTERFACE
                     "-Wl,--unresolved-symbols=ignore-in-shared-libs")
 
 # Build Core libraries of the project. attentionPlugin shared library and
-# edgellmCore/edgellmTokenizer/edgellmBuilder static library will be generated.
+# edgellmCore/edgellmBuilder static library will be generated.
 add_subdirectory(cpp)
 
 # Build C++ examples to showcase the usage
 add_subdirectory(examples)
 
 option(BUILD_UNIT_TESTS "Enable building unit tests" OFF)
+option(BUILD_PYTHON_BINDINGS "Enable building Python pybind11 bindings" OFF)
+
+# CuTe DSL unified kernel option — declare here so it is always defined before
+# any subdirectory or include references it. Choices: OFF | ALL | fmha | gdn |
+# semicolon-separated group list (e.g. -DENABLE_CUTE_DSL=fmha;gdn).
+set(ENABLE_CUTE_DSL
+    "OFF"
+    CACHE
+      STRING
+      "CuTe DSL kernels: OFF (default), ALL, or semicolon-separated group list (fmha;gdn)"
+)
 
 if(BUILD_UNIT_TESTS)
   set(BUILD_GMOCK
@@ -191,11 +186,13 @@ if(BUILD_UNIT_TESTS)
                              PRIVATE PROJECT_ROOT_DIR="${CMAKE_SOURCE_DIR}")
   target_link_libraries(unitTest PRIVATE gtest gtest_main edgellmCore
                                          ${CUDART_LIB} ${CUDA_DRIVER_LIB})
-  add_cross_build_link_options(unitTest)
-
-  # Link prebuilt CuTe DSL FMHA kernels into unit tests
-  if(ENABLE_CUTE_DSL_FMHA)
-    include(${CMAKE_SOURCE_DIR}/cmake/CuteDslFMHA.cmake)
-    cute_dsl_fmha_setup(LINK_TARGETS unitTest)
+  if(NOT ENABLE_CUTE_DSL STREQUAL "OFF")
+    include(${CMAKE_SOURCE_DIR}/cmake/CuteDsl.cmake)
+    cute_dsl_setup(LINK_TARGETS unitTest)
   endif()
+  add_cross_build_link_options(unitTest)
+endif()
+
+if(BUILD_PYTHON_BINDINGS)
+  add_subdirectory(experimental/pybind)
 endif()

@@ -201,7 +201,7 @@ bool Qwen3OmniAudioRunner::allocateBuffer([[maybe_unused]] cudaStream_t stream)
 
 bool Qwen3OmniAudioRunner::preprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
-    [[maybe_unused]] rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
+    [[maybe_unused]] rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream, [[maybe_unused]] bool imageOnly)
 {
     std::vector<int64_t> audioTokenLengths;
 
@@ -569,7 +569,7 @@ bool Qwen3OmniAudioRunner::initializeSequentialMRopeCache(
     {
         kernel::initializeMRopeCosSin(ropeRotaryCosSinDevice.dataPointer<float>(),
             positionIdsDevice.dataPointer<int64_t>(), mConfig.mropeTheta, rotaryDim, maxPositionEmbeddings,
-            activeBatchSize, interleaved, stream);
+            activeBatchSize, interleaved, mConfig.mropeSectionH, mConfig.mropeSectionW, stream);
     }
     catch (std::exception const& e)
     {

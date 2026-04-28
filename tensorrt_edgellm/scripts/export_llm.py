@@ -100,6 +100,11 @@ def main() -> None:
         help=
         "Comma-separated list of models to export for Qwen3-Omni (e.g., 'thinker,talker' or 'code_predictor'). Default: export all models"
     )
+    parser.add_argument(
+        "--fp8_embedding",
+        required=False,
+        action='store_true',
+        help="Quantize embedding table to FP8 for reduced memory bandwidth")
 
     args = parser.parse_args()
 
@@ -113,7 +118,8 @@ def main() -> None:
                          export_models=args.export_models,
                          chat_template_path=args.chat_template_path,
                          fp8_kv_cache=args.fp8_kv_cache,
-                         trt_native_ops=args.trt_native_ops)
+                         trt_native_ops=args.trt_native_ops,
+                         fp8_embedding=args.fp8_embedding)
 
         print("LLM model export completed successfully!")
 

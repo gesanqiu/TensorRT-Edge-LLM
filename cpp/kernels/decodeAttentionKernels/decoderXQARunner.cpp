@@ -322,9 +322,10 @@ bool DecoderXQARunner::canImplement(
     bool const checkSMVersion
         = std::find(allowedSMVersions.begin(), allowedSMVersions.end(), smVersion) != allowedSMVersions.end();
 
-    // Current kernel list supports head ratio from 1 to 8.
+    // Current kernel list supports head ratio 1-8 for head_dim {32, 64, 128}
+    // and head ratio 16 for head_dim 128 only (NemotronH).
     int32_t const headRatio = numQHeads / numKVHeads;
-    bool const checkQHeadPerKV = headRatio >= 1 && headRatio <= 8;
+    bool const checkQHeadPerKV = (headRatio >= 1 && headRatio <= 8) || headRatio == 16;
 
     return checkHeadNumbers && checkType && checkKVType && checkSMVersion && checkQHeadPerKV;
 }

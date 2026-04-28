@@ -57,7 +57,7 @@ void computeLongRopeReference(std::vector<float>& shortCosSinCache, std::vector<
 
 void computeMRopeReference(std::vector<float>& mropeRotaryCosSin, std::vector<int64_t> const& mropePositionIds,
     float rotaryBaseFrequency, int32_t rotaryDim, int32_t rotaryEmbeddingMaxPositions, int32_t batchSize,
-    bool interleaved);
+    bool interleaved, int32_t sectionH, int32_t sectionW);
 
 // Embedding lookup reference functions
 std::vector<half> embeddingLookupRef(std::vector<int32_t> const& inputIds, std::vector<half> const& embeddingTable,
@@ -149,3 +149,8 @@ void referenceMoeTopK(std::vector<float> const& softmaxOutput, std::vector<float
 void referenceMoeTopkSoftmax(std::vector<float> const& gatingOutput, std::vector<float> const* correctionBias,
     std::vector<float>& topkWeights, std::vector<int32_t>& topkIndices, int32_t numTokens, int32_t numExperts,
     int32_t topk, bool renormalize, float moeSoftcapping = 0.0f);
+
+// MoE Sigmoid Group TopK reference (NemotronH routing)
+void referenceSigmoidGroupTopk(std::vector<float> const& logits, std::vector<float> const* correctionBias,
+    std::vector<float>& topkWeights, std::vector<int32_t>& topkIndices, int32_t numTokens, int32_t numExperts,
+    int32_t topK, int32_t nGroup, int32_t topkGroup, bool normTopkProb, float routedScalingFactor);

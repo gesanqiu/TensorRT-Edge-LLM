@@ -36,7 +36,8 @@ enum VLMBuildOptionId : int
     DEBUG = 604,
     MIN_IMAGE_TOKENS = 605,
     MAX_IMAGE_TOKENS = 606,
-    MAX_IMAGE_TOKENS_PER_IMAGE = 607
+    MAX_IMAGE_TOKENS_PER_IMAGE = 607,
+    PROFILING_DETAILED = 608
 };
 
 struct ViTBuildArgs
@@ -48,13 +49,14 @@ struct ViTBuildArgs
     int64_t minImageTokens{4};
     int64_t maxImageTokens{1024};
     int64_t maxImageTokensPerImage{512};
+    bool profilingDetailed{false}; // Enable detailed profiling verbosity for layer info extraction
 };
 
 void printUsage(char const* programName)
 {
     std::cerr << "Usage: " << programName
               << " [--help] <--onnxDir str> <--engineDir str> [--debug]"
-                 "[--minImageTokens int] [--maxImageTokens int] [--maxImageTokensPerImage int]"
+                 "[--minImageTokens int] [--maxImageTokens int] [--maxImageTokensPerImage int] [--profilingDetailed]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
     std::cerr << "  --help               Display this help message" << std::endl;
@@ -67,6 +69,9 @@ void printUsage(char const* programName)
     std::cerr << "  --minImageTokens     Minimum image tokens. Default = 4" << std::endl;
     std::cerr << "  --maxImageTokens     Maximum image tokens. Default = 1024" << std::endl;
     std::cerr << "  --maxImageTokensPerImage     Maximum image tokens per image. Default = 512" << std::endl;
+    std::cerr << "  --profilingDetailed  Enable detailed profiling verbosity to include ONNX op names. "
+                 "Use for DLSim analysis."
+              << std::endl;
 }
 
 bool parseViTBuildArgs(ViTBuildArgs& args, int argc, char* argv[])
@@ -77,7 +82,8 @@ bool parseViTBuildArgs(ViTBuildArgs& args, int argc, char* argv[])
         {"debug", no_argument, 0, VLMBuildOptionId::DEBUG},
         {"minImageTokens", required_argument, 0, VLMBuildOptionId::MIN_IMAGE_TOKENS},
         {"maxImageTokens", required_argument, 0, VLMBuildOptionId::MAX_IMAGE_TOKENS},
-        {"maxImageTokensPerImage", required_argument, 0, VLMBuildOptionId::MAX_IMAGE_TOKENS_PER_IMAGE}, {0, 0, 0, 0}};
+        {"maxImageTokensPerImage", required_argument, 0, VLMBuildOptionId::MAX_IMAGE_TOKENS_PER_IMAGE},
+        {"profilingDetailed", no_argument, 0, VLMBuildOptionId::PROFILING_DETAILED}, {0, 0, 0, 0}};
 
     int opt;
     while ((opt = getopt_long(argc, argv, "", vitOptions, nullptr)) != -1)
@@ -126,6 +132,7 @@ bool parseViTBuildArgs(ViTBuildArgs& args, int argc, char* argv[])
                 args.maxImageTokensPerImage = std::stoi(optarg);
             }
             break;
+        case VLMBuildOptionId::PROFILING_DETAILED: args.profilingDetailed = true; break;
         default: LOG_ERROR("ERROR: Invalid Argument %c is %s", opt, optarg); return false;
         }
     }
@@ -180,6 +187,7 @@ int main(int argc, char** argv)
     config.minImageTokens = args.minImageTokens;
     config.maxImageTokens = args.maxImageTokens;
     config.maxImageTokensPerImage = args.maxImageTokensPerImage;
+    config.profilingDetailed = args.profilingDetailed;
 
     std::string actualEngineDir = args.engineDir + "/visual";
 

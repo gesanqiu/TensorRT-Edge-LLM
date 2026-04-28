@@ -26,6 +26,11 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import \
     Qwen2_5_VisionTransformerPretrainedModel
 from transformers.models.qwen2_vl.modeling_qwen2_vl import \
     Qwen2VisionTransformerPretrainedModel
+
+try:
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
+except (ImportError, ModuleNotFoundError):
+    Qwen3_5VisionModel = None
 from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
 
 try:
@@ -155,6 +160,7 @@ def get_visual_calib_dataloader(
 
 def quantize_visual(model, precision, processor, dataset_dir="lmms-lab/MMMU"):
     supported_model_types = [
+        Qwen3_5VisionModel,
         Qwen3VLVisionModel,
         Qwen2_5_VisionTransformerPretrainedModel,
         Qwen2VisionTransformerPretrainedModel,

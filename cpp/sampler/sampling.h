@@ -86,6 +86,19 @@ struct SamplingParams
 struct SamplingWorkspace;
 
 /*!
+ * @brief Decide whether sampling parameters require non-greedy decoding
+ *
+ * Greedy decoding is used for the default tuple `(temperature=1.0, topK<=1, topP=1.0)`
+ * as well as near-zero temperatures, which are treated as greedy to avoid unstable softmax.
+ *
+ * @param temperature Sampling temperature
+ * @param topK Top-k sampling parameter
+ * @param topP Top-p sampling parameter
+ * @return True when top-k / top-p sampling should be used, false for greedy top-1
+ */
+bool shouldUseNonGreedySampling(float temperature, int64_t topK, float topP) noexcept;
+
+/*!
  * \brief Main sampling function for top-K and top-P sampling from logits.
  *
  * Performs token sampling using top-K and/or top-P (nucleus) sampling strategies

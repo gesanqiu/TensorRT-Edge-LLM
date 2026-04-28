@@ -21,6 +21,7 @@ This module provides functions to export audio components of multimodal models
 
 import json
 import os
+from typing import Optional
 
 import torch
 
@@ -32,12 +33,15 @@ def audio_export(model_dir: str,
                  output_dir: str,
                  dtype: str,
                  device: str = "cuda",
-                 export_models: str = None) -> str:
+                 export_models: str = None,
+                 quantization: Optional[str] = None,
+                 dataset_dir: str = "openslr/librispeech_asr") -> str:
     """
     Export audio model using the appropriate wrapper based on model architecture.
     
     This function loads a multimodal model, extracts its audio component, wraps it
-    in the appropriate model wrapper, and exports it to ONNX format.
+    in the appropriate model wrapper, applies quantization if requested, and exports
+    it to ONNX format.
     
     Args:
         model_dir: Directory containing the torch model
@@ -45,6 +49,10 @@ def audio_export(model_dir: str,
         dtype: Data type for export (currently only "fp16" supported)
         device: Device to load the model on (default: "cuda", options: cpu, cuda, cuda:0, cuda:1, etc.)
         export_models: Comma-separated list of models to export for Qwen3-Omni (e.g., 'audio_encoder', 'code2wav', or both. Default is to export both models)
+        quantization: Quantization method for audio encoder ("fp8" or None).
+            For Qwen3-Omni, this only applies to `audio_encoder`; `code2wav`
+            is always exported in FP16.
+        dataset_dir: HuggingFace dataset identifier for quantization calibration data
     Returns:
         str: Path to the output directory where the exported model is saved
     
@@ -54,9 +62,12 @@ def audio_export(model_dir: str,
     """
     # Validate input parameters
     assert dtype == "fp16", f"Only fp16 is supported for dtype. You passed: {dtype}"
+    assert quantization in [
+        "fp8", None
+    ], f"Only fp8 or None is supported for quantization. You passed: {quantization}"
     if not os.path.isdir(model_dir):
-        raise ValueError(
-            f"model_dir must be a local directory. You passed: {model_dir}")
+        print(f"Warning: model_dir '{model_dir}' is not a local directory. "
+              "The model will be downloaded from the HuggingFace Hub.")
 
     # Load the model and processor
     try:
@@ -97,6 +108,13 @@ def audio_export(model_dir: str,
             wrapped_model.load_state_dict(
                 model.thinker.audio_tower.state_dict())
             wrapped_model.eval().to(device)
+
+            if quantization == "fp8":
+                from tensorrt_edgellm.quantization.audio_quantization import \
+                    quantize_audio
+                wrapped_model = quantize_audio(wrapped_model, quantization,
+                                               dataset_dir)
+
             audio_encoder_output_dir = os.path.join(output_dir,
                                                     'audio_encoder')
             export_qwen3_omni_audio(wrapped_model, audio_encoder_output_dir,
@@ -130,6 +148,9 @@ def audio_export(model_dir: str,
                       "w") as f:
                 json.dump(config_dict, f, indent=2)
     elif model_type == 'qwen3_tts':
+        if quantization is not None:
+            raise ValueError(
+                "Quantization is not supported for Qwen3-TTS audio models.")
         print(f"Exporting Qwen3-TTS audio models from {model_dir}")
 
         valid_models = {'tokenizer_decoder', 'speaker_encoder'}
@@ -194,6 +215,13 @@ def audio_export(model_dir: str,
         )
         wrapped_asr.load_state_dict(model.thinker.audio_tower.state_dict())
         wrapped_asr.eval().to(device)
+
+        if quantization == "fp8":
+            from tensorrt_edgellm.quantization.audio_quantization import \
+                quantize_audio
+            wrapped_asr = quantize_audio(wrapped_asr, quantization,
+                                         dataset_dir)
+
         export_qwen3_asr_audio(wrapped_asr, output_dir, torch_dtype)
         print(f"Exported ASR audio encoder to {output_dir}")
 
@@ -205,7 +233,7 @@ def audio_export(model_dir: str,
         raise ValueError(f"Unsupported model type: {model_type}")
 
     print(
-        f"Audio export completed for {model_type} with dtype={dtype}, device={device}"
+        f"Audio export completed for {model_type} with dtype={dtype}, quantization={quantization}, device={device}"
     )
     print(f"Exported to: {output_dir}")
     return output_dir

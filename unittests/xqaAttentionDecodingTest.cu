@@ -120,7 +120,7 @@ void TestXQAAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, int3
         {
             numErrorWithin1E_3++;
         }
-        if (__hisnan(outHost[i]))
+        if (isnan(__half2float(outHost[i])))
         {
             NanValueDetected = true;
         }
@@ -215,9 +215,6 @@ void TestXQAAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, int3
 
         thrust::device_vector<__nv_fp8_e4m3> kvInputFp8Device(kvInputFp8);
         thrust::device_vector<half> outFp8Device(batchSize * numQHeads * headSize, __float2half(0.0F));
-        thrust::device_vector<float> kScaleDevice(1, kScaleQuantOrig);
-        thrust::device_vector<float> vScaleDevice(1, vScaleQuantOrig);
-
         EXPECT_TRUE(trt_edgellm::DecoderXQARunner::canImplement(
             numQHeads, numKVHeads, smVersion, DataType::kHALF, DataType::kFP8));
         trt_edgellm::DecoderXQARunner runnerFp8(
@@ -228,8 +225,8 @@ void TestXQAAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, int3
         paramsFp8.kvCache.sequence_lengths = thrust::raw_pointer_cast(kvCacheLengthDevice.data());
         paramsFp8.kvCache.capacity = kvCacheCapacity;
         paramsFp8.output = thrust::raw_pointer_cast(outFp8Device.data());
-        paramsFp8.kScale = thrust::raw_pointer_cast(kScaleDevice.data());
-        paramsFp8.vScale = thrust::raw_pointer_cast(vScaleDevice.data());
+        paramsFp8.kScale = kScaleQuantOrig;
+        paramsFp8.vScale = vScaleQuantOrig;
 
         // Reuse the same stream used for FP16 decoding.
         cudaStream_t stream{nullptr};
@@ -256,11 +253,11 @@ void TestXQAAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, int3
             {
                 numClose++;
             }
-            if (__hisnan(outFp8Host[i]))
+            if (isnan(__half2float(outFp8Host[i])))
             {
                 NanValueDetectedFp8 = true;
             }
-            EXPECT_FALSE(__hisnan(outFp8Host[i]));
+            EXPECT_FALSE(isnan(__half2float(outFp8Host[i])));
         }
         float const matchRate = static_cast<float>(numClose) / static_cast<float>(outHost.size());
         std::cout << "XQA Attention Decoding test. [FP8 KV cache] batch_size: " << batchSize
@@ -288,6 +285,9 @@ TEST(XQAAttentionDecodingTest, accuracyKVRatio4)
     TestXQAAttentionDecodingAccuracy(4, 32, 8, 128, 256);
     TestXQAAttentionDecodingAccuracy(1, 32, 8, 64, 2048);
     TestXQAAttentionDecodingAccuracy(4, 16, 4, 64, 512);
+    TestXQAAttentionDecodingAccuracy(1, 8, 2, 256, 1024);
+    TestXQAAttentionDecodingAccuracy(1, 16, 4, 256, 1024);
+    TestXQAAttentionDecodingAccuracy(2, 16, 4, 256, 512);
 }
 
 TEST(XQAAttentionDecodingTest, accuracyKVRatio5)
@@ -313,6 +313,13 @@ TEST(XQAAttentionDecodingTest, accuracyKVRatio8)
     TestXQAAttentionDecodingAccuracy(4, 32, 4, 128, 256);
 }
 
+TEST(XQAAttentionDecodingTest, accuracyKVRatio6)
+{
+    TestXQAAttentionDecodingAccuracy(1, 24, 4, 256, 1024);
+    TestXQAAttentionDecodingAccuracy(2, 24, 4, 256, 512);
+    TestXQAAttentionDecodingAccuracy(4, 24, 4, 256, 256);
+}
+
 #if SUPPORTS_FP8
 TEST(XQAAttentionDecodingFP8Test, accuracyKVRatio3)
 {
@@ -328,6 +335,9 @@ TEST(XQAAttentionDecodingFP8Test, accuracyKVRatio4)
     TestXQAAttentionDecodingAccuracy(4, 32, 8, 128, 256, true);
     TestXQAAttentionDecodingAccuracy(1, 32, 8, 64, 2048, true);
     TestXQAAttentionDecodingAccuracy(4, 16, 4, 64, 512, true);
+    TestXQAAttentionDecodingAccuracy(1, 8, 2, 256, 1024, true);
+    TestXQAAttentionDecodingAccuracy(1, 16, 4, 256, 1024, true);
+    TestXQAAttentionDecodingAccuracy(2, 16, 4, 256, 512, true);
 }
 
 TEST(XQAAttentionDecodingFP8Test, accuracyKVRatio5)
@@ -351,5 +361,12 @@ TEST(XQAAttentionDecodingFP8Test, accuracyKVRatio8)
     TestXQAAttentionDecodingAccuracy(1, 32, 4, 128, 1024, true);
     TestXQAAttentionDecodingAccuracy(2, 32, 4, 128, 512, true);
     TestXQAAttentionDecodingAccuracy(4, 32, 4, 128, 256, true);
+}
+
+TEST(XQAAttentionDecodingFP8Test, accuracyKVRatio6)
+{
+    TestXQAAttentionDecodingAccuracy(1, 24, 4, 256, 1024, true);
+    TestXQAAttentionDecodingAccuracy(2, 24, 4, 256, 512, true);
+    TestXQAAttentionDecodingAccuracy(4, 24, 4, 256, 256, true);
 }
 #endif

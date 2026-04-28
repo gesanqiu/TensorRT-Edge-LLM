@@ -63,6 +63,22 @@ public:
     virtual ~MultimodalRunner() noexcept = default;
 
     /*!
+     * @brief Get the required context memory size for this engine
+     * @return Required context memory size in bytes
+     * @note Handles both visual and audio engines
+     */
+    int64_t getRequiredContextMemorySize() const;
+
+    /*!
+     * @brief Set shared context memory for the execution context
+     * @param sharedContextMemory Tensor containing the shared device memory (must be on GPU)
+     * @return True on success, false if the tensor is too small
+     * @note The tensor size must be >= getRequiredContextMemorySize(). Must be called before infer().
+     * @note Handles both visual and audio engines
+     */
+    bool setContextMemory(rt::Tensor& sharedContextMemory);
+
+    /*!
      * @brief Create appropriate multimodal runner instance
      *
      * Factory method that detects model type and creates corresponding runner.
@@ -84,11 +100,13 @@ public:
      * @param tokenizer Tokenizer instance
      * @param ropeRotaryCosSinDevice RoPE cache tensor (only used by image / language models)
      * @param stream CUDA stream
+     * @param imageOnly When true, only run image preprocessing (skip text tokenization and RoPE
+     *        generation). Used for benchmarking where only the visual engine inputs need to be set up.
      * @return True on success, false on failure
      */
     virtual bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
-        tokenizer::Tokenizer const* tokenizer, [[maybe_unused]] rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
-        = 0;
+        tokenizer::Tokenizer const* tokenizer, [[maybe_unused]] rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream,
+        bool imageOnly = false) = 0;
 
     /*!
      * @brief Used for KVCache saving where we need to conduct the tokenization of the system prompt and generate
@@ -146,12 +164,14 @@ public:
     }
 
 protected:
-    multimodal::ModelType mModelType;                      //!< Model type identifier
-    std::unique_ptr<nvinfer1::IRuntime> mRuntime;          //!< TensorRT runtime
-    std::unique_ptr<nvinfer1::ICudaEngine> mVisualEngine;  //!< Visual encoder engine
-    std::unique_ptr<nvinfer1::IExecutionContext> mContext; //!< Execution context
-    rt::Tensor mOutputEmbedding;                           //!< Output embeddings
-    metrics::MultimodalMetrics mMultimodalMetrics;         //!< Performance metrics
+    multimodal::ModelType mModelType;                     //!< Model type identifier
+    std::unique_ptr<nvinfer1::IRuntime> mRuntime;         //!< TensorRT runtime
+    std::unique_ptr<nvinfer1::ICudaEngine> mVisualEngine; //!< Visual encoder engine (null for audio-only runners)
+    std::unique_ptr<nvinfer1::IExecutionContext> mVisualContext; //!< Visual execution context
+    std::unique_ptr<nvinfer1::ICudaEngine> mAudioEngine;        //!< Audio encoder engine (null for visual-only runners)
+    std::unique_ptr<nvinfer1::IExecutionContext> mAudioContext; //!< Audio execution context
+    rt::Tensor mOutputEmbedding;                                //!< Output embeddings
+    metrics::MultimodalMetrics mMultimodalMetrics;              //!< Performance metrics
 };
 
 } // namespace rt

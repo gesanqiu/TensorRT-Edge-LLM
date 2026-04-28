@@ -88,7 +88,12 @@ def quantize_model(
 
         for data in pbar:
             if isinstance(data, dict):
-                data = {k: v.to(model.device) for k, v in data.items()}
+                data = {
+                    k:
+                    v.to(model.device,
+                         dtype=model.dtype if v.is_floating_point() else None)
+                    for k, v in data.items()
+                }
                 model(**data, **kwargs)
             else:
                 data = data.to(model.device)

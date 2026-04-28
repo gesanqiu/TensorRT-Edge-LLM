@@ -164,6 +164,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         # MMA/SMEM/CTA tilers below use mma_tiler[2] (padded, e.g. 80).
         # TMA ZFILL bridges the gap on loads; OOB drop on stores.
         self.head_dim = actual_head_dim if actual_head_dim is not None else mma_tiler[2]
+        self.inv_sqrt_head_dim = 1.0 / math.sqrt(self.head_dim)
+        self.log2_e = math.log2(math.e)
         self.cta_tiler = (
             2 * mma_tiler[0],  # 2 Q tile per CTA
             mma_tiler[1],
@@ -253,6 +255,14 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.mma_softmax_stage = 1
         self.epi_stage = 2
 
+        # Pre-scale softmax output by 2^FP8_E4M3_PRESCALE_LOG2=256 for FP8 to maximize
+        # E4M3 dynamic range.
+        # P ∈ [0,1] → P*256 ∈ [0,256], utilizing more of the [0,448] FP8 range.
+        # Fused into exp2: exp2(x + 8) = exp2(x) * 256, zero extra per-element ops.
+        FP8_E4M3_PRESCALE_LOG2 = 8.0  # log2(256) — tuned for FP8 E4M3 range [0, 448]
+        self.softmax_prescale_log2 = FP8_E4M3_PRESCALE_LOG2 if self.q_dtype.width == 8 else 0.0
+        self.softmax_prescale_ln = self.softmax_prescale_log2 * 0.6931471805599453
+
     @cute.jit
     def __call__(
         self,
@@ -261,9 +271,10 @@ class BlackwellFusedMultiHeadAttentionForward:
         o_tensor: cute.Tensor,  # (B, S_q, H_q, D) — same layout as Q
         cum_seqlen_k: cute.Tensor,  # (B+1,) Int32 — cumulative KV sequence lengths
         window_size_left: Int32,
-        scale_softmax_log2: Float32,
-        scale_softmax: Float32,
-        scale_output: Float32,
+        scale_q: Float32,
+        scale_k: Float32,
+        scale_v: Float32,
+        inv_scale_o: Float32,
         stream: cuda.CUstream,
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
@@ -279,6 +290,11 @@ class BlackwellFusedMultiHeadAttentionForward:
         5. Grid and work scheduling computation
         6. Kernel launch with appropriate parameters
 
+        The softmax scale is computed as:
+            scale_softmax = scale_q * scale_k * (1 / sqrt(head_dim))
+        For FP16 (no quantization), pass scale_q = scale_k = scale_v = inv_scale_o = 1.0.
+        For FP8, pass the dequant scales so the kernel folds them into softmax/output scaling.
+
         :param q_tensor: The query tensor (B, S_q, H_q, D) with dynamic B, S_q, H_q
         :type q_tensor: cute.Tensor
         :param kv_cache: The KV cache tensor (B, 2, H_kv, S_k, D) with dynamic B, H_kv, S_k
@@ -287,17 +303,22 @@ class BlackwellFusedMultiHeadAttentionForward:
         :type o_tensor: cute.Tensor
         :param window_size_left: Left-side sliding window size for attention masking.
         :type window_size_left: Int32
-        :param scale_softmax_log2: The log2 scale factor for softmax
-        :type scale_softmax_log2: Float32
-        :param scale_softmax: The scale factor for softmax
-        :type scale_softmax: Float32
-        :param scale_output: The scale factor for the output
-        :type scale_output: Float32
+        :param scale_q: Dequantization scale for Q (quant→orig). 1.0 for FP16.
+        :type scale_q: Float32
+        :param scale_k: Dequantization scale for K (quant→orig). 1.0 for FP16.
+        :type scale_k: Float32
+        :param scale_v: Dequantization scale for V (quant→orig). 1.0 for FP16.
+        :type scale_v: Float32
+        :param inv_scale_o: Inverse output quantization scale. 1.0 for FP16 output.
+        :type inv_scale_o: Float32
         :param stream: The CUDA stream to execute the kernel on
         :type stream: cuda.CUstream
         :raises TypeError: If tensor data types don't match or aren't supported
         :raises RuntimeError: If tensor layouts aren't in supported formats
         """
+        scale_softmax = scale_q * scale_k * self.inv_sqrt_head_dim
+        scale_softmax_log2 = scale_softmax * self.log2_e
+        scale_output = scale_v * inv_scale_o
         b = q_tensor.layout.shape[0]
         s_q = q_tensor.layout.shape[1]
         h_q = q_tensor.layout.shape[2]
@@ -856,6 +877,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         :type mO_qdl: cute.Tensor
         :param scale_softmax_log2: The log2 scale factor for softmax
         :type scale_softmax_log2: Float32
+        :param scale_softmax: The scale factor for softmax
+        :type scale_softmax: Float32
         :param scale_output: The scale factor for the output
         :type scale_output: Float32
         :param window_size_left: Left-side sliding window size for attention masking.
@@ -1957,7 +1980,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         )
 
         scale = scale_softmax_log2
-        minus_row_max_scale = (0.0 - row_max_safe) * scale
+        minus_row_max_scale = (0.0 - row_max_safe) * scale + self.softmax_prescale_log2
 
         # Sequence barrier wait
         if cutlass.const_expr(stage == 0):
@@ -2556,7 +2579,7 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         if cutlass.const_expr(mLSE is not None):
             scaled_tmp = scale_softmax * tTMEM_LOAD_VECrS[1]
-            lse = cute.math.log(tTMEM_LOAD_VECrS[0], fastmath=True) + scaled_tmp
+            lse = cute.math.log(tTMEM_LOAD_VECrS[0], fastmath=True) + scaled_tmp - self.softmax_prescale_ln
             if row_idx < seqlen_q:
                 mLSE[row_idx + cuseqlen_q, blk_coord[2]] = lse
 
@@ -2754,7 +2777,8 @@ def run(
     if cp.cuda.runtime.getDeviceCount() == 0:
         raise RuntimeError("GPU is required to run this example!")
 
-    cp.random.seed(1111)
+    if not export_only:
+        cp.random.seed(1111)
     np.random.seed(1111)
 
     if isinstance(s_q, tuple) or isinstance(s_k, tuple):
@@ -2765,9 +2789,11 @@ def run(
     def create_and_pad_tensor(shape, padding, dtype, is_dynamic_layout=True):
         shape_ = tuple(map(lambda x, y: x + y, shape, padding))
 
-        # Create random f32 data on GPU
-        min_val = -2 if dtype.is_float or dtype.signed else 0
-        f32_gpu_full = cp.random.randint(min_val, 2, shape_).astype(cp.float32)
+        if export_only:
+            f32_gpu_full = cp.zeros(shape_, dtype=cp.float32)
+        else:
+            min_val = -2 if dtype.is_float or dtype.signed else 0
+            f32_gpu_full = cp.random.randint(min_val, 2, shape_).astype(cp.float32)
 
         # Create dtype GPU buffer and initialize
         cp_dtype = _cutlass_to_cupy_dtype(dtype)
@@ -2912,15 +2938,15 @@ def run(
     # Initialize Stream
     current_stream = cuda.CUstream(cp.cuda.get_current_stream().ptr)
 
+    # Compute folded scales for numpy reference and ViT path.
+    # The LLM __call__ computes these internally from the raw per-tensor scales.
     if scale_softmax == 0.0:  # default to 1/sqrt(d)
         scale_softmax = 1.0 / math.sqrt(d)
-    log2_e = math.log2(
-        math.exp(1.0)
-    )  # gpu uses exp2 for perf concerns, we need an extra factor 'log2_e' here
+    log2_e = math.log2(math.exp(1.0))
 
-    scale_softmax = scale_q * scale_k * scale_softmax
-    scale_softmax_log2 = scale_softmax * log2_e
-    scale_output = scale_v * inv_scale_o
+    ref_scale_softmax = scale_q * scale_k * scale_softmax
+    ref_scale_softmax_log2 = ref_scale_softmax * log2_e
+    ref_scale_output = scale_v * inv_scale_o
 
     def mark_bshd_dynamic(tensor):
         so = (0, 1, 2, 3)  # outermost-to-innermost for contiguous BSHD
@@ -2986,7 +3012,7 @@ def run(
         compiled_fmha = cute.compile(
             fmha.__call_vit__,
             q_dyn, k_dyn, v_dyn, o_dyn, cu_dyn, _max_seqlen,
-            scale_softmax_log2, scale_softmax, scale_output,
+            ref_scale_softmax_log2, ref_scale_softmax, ref_scale_output,
             current_stream,
         )
     else:
@@ -3007,7 +3033,7 @@ def run(
         compiled_fmha = cute.compile(
             fmha,
             q_dyn, kv_dyn, o_dyn, cu_kv_seqlens, _wsl,
-            scale_softmax_log2, scale_softmax, scale_output,
+            scale_q, scale_k, scale_v, inv_scale_o,
             current_stream,
         )
 
@@ -3148,7 +3174,7 @@ def run(
             compiled_fmha(
                 q_vit_tensor, k_vit_tensor, v_vit_tensor, o_vit_tensor,
                 cu_seqlens, _max_seqlen,
-                scale_softmax_log2, scale_softmax, scale_output,
+                ref_scale_softmax_log2, ref_scale_softmax, ref_scale_output,
                 current_stream,
             )
 
@@ -3167,8 +3193,8 @@ def run(
                 v_vit_ref,
                 cu_q_np,
                 cu_k_np,
-                scale_softmax=scale_softmax,
-                scale_output=scale_output,
+                scale_softmax=ref_scale_softmax,
+                scale_output=ref_scale_output,
                 is_causal=False,
                 bottom_right_align=False,
                 lse_calculation=False,
@@ -3195,7 +3221,7 @@ def run(
                 mark_shd_dynamic(q_ws), mark_shd_dynamic(k_ws),
                 mark_shd_dynamic(v_ws), mark_shd_dynamic(o_ws),
                 cu_dyn, _max_seqlen,
-                scale_softmax_log2, scale_softmax, scale_output,
+                ref_scale_softmax_log2, ref_scale_softmax, ref_scale_output,
                 current_stream,
             )
 
@@ -3283,9 +3309,10 @@ def run(
             o_ws,
             cu_kv_seqlens,
             _wsl,
-            scale_softmax_log2,
-            scale_softmax,
-            scale_output,
+            scale_q,
+            scale_k,
+            scale_v,
+            inv_scale_o,
             current_stream,
         )
         return args
@@ -3377,10 +3404,14 @@ def run_llm_multi_round_prefill_test(
     cp.random.seed(42)
     np.random.seed(42)
 
-    scale_softmax = 1.0 / math.sqrt(d)
-    log2_e = math.log2(math.exp(1.0))
-    scale_softmax_log2 = scale_softmax * log2_e
-    scale_output = 1.0
+    # FP16 test: all per-tensor scales are 1.0.
+    # The kernel computes softmax_scale = scale_q * scale_k / sqrt(d) internally.
+    _scale_q = 1.0
+    _scale_k = 1.0
+    _scale_v = 1.0
+    _inv_scale_o = 1.0
+    # Reference softmax scale for numpy validation
+    ref_scale_softmax = 1.0 / math.sqrt(d)
 
     mask_type = fmha_utils.MaskEnum.WINDOW_MASK
     if bottom_right_align:
@@ -3469,7 +3500,7 @@ def run_llm_multi_round_prefill_test(
             start_time = time.time()
             compiled_fmha = cute.compile(
                 fmha_op, q_t, kv_t, o_t, cu_kv, _wsl,
-                scale_softmax_log2, scale_softmax, scale_output,
+                _scale_q, _scale_k, _scale_v, _inv_scale_o,
                 current_stream,
             )
             print(f"{_tag} Compilation time: "
@@ -3478,7 +3509,7 @@ def run_llm_multi_round_prefill_test(
         # ---- run kernel ----
         compiled_fmha(
             q_t, kv_t, o_t, cu_kv, _wsl,
-            scale_softmax_log2, scale_softmax, scale_output,
+            _scale_q, _scale_k, _scale_v, _inv_scale_o,
             current_stream,
         )
 
@@ -3501,7 +3532,7 @@ def run_llm_multi_round_prefill_test(
                 v_b = np.repeat(v_b, h_r, axis=0)
 
             scores = (np.einsum("hqd,hkd->hqk", q_b, k_b)
-                      * scale_softmax)
+                      * ref_scale_softmax)
 
             s_k = effective_kv_len
             if window_size_left is not None or window_size_right is not None:
@@ -3518,7 +3549,7 @@ def run_llm_multi_round_prefill_test(
                 scores = np.where(mask, -np.inf, scores)
             probs = _numpy_softmax(scores, axis=-1)
             o_ref = np.einsum("hqk,hkd->hqd", probs, v_b)
-            o_ref = o_ref.transpose(1, 0, 2) * scale_output
+            o_ref = o_ref.transpose(1, 0, 2) * _scale_v * _inv_scale_o
 
             o_actual = o_result[bi]
             max_diff = np.max(np.abs(o_actual - o_ref))
@@ -3774,9 +3805,6 @@ if __name__ == "__main__":
 
     if cp.cuda.runtime.getDeviceCount() == 0:
         raise RuntimeError("GPU is required to run this example!")
-
-    cp.random.seed(1111)
-    np.random.seed(1111)
 
     if len(args.q_shape) != 4:
         parser.error("--q_shape must contain exactly 4 values")

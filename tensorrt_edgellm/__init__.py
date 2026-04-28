@@ -106,6 +106,7 @@ Example Usage:
         )
 """
 
+from .onnx_export.action_export import action_export
 from .onnx_export.audio_export import audio_export
 from .onnx_export.llm_export import export_draft_model, export_llm_model
 from .onnx_export.lora import (insert_lora_and_save,
@@ -125,6 +126,7 @@ __all__ = [
     "quantize_and_save_draft",
     "export_draft_model",
     "export_llm_model",
+    "action_export",
     "visual_export",
     "audio_export",
     "insert_lora_and_save",

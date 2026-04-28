@@ -24,7 +24,7 @@ The module contains:
 - ONNX export utilities for the custom operation
 """
 
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 import onnx
 import torch
@@ -91,18 +91,11 @@ attention_plugin_schema = OpSchema(
             type_str="tensor(int32)",
             param_option=OpSchema.FormalParameterOption.Optional,
         ),
-        OpSchema.FormalParameter(
-            name="k_v_scale_quant_orig",
-            description=
-            "Packed KV dequant scales for FP8 KV cache. Shape [2] float: [k_scale_quant_orig, v_scale_quant_orig] (optional)",
-            type_str="tensor(float)",
-            param_option=OpSchema.FormalParameterOption.Optional,
-        ),
     ],
     outputs=[
         OpSchema.FormalParameter(
             name="attn_output",
-            description="Attention output tensor",
+            description="Attention output tensor (always FP16)",
             type_str="T",
         ),
         OpSchema.FormalParameter(
@@ -116,7 +109,7 @@ attention_plugin_schema = OpSchema(
         (
             "T",
             ["tensor(float16)"],
-            "Input Q/K/V data type.",
+            "Input Q/K/V and attention output data type.",
         ),
         (
             "T_KV",
@@ -161,6 +154,13 @@ attention_plugin_schema = OpSchema(
             type=OpSchema.AttrType.INT,
             description=
             "Sliding window size for attention (-1 = no sliding window, >0 = window size).",
+            required=False,
+        ),
+        OpSchema.Attribute(
+            name="qkv_scales",
+            type=OpSchema.AttrType.FLOATS,
+            description=
+            "Optional QKV dequant scales [q, k, v] for FP8 attention.",
             required=False,
         ),
     ],
@@ -235,7 +235,7 @@ onnx.defs.register_schema(vit_attention_plugin_schema)
 
 
 @symbolic_helper.parse_args("v", "v", "v", "v", "v", "v", "v", "i", "i", "b",
-                            "i", "b", "i", "v", "v", "v")
+                            "i", "b", "i", "v", "v", "none")
 def symbolic_attention_plugin(
     g: torch.onnx._internal.torchscript_exporter.jit_utils.GraphContext,
     q: torch._C.Value,
@@ -253,11 +253,10 @@ def symbolic_attention_plugin(
     sliding_window_size: torch._C.Value,
     attention_mask: Optional[torch._C.Value] = None,
     position_ids: Optional[torch._C.Value] = None,
-    k_v_scale_quant_orig: Optional[torch._C.Value] = None,
+    qkv_scales=None,
 ):
     """Custom attention plugin operation for ONNX export."""
 
-    # Build inputs list - kvcache_start_index is now always required
     inputs = [
         q, k, v, past_key_value, context_lengths, rope_rotary_cos_sin,
         kvcache_start_index
@@ -270,13 +269,6 @@ def symbolic_attention_plugin(
         inputs.append(attention_mask)
         inputs.append(position_ids)
 
-    # append the scale inputs (they can be constant tensors)
-    if enable_fp8_kv_cache:
-        assert k_v_scale_quant_orig is not None and k_v_scale_quant_orig.type(
-        ).kind(
-        ) != "NoneType", "k_v_scale_quant_orig should be provided for FP8 KV cache"
-        inputs.append(k_v_scale_quant_orig)
-
     q_type = q.type()
     past_key_value_type = past_key_value.type()
     attrs = dict[str, Value | int](
@@ -287,6 +279,23 @@ def symbolic_attention_plugin(
         enable_fp8_kv_cache_i=1 if enable_fp8_kv_cache else 0,
         sliding_window_size_i=sliding_window_size,
     )
+    if qkv_scales is not None:
+        if isinstance(qkv_scales, torch._C.Value):
+            if not qkv_scales.node().mustBeNone():
+                node = qkv_scales.node()
+                if node.kind() == 'prim::ListConstruct':
+                    attrs["qkv_scales_f"] = [
+                        float(v.node().f('value')) for v in node.inputs()
+                    ]
+                elif node.kind() == 'onnx::Constant':
+                    attrs["qkv_scales_f"] = node.t('value').tolist()
+                else:
+                    raise RuntimeError(
+                        f"Unsupported qkv_scales JIT node kind: "
+                        f"{node.kind()}. Expected prim::ListConstruct "
+                        f"or onnx::Constant.")
+        else:
+            attrs["qkv_scales_f"] = list(qkv_scales)
 
     attn_output, present_key_value = g.op("trt::AttentionPlugin",
                                           *inputs,
@@ -350,7 +359,7 @@ def attention_plugin(
     sliding_window_size: int = -1,
     attention_mask: Optional[torch.Tensor] = None,
     position_ids: Optional[torch.Tensor] = None,
-    k_v_scale_quant_orig: Optional[torch.Tensor] = None,
+    qkv_scales: Optional[Sequence[float]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Dummy TensorRT operation for attention computation, this is not used in the actual inference.
@@ -372,16 +381,14 @@ def attention_plugin(
         enable_tree_attention: Whether to enable tree attention
         head_size: Size of each attention head
         enable_fp8_kv_cache: Whether to use FP8 KV cache
-        attention_mask: Attention mask of shape (batch_size, seq_len, seq_len + past_len), optional
         sliding_window_size: Sliding window size for attention, optional
+        attention_mask: Attention mask of shape (batch_size, seq_len, seq_len + past_len), optional
         position_ids: Position IDs tensor of shape (batch_size, seq_len), optional
-        k_v_scale_quant_orig: Packed KV dequant scales for FP8 KV cache, shape (2), optional.
-            Layout: [k_scale_quant_orig, v_scale_quant_orig]
+        qkv_scales: QKV dequant scales [q, k, v] as host floats, or None.
+            Required when enable_fp8_kv_cache is True.
 
     Returns:
-        Tuple[torch.Tensor, torch.Tensor]: Attention output tensor and updated KV cache
-            - Attention output: shape (batch_size, seq_len, num_q_heads * head_size)
-            - Updated KV cache: shape (batch_size, 2, num_kv_heads, present_kv_cache_len, head_size) with dynamic shapes
+        Tuple[torch.Tensor, torch.Tensor]: Attention output (FP16) and updated KV cache
 
     Raises:
         AssertionError: If enable_tree_attention is True but required tensors are missing
@@ -390,9 +397,8 @@ def attention_plugin(
         assert attention_mask is not None, "attention_mask should be provided for tree attention"
         assert position_ids is not None, "position_ids should be provided for tree attention"
     if enable_fp8_kv_cache:
-        assert k_v_scale_quant_orig is not None, "k_v_scale_quant_orig should be provided for FP8 KV cache"
-        assert k_v_scale_quant_orig.numel(
-        ) == 2, "k_v_scale_quant_orig must have 2 elements: [k_scale_quant_orig, v_scale_quant_orig]"
+        assert qkv_scales is not None and len(qkv_scales) == 3, \
+            "qkv_scales must have 3 elements [q, k, v] when FP8 KV cache is enabled"
 
     batch_size_q, seq_len_q, q_size = q.shape
     batch_size_k, seq_len_k, k_size = k.shape
@@ -433,7 +439,6 @@ def attention_plugin(
     assert v.dtype == torch.float16, f"v {v.dtype} should be in float16"
     assert past_key_value.dtype == torch.float16 or past_key_value.dtype == torch.float8_e4m3fn, f"past_key_value {past_key_value.dtype} should be in float16, float8_e4m3fn"
 
-    # Dummy implementation for ONNX export, this is not used in the actual inference
     attn_output = torch.zeros(batch_size,
                               seq_len,
                               num_q_heads,

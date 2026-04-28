@@ -15,6 +15,8 @@
  * limitations under the License.
  */
 
+#pragma once
+
 #include "common/hashUtils.h"
 #include "common/tensor.h"
 #include "multimodal/multimodalRunner.h"
@@ -23,20 +25,27 @@
 #include "runtime/eagleDraftEngineRunner.h"
 #include "runtime/llmEngineRunner.h"
 #include "runtime/llmRuntimeUtils.h"
+#include "runtime/streaming.h"
 #include "tokenizer/tokenizer.h"
+#include <cassert>
+#include <optional>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
 
 namespace trt_edgellm
 {
-/*! \brief Structure to hold cached system prompt and its KV cache
+
+/*! \brief Structure to hold cached system prompt and its KV cache (unified with recurrent state support)
  */
 struct SystemPromptKVCache
 {
     std::string systemPrompt;                     //!< The system prompt text
     std::vector<tokenizer::Rank> tokenizedPrompt; //!< Tokenized version of the system prompt
-    rt::Tensor kvCacheContent;                    //!< Cached KV cache content for the system prompt
+    std::vector<rt::Tensor> kvCacheLayers;        //!< Per-layer KV cache tensors for the system prompt
+    std::vector<rt::Tensor>
+        recurrentStateContents;                //!< Cached recurrent states for hybrid layers (empty if not applicable)
+    std::vector<rt::Tensor> convStateContents; //!< Cached conv states for hybrid layers (empty if not applicable)
 };
 
 namespace rt
@@ -78,7 +87,9 @@ struct SpecDecodeInferenceContext
     // Key: original batch index, Value: complete batch result data
     std::unordered_map<int32_t, BatchResult> completedBatches; //!< Results of completed batches (unified storage)
     std::vector<int32_t> batchIndexMapping;                    //!< Maps current batch index to original index
-    rt::OptionalInputTensor multimodalEmbeddings;              //!< Optional multimodal embeddings
+    std::vector<SlotStreamState> slotStreams;                  //!< Per-slot streaming state (parallel to tokenIds).
+    rt::OptionalInputTensor visualEmbeddings;                  //!< Optional visual embeddings
+    rt::OptionalInputTensor audioEmbeddings;                   //!< Optional audio embeddings
     rt::OptionalInputTensors deepstackFeatures; //!< Deepstack features for Qwen3-VL (raw features before embedding)
     int32_t generationRound;                    //!< Current generation round (shared across all batches)
     int32_t maxGenerateLength;                  //!< Maximum generation length
@@ -86,16 +97,21 @@ struct SpecDecodeInferenceContext
     std::string loraWeightsName{""};            //!< LoRA adapter name used by this request
     cudaStream_t stream;                        //!< CUDA stream
 
+    // Sampling parameters (forwarded from request)
+    float temperature{1.0f}; //!< Temperature for sampling
+    float topP{1.0f};        //!< Top-P (nucleus) sampling parameter
+    int64_t topK{0};         //!< Top-K sampling parameter
+
     /*!
      * @brief Initialize the context with given parameters
      * @param batchSize Active batch size
      * @param maxGenLength Maximum generation length
-     * @param multimodal Optional multimodal embeddings
+     * @param visual Optional visual embeddings
      * @param deepstackFeatures Deepstack features for Qwen3-VL (raw features before embedding)
      * @param loraName LoRA weights name used by this request
      * @param cudaStream CUDA stream for operations
      */
-    void initialize(int32_t batchSize, int32_t maxGenLength, rt::OptionalInputTensor const& multimodal,
+    void initialize(int32_t batchSize, int32_t maxGenLength, rt::OptionalInputTensor const& visual,
         rt::OptionalInputTensors const& deepstackFeatures, std::string const& loraName, cudaStream_t cudaStream);
 };
 
@@ -112,16 +128,18 @@ struct EagleDraftingConfig
 };
 
 /*!
- * @brief LLM inference runtime with Eagle speculative decoding
+ * @brief Unified LLM inference runtime with optional Eagle speculative decoding
  *
- * Manages inference pipeline using Eagle speculative decoding for improved throughput.
- * Coordinates base model, draft model, and multimodal processing.
+ * Manages inference pipeline for both standard (vanilla) and Eagle speculative decoding modes.
+ * When constructed without a drafting config, operates as a pure vanilla decoding runtime
+ * (equivalent to the former LLMInferenceRuntime) with zero draft-model memory overhead.
+ * Coordinates base model, optional draft model, and multimodal processing (vision + audio).
  */
 class LLMInferenceSpecDecodeRuntime
 {
 public:
     /*!
-     * @brief Construct speculative decode runtime
+     * @brief Construct runtime with Eagle speculative decoding
      * @param engineDir Directory containing engine files
      * @param multimodalEngineDir Directory containing multimodal engine files
      * @param loraWeightsMap Map of LoRA weight names to file paths
@@ -133,20 +151,32 @@ public:
         std::unordered_map<std::string, std::string> const& loraWeightsMap, EagleDraftingConfig const& draftingConfig,
         cudaStream_t stream);
 
+    /*!
+     * @brief Construct runtime for vanilla-only decoding (no draft model)
+     * @param engineDir Directory containing engine files
+     * @param multimodalEngineDir Directory containing multimodal engine files
+     * @param loraWeightsMap Map of LoRA weight names to file paths
+     * @param stream CUDA stream for operations
+     * @throws std::runtime_error if directories do not contain expected data, or runner initialization fails
+     */
+    LLMInferenceSpecDecodeRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
+        std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream);
+
     //! @brief Destructor
     ~LLMInferenceSpecDecodeRuntime() noexcept = default;
 
-    //! @brief Capture CUDA graphs for Eagle decoding stages to optimize performance.
+    //! @brief Capture CUDA graphs for decoding stages to optimize performance.
     //!
-    //! Captures graphs for draft proposal, draft accept token, base verification, and
-    //! base vanilla decoding across all supported batch sizes.
+    //! When draft model is present, captures graphs for draft proposal, draft accept token,
+    //! base verification, and base vanilla decoding. Without draft model, captures only
+    //! vanilla decoding graphs.
     //!
     //! @param stream CUDA stream
     //! @return True if all stage captures succeed, false otherwise
     //! @throws std::runtime_error if a tensor reshape operation fails
     //! @note If capture fails for any stage, the inference can proceed without CUDA graph capture,
     //! but at cost of performance degradation.
-    bool captureDecodingCudaGraph(cudaStream_t stream);
+    bool captureDecodingCUDAGraph(cudaStream_t stream);
 
     /*!
      * @brief Handle generation request
@@ -158,34 +188,66 @@ public:
      */
     bool handleRequest(LLMGenerationRequest const& request, LLMGenerationResponse& response, cudaStream_t stream);
 
+    /*!
+     * @brief Generate and save system prompt KV cache (public API matching standard runtime signature)
+     * @param prompt The system prompt to generate the KVCache
+     * @param loraWeightsName The name of the LoRA weights
+     * @param stream The CUDA stream used for the generation
+     * @return True if the KVCache is generated and saved successfully, false otherwise
+     * @throws std::runtime_error if a CUDA operation fails
+     */
+    bool genAndSaveSystemPromptKVCache(
+        std::string const& prompt, std::string const& loraWeightsName, cudaStream_t stream);
+
     //! Get LLM prefill stage metrics
     metrics::LLMPrefillMetrics const& getPrefillMetrics() const noexcept
     {
         return mPrefillMetrics;
     }
 
-    //! Get Eagle generation stage metrics
+    //! Get Eagle generation stage metrics (only meaningful when draft model is present)
     metrics::EagleGenerationMetrics const& getEagleGenerationMetrics() const noexcept
     {
         return mEagleGenerationMetrics;
     }
 
+    //! Get vanilla generation stage metrics (only meaningful when no draft model / vanilla path)
+    metrics::LLMGenerationMetrics const& getGenerationMetrics() const noexcept
+    {
+        return mGenerationMetrics;
+    }
+
     //! Get multimodal metrics (returns empty metrics if no multimodal runner)
     metrics::MultimodalMetrics getMultimodalMetrics() const noexcept
     {
-        return mMultimodalRunner ? mMultimodalRunner->getMultimodalMetrics() : metrics::MultimodalMetrics{};
+        return mVisionRunner ? mVisionRunner->getMultimodalMetrics()
+            : mAudioRunner   ? mAudioRunner->getMultimodalMetrics()
+                             : metrics::MultimodalMetrics{};
+    }
+
+    //! @brief Check if draft model is loaded and spec-decode is available
+    bool hasDraftModel() const noexcept
+    {
+        return mDraftEngineRunner != nullptr;
     }
 
 private:
-    int32_t mMaxRuntimeBatchSize{1};                 //!< Maximum runtime batch size
-    EagleDraftingConfig mDraftingConfig;             //!< Eagle drafting configuration
-    LLMEngineRunnerConfig mBaseEngineConfig;         //!< Base engine configuration
-    EagleDraftEngineRunnerConfig mDraftEngineConfig; //!< Draft engine configuration
+    //! @brief Common initialization logic shared between both constructors
+    void initializeCommon(std::string const& engineDir, std::string const& multimodalEngineDir,
+        std::unordered_map<std::string, std::string> const& loraWeightsMap,
+        std::optional<EagleDraftingConfig> const& draftingConfig, cudaStream_t stream);
 
-    std::unique_ptr<LLMEngineRunner> mBaseEngineRunner;           //!< Base model engine runner
-    std::unique_ptr<EagleDraftEngineRunner> mDraftEngineRunner;   //!< Draft model engine runner
-    std::unique_ptr<MultimodalRunner> mMultimodalRunner{nullptr}; //!< Multimodal runner (optional)
-    std::unique_ptr<tokenizer::Tokenizer> mTokenizer;             //!< Tokenizer
+    rt::Tensor mSharedExecContextMemory{};              //!< Shared device memory for all execution contexts
+    int32_t mMaxRuntimeBatchSize{1};                    //!< Maximum runtime batch size
+    std::optional<EagleDraftingConfig> mDraftingConfig; //!< Eagle drafting configuration (nullopt = no draft)
+    LLMEngineRunnerConfig mBaseEngineConfig;            //!< Base engine configuration
+    std::optional<EagleDraftEngineRunnerConfig> mDraftEngineConfig; //!< Draft engine configuration (nullopt = no draft)
+
+    std::unique_ptr<LLMEngineRunner> mBaseEngineRunner;         //!< Base model engine runner
+    std::unique_ptr<EagleDraftEngineRunner> mDraftEngineRunner; //!< Draft model engine runner (nullptr = no draft)
+    std::unique_ptr<MultimodalRunner> mVisionRunner{nullptr};   //!< Vision multimodal runner (optional)
+    std::unique_ptr<MultimodalRunner> mAudioRunner{nullptr};    //!< Audio multimodal runner (optional)
+    std::unique_ptr<tokenizer::Tokenizer> mTokenizer;           //!< Tokenizer
     hash_utils::HashMap<std::tuple<std::string, std::string>, SystemPromptKVCache>
         mSystemPromptKVCacheBase; //!< System prompt KVCache for base model
     hash_utils::HashMap<std::tuple<std::string, std::string>, SystemPromptKVCache>
@@ -194,7 +256,7 @@ private:
 
     // Pre-define key runtime GPU tensors and initialize them during construction.
     // [1] I/O Tensors to work with base and eagle draft engine.
-    rt::Tensor mEmbeddingTable;               //!< Embedding table [vocabSize, hiddenSize]
+    EmbeddingData mEmbedding;                 //!< Embedding table [vocabSize, hiddenSize] and optional FP8 scales
     rt::Tensor mIdsInput;                     //!< Input token IDs (used for embedding lookup)
     rt::Tensor mInputsEmbeds;                 //!< Input embeddings (after embedding lookup)
     std::vector<rt::Tensor> mDeepstackEmbeds; //!< Deepstack embeddings for Qwen3-VL (one per feature)
@@ -214,7 +276,7 @@ private:
     rt::Tensor mSamplingScores;
     rt::Tensor mBaseVocabMappingTable; // Vocab mapping table for base model reduced vocab (empty if not used)
 
-    // [3] Data structures used during Draft tree constructions.
+    // [3] Data structures used during Draft tree constructions (only allocated when draft model present).
     // Data tables that store the data structure that can completely describe a multi-layer draft tree.
     rt::Tensor mDraftTokenIdsFullTable;
     rt::Tensor mDraftTokenScoreFullTable;
@@ -229,7 +291,7 @@ private:
     rt::Tensor mDraftTokenIntermediateScores;
     rt::Tensor mDraftTokenIntermediateParents;
 
-    // [4] Data structures that used during base model verification.
+    // [4] Data structures that used during base model verification (only allocated when draft model present).
     rt::Tensor mAcceptedTokenIds;
     rt::Tensor mAcceptedTokenIndices;
     rt::Tensor mAcceptLength;
@@ -244,10 +306,29 @@ private:
     rt::Tensor mHostAcceptedTokenIds;    //!< Host pinned memory for accepted token IDs
     rt::Tensor mHostReuseKVCacheLengths; //!< Host pinned memory for reuse KV cache lengths
 
+    // [7] Multimodal support tensors for audio/image token indexing
+    rt::Tensor mMultimodalIndices; //!< Multimodal indices tensor [batchSize, seqLen] for audio/image embeddings
+
+    //! @brief Restore recurrent/conv states from a cached system prompt.
+    void restoreRecurrentStates(int32_t batchIdx, SystemPromptKVCache const& cachedStates, cudaStream_t stream);
+
+    //! @brief Zero all recurrent/conv states for a given batch index.
+    void zeroRecurrentStates(int32_t batchIdx, cudaStream_t stream);
+
     // Key functions to drive the spec-decode runtime, defined in a consumer-producer pattern.
     // Consume tokenized IDS as input and produce hidden states for the whole sequence and first generated token.
     //! @throws std::runtime_error if a CUDA error occurs
     bool runBaseModelPrefill(SpecDecodeInferenceContext& context);
+
+    //! Validate request shape/runtime compatibility.
+    bool validateRequestConfig(LLMGenerationRequest const& request);
+
+    //! Prepare per-request runtime state for models built with multimodal support.
+    //! Runs multimodal preprocessing when audio or vision inputs are present.
+    //! For text-only requests on MRope-based multimodal models, restores text-only RoPE state
+    //! and clears stale multimodal request state.
+    bool multiModalRuntimePreprocess(
+        LLMGenerationRequest const& request, SpecDecodeInferenceContext& context, cudaStream_t stream);
 
     // Consume the base model hidden states and input token of the sequence. Produce the draft hidden states and logits
     // for the last token of the sequence.
@@ -290,6 +371,7 @@ private:
     // Stage-specific metrics
     metrics::LLMPrefillMetrics mPrefillMetrics;
     metrics::EagleGenerationMetrics mEagleGenerationMetrics;
+    metrics::LLMGenerationMetrics mGenerationMetrics; //!< Vanilla generation metrics (used when no spec-decode)
 };
 
 } // namespace rt

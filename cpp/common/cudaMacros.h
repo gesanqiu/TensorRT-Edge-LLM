@@ -44,3 +44,10 @@
 #else
 #define SUPPORTS_FP8 0
 #endif
+
+#if defined(CUDA_VERSION) && (CUDA_VERSION >= 12080)
+#include <cuda_fp4.h>
+#define SUPPORTS_FP4 1
+#else
+#define SUPPORTS_FP4 0
+#endif

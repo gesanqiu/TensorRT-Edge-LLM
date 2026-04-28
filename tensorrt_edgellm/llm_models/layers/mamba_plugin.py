@@ -49,6 +49,10 @@ causal_conv1d_schema = OpSchema(
         OpSchema.FormalParameter(name="conv_state",
                                  description="Conv state [batch, dim, kernel]",
                                  type_str="T"),
+        OpSchema.FormalParameter(
+            name="context_lengths",
+            description="Per-batch actual token count [batch]",
+            type_str="T_CL"),
     ],
     outputs=[
         OpSchema.FormalParameter(name="output",
@@ -60,6 +64,7 @@ causal_conv1d_schema = OpSchema(
     ],
     type_constraints=[
         ("T", ["tensor(float16)", "tensor(bfloat16)", "tensor(float)"], ""),
+        ("T_CL", ["tensor(int32)"], ""),
     ],
     attributes=[
         OpSchema.Attribute(name="stride",
@@ -110,6 +115,10 @@ update_ssm_state_schema = OpSchema(
         OpSchema.FormalParameter(name="state",
                                  description="SSM state",
                                  type_str="T"),
+        OpSchema.FormalParameter(
+            name="context_lengths",
+            description="Per-batch actual token count [batch]",
+            type_str="T_CL"),
     ],
     outputs=[
         OpSchema.FormalParameter(name="output",
@@ -122,6 +131,7 @@ update_ssm_state_schema = OpSchema(
     type_constraints=[
         ("T", ["tensor(float16)", "tensor(bfloat16)", "tensor(float)"], ""),
         ("T_A", ["tensor(float)", "tensor(float16)", "tensor(bfloat16)"], ""),
+        ("T_CL", ["tensor(int32)"], ""),
     ],
     attributes=[
         OpSchema.Attribute(name="dt_softplus",
@@ -140,9 +150,9 @@ update_ssm_state_schema = OpSchema(
 # ---------------------------------------------------------------------------
 
 
-@symbolic_helper.parse_args("v", "v", "v", "v", "i", "i", "i", "i")
-def symbolic_causal_conv1d(g, x, weight, bias, conv_state, stride, padding,
-                           dilation, groups):
+@symbolic_helper.parse_args("v", "v", "v", "v", "v", "i", "i", "i", "i")
+def symbolic_causal_conv1d(g, x, weight, bias, conv_state, context_lengths,
+                           stride, padding, dilation, groups):
     """Map trt_edgellm::causal_conv1d to ONNX custom op."""
     output, conv_state_out = g.op(
         "trt_edgellm::causal_conv1d",
@@ -150,6 +160,7 @@ def symbolic_causal_conv1d(g, x, weight, bias, conv_state, stride, padding,
         weight,
         bias,
         conv_state,
+        context_lengths,
         stride_i=stride,
         padding_i=padding,
         dilation_i=dilation,
@@ -167,6 +178,7 @@ def causal_conv1d_plugin(
     weight: torch.Tensor,
     bias: torch.Tensor,
     conv_state: torch.Tensor,
+    context_lengths: torch.Tensor,
     stride: int,
     padding: int,
     dilation: int,
@@ -181,9 +193,10 @@ def causal_conv1d_plugin(
 # ---------------------------------------------------------------------------
 
 
-@symbolic_helper.parse_args("v", "v", "v", "v", "v", "v", "v", "v", "i", "i")
+@symbolic_helper.parse_args("v", "v", "v", "v", "v", "v", "v", "v", "v", "i",
+                            "i")
 def symbolic_update_ssm_state(g, x, A, B, C, D, dt, dt_bias, state,
-                              dt_softplus, ngroups):
+                              context_lengths, dt_softplus, ngroups):
     """Map trt_edgellm::update_ssm_state to ONNX custom op."""
     output, state_out = g.op(
         "trt_edgellm::update_ssm_state",
@@ -195,6 +208,7 @@ def symbolic_update_ssm_state(g, x, A, B, C, D, dt, dt_bias, state,
         dt,
         dt_bias,
         state,
+        context_lengths,
         dt_softplus_i=dt_softplus,
         ngroups_i=ngroups,
         outputs=2,
@@ -214,6 +228,7 @@ def update_ssm_state_plugin(
     dt: torch.Tensor,
     dt_bias: torch.Tensor,
     state: torch.Tensor,
+    context_lengths: torch.Tensor,
     dt_softplus: int,
     ngroups: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:

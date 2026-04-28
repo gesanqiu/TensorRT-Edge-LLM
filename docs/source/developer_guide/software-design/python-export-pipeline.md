@@ -1,4 +1,6 @@
-# Python Export Pipeline
+# Python Export Pipeline (Legacy)
+
+> **Deprecation Notice:** This FX-tracing export pipeline (`tensorrt_edgellm`) is deprecated for new workflows. Use the [Checkpoint-Based Model Loader (llm_loader)](llm-loader.md), which reads pre-quantized HuggingFace checkpoints directly, is immune to `transformers` API breakage, and supports all models listed in [Supported Models](../../user_guide/getting_started/supported-models.md). The `tensorrt_edgellm/` folder will be removed in 0.8.0, with full feature parity provided by the `experimental/quantization` -> `experimental/llm_loader` workflow for all models and features. See the [migration guide](llm-loader.md#migrating-from-the-legacy-pipeline) for step-by-step instructions.
 
 ## Overview
 
@@ -181,7 +183,7 @@ The `tensorrt-edgellm` package provides seven specialized command-line tools for
 
 The export pipeline supports multiple quantization methods optimized for different hardware platforms and performance requirements.
 
-For complete details on quantization methods, precision requirements, platform compatibility, and memory reduction, see the **[Precision Support](../../user_guide/getting_started/supported-models.md#precision-support)** section in the Supported Models guide.
+For complete details on supported model families, quantization methods, and precision requirements, see the **[Supported Models](../../user_guide/getting_started/supported-models.md)** guide.
 
 **Note**: INT4 GPTQ models can be loaded directly from HuggingFace Hub or quantized using [GPTQModel](https://github.com/ModelCloud/GPTQModel). No additional quantization step with `tensorrt-edgellm-quantize-llm` is required for pre-quantized GPTQ checkpoints.
 
@@ -372,7 +374,7 @@ curl -I https://huggingface.co
 # Should return HTTP 200 OK
 ```
 
-3. For gated models (Llama, Phi-4), login to HuggingFace:
+3. For gated models (Llama, Phi-4-Multimodal), login to HuggingFace:
 ```bash
 huggingface-cli login
 # Enter your access token

@@ -162,6 +162,7 @@ def executable_files(env_config):
     return {
         'llm_build': f"{build_dir}/examples/llm/llm_build",
         'llm_inference': f"{build_dir}/examples/llm/llm_inference",
+        'llm_bench': f"{build_dir}/examples/llm/llm_bench",
         'visual_build': f"{build_dir}/examples/multimodal/visual_build",
         'unit_test': f"{build_dir}/unitTest"
     }
@@ -267,6 +268,11 @@ def pytest_addoption(parser):
                      action="store",
                      default=None,
                      help="Test priority level (l0, l1, etc.)")
+    parser.addoption("--test-param",
+                     action="append",
+                     default=None,
+                     help="Run a single test case directly without YAML. "
+                     "Can be specified multiple times for multiple cases.")
     parser.addoption("--execution-mode",
                      action="store",
                      default="local",
@@ -328,65 +334,91 @@ def _get_test_list_file(priority):
 
 
 def pytest_generate_tests(metafunc):
-    """Generate parameterized tests based on YAML configuration"""
-    if "test_param" in metafunc.fixturenames:
-        priority = metafunc.config.getoption("--priority", "l0")
-        test_list_file = _get_test_list_file(priority)
+    """Generate parameterized tests from --test-param CLI args or YAML config"""
+    if "test_param" not in metafunc.fixturenames:
+        return
 
-        if not test_list_file:
-            return
+    # --test-param takes precedence: inject directly, skip YAML entirely
+    direct_params = metafunc.config.getoption("--test-param")
+    if direct_params:
+        metafunc.parametrize("test_param", direct_params)
+        return
 
-        test_cases = test_list_file.get('tests', [])
-        current_test_name = metafunc.function.__name__
+    priority = metafunc.config.getoption("--priority", "l0")
+    test_list_file = _get_test_list_file(priority)
 
-        relevant_tests = []
-        current_test_file = metafunc.module.__name__
+    if not test_list_file:
+        return
 
-        for test_case in test_cases:
-            if isinstance(test_case, str):
-                if '::' in test_case:
-                    test_file_path, test_function_part = test_case.split(
-                        '::', 1)
-                    test_module = test_file_path.replace('/', '.').replace(
-                        '.py', '')
+    test_cases = test_list_file.get('tests', [])
+    current_test_name = metafunc.function.__name__
 
-                    if (test_module == current_test_file
-                            and current_test_name in test_function_part):
-                        if '[' in test_case and ']' in test_case:
-                            param = test_case.split('[')[1].split(']')[0]
-                            relevant_tests.append(param)
+    relevant_tests = []
+    current_test_file = metafunc.module.__name__
 
-        if relevant_tests:
-            metafunc.parametrize("test_param", relevant_tests)
+    for test_case in test_cases:
+        if isinstance(test_case, str):
+            if '::' in test_case:
+                test_file_path, test_function_part = test_case.split('::', 1)
+                test_module = test_file_path.replace('/',
+                                                     '.').replace('.py', '')
+
+                if test_module != current_test_file:
+                    continue
+                # Match class name when both YAML entry and test belong to a class
+                if '::' in test_function_part:
+                    yaml_class, yaml_func = test_function_part.split('::', 1)
+                    if metafunc.cls and metafunc.cls.__name__ != yaml_class:
+                        continue
+                    if current_test_name not in yaml_func:
+                        continue
+                elif current_test_name not in test_function_part:
+                    continue
+
+                if '[' in test_case and ']' in test_case:
+                    param = test_case.split('[')[1].split(']')[0]
+                    relevant_tests.append(param)
+
+    if relevant_tests:
+        metafunc.parametrize("test_param", relevant_tests)
 
 
 def pytest_collection_modifyitems(config, items):
-    """Keep only test functions that are explicitly configured in the YAML file"""
+    """Filter and reorder tests to strictly follow YAML declaration order"""
+    # --test-param bypasses YAML filtering entirely
+    if config.getoption("--test-param"):
+        return
+
     priority = config.getoption("--priority", "l0")
     test_list_file = _get_test_list_file(priority)
 
     if not test_list_file:
         return
 
-    configured_tests = set()
+    item_by_name = {}
+    item_by_base = {}
+    for item in items:
+        item_by_name.setdefault(item.name, []).append(item)
+        if '[' in item.name:
+            base = item.name.split('[')[0]
+            item_by_base.setdefault(base, []).append(item)
+
+    ordered = []
+    seen = set()
     for test_case in test_list_file.get('tests', []):
-        if isinstance(test_case, str):
-            test_name = test_case.split('::')[-1]
-            configured_tests.add(test_name)
+        if not isinstance(test_case, str):
+            continue
+        test_name = test_case.split('::')[-1]
 
-    def matches_configured_test(item_name, configured_tests):
-        """Check if item name matches any configured test, handling parameterized tests"""
-        # Check exact match first
-        if item_name in configured_tests:
-            return True
-        # For parameterized tests, check if base name (without [param]) matches
-        if '[' in item_name:
-            base_name = item_name.split('[')[0]
-            if base_name in configured_tests:
-                return True
-        return False
+        for item in item_by_name.get(test_name, []):
+            if id(item) not in seen:
+                ordered.append(item)
+                seen.add(id(item))
 
-    items[:] = [
-        item for item in items
-        if matches_configured_test(item.name, configured_tests)
-    ]
+        if '[' not in test_name:
+            for item in item_by_base.get(test_name, []):
+                if id(item) not in seen:
+                    ordered.append(item)
+                    seen.add(id(item))
+
+    items[:] = ordered

@@ -122,6 +122,10 @@ private:
     //! @return true if parsing was successful, false otherwise
     bool parseCode2WavConfig();
 
+    //! Parse Nemotron-Omni audio encoder configuration from sound_config.
+    //! @return true if parsing was successful, false otherwise
+    bool parseNemotronOmniAudioConfig();
+
     //! Set up optimization profile for audio encoder.
     //! Creates optimization profile with appropriate dynamic shapes for audio inputs.
     //! @param builder TensorRT builder object (must not be null)
@@ -135,6 +139,12 @@ private:
     //! @param profile Optimization profile to configure
     //! @return true if setup was successful, false otherwise
     bool setupQwen3OmniAudioEncoderProfile(nvinfer1::IOptimizationProfile& profile);
+
+    //! Set up Nemotron-Omni Parakeet audio encoder profile.
+    //! Configures inputs: input_features [batch, seq_len, mel_bins] + attention_mask [batch, seq_len].
+    //! @param profile Optimization profile to configure
+    //! @return true if setup was successful, false otherwise
+    bool setupNemotronOmniAudioEncoderProfile(nvinfer1::IOptimizationProfile& profile);
 
     //! Set up optimization profile for Code2Wav vocoder.
     //! Creates optimization profile with appropriate dynamic shapes for code inputs.

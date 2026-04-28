@@ -23,6 +23,9 @@
 #include "common/stringUtils.h"
 #include "kernels/embeddingKernels/embeddingKernels.h"
 #include "kernels/talkerMLPKernels/talkerMLPKernels.h"
+#ifdef CUTE_DSL_GEMM_ENABLED
+#include "kernels/talkerMLPKernels/cuteDslGemmRunner.h"
+#endif
 #include "profiling/metrics.h"
 #include "profiling/nvtx_wrapper.h"
 #include "profiling/timer.h"
@@ -31,7 +34,6 @@
 #include <chrono>
 #include <cmath>
 #include <cuda_runtime.h>
-#include <dlfcn.h>
 #include <filesystem>
 #include <fstream>
 #include <nlohmann/json.hpp>
@@ -122,24 +124,37 @@ Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std
         throw std::runtime_error("Failed to initialize engine runners");
     }
 
+    // Setup shared execution context memory for Talker and CodePredictor engines.
+    // LLMEngineRunner uses kUSER_MANAGED allocation and requires setContextMemory() before execution.
+    {
+        int64_t const talkerCtxSize = mTalkerLLMRunner->getRequiredContextMemorySize();
+        int64_t const cpCtxSize = mCodePredictorRunner ? mCodePredictorRunner->getRequiredContextMemorySize() : 0;
+        int64_t const sharedCtxSize = std::max(talkerCtxSize, cpCtxSize);
+        LOG_INFO("Setup shared execution context memory: %zu bytes (talker: %zu, code_predictor: %zu)",
+            static_cast<size_t>(sharedCtxSize), static_cast<size_t>(talkerCtxSize), static_cast<size_t>(cpCtxSize));
+        mSharedExecContextMemory = rt::Tensor({sharedCtxSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8,
+            "Qwen3OmniTTSRuntime::mSharedExecContextMemory");
+        if (!mTalkerLLMRunner->setContextMemory(mSharedExecContextMemory))
+        {
+            throw std::runtime_error("Failed to set context memory for Talker LLM engine");
+        }
+        if (mCodePredictorRunner && !mCodePredictorRunner->setContextMemory(mSharedExecContextMemory))
+        {
+            throw std::runtime_error("Failed to set context memory for CodePredictor engine");
+        }
+    }
+
     if (!loadCodePredictorWeights(codePredictorEngineDir))
     {
         throw std::runtime_error("Failed to load CodePredictor weights");
     }
 
-    // Dynamically load cuBLAS to avoid compile-time dependency
-    void* cublasLib = dlopen("libcublas.so", RTLD_LAZY);
-    if (!cublasLib)
+#ifdef CUTE_DSL_GEMM_ENABLED
+    if (!CuteDslGemmRunner::loadKernelModule())
     {
-        throw std::runtime_error("Failed to load libcublas.so");
+        throw std::runtime_error("Failed to load CuTe DSL GEMM kernel module");
     }
-    auto cublasCreateFn = reinterpret_cast<int (*)(void**)>(dlsym(cublasLib, "cublasCreate_v2"));
-    if (!cublasCreateFn || cublasCreateFn(&mCublasHandle) != 0)
-    {
-        throw std::runtime_error("Failed to create cuBLAS handle");
-    }
-    // Note: do NOT dlclose here - cuBLAS handle requires library to remain loaded
-    // Library will be closed in destructor after cublasDestroy
+#endif
 
     if (!allocateBuffer())
     {
@@ -158,20 +173,9 @@ Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std
 
 Qwen3OmniTTSRuntime::~Qwen3OmniTTSRuntime()
 {
-    if (mCublasHandle)
-    {
-        void* cublasLib = dlopen("libcublas.so", RTLD_LAZY);
-        if (cublasLib)
-        {
-            auto cublasDestroyFn = reinterpret_cast<int (*)(void*)>(dlsym(cublasLib, "cublasDestroy_v2"));
-            if (cublasDestroyFn)
-            {
-                cublasDestroyFn(mCublasHandle);
-            }
-            dlclose(cublasLib);
-        }
-        mCublasHandle = nullptr;
-    }
+#ifdef CUTE_DSL_GEMM_ENABLED
+    CuteDslGemmRunner::unloadKernelModule();
+#endif
 }
 
 bool Qwen3OmniTTSRuntime::initializeEngineRunners(
@@ -191,7 +195,7 @@ bool Qwen3OmniTTSRuntime::initializeEngineRunners(
 
         LOG_INFO("Talker LLM engine loaded: vocabSize=%d, hiddenSize=%d", mTalkerLLMConfig.vocabSize,
             mTalkerLLMConfig.hiddenSize);
-        auto talkerKVType = mTalkerLLMRunner->getLinearKVCache().getConfig().kvCacheTypeTRT;
+        auto talkerKVType = mTalkerLLMRunner->getCacheManager().getKVCacheManager().getConfig().kvCacheType;
         LOG_INFO("Talker KV cache dtype: %s",
             talkerKVType == nvinfer1::DataType::kHALF ? "FP16"
                                                       : (talkerKVType == nvinfer1::DataType::kFP8 ? "FP8" : "UNKNOWN"));
@@ -226,7 +230,7 @@ bool Qwen3OmniTTSRuntime::initializeEngineRunners(
 
         LOG_INFO("CodePredictor engine loaded: vocabSize=%d, hiddenSize=%d, numLayers=%d",
             mCodePredictorConfig.vocabSize, mCodePredictorConfig.hiddenSize, mCodePredictorConfig.numDecoderLayers);
-        auto cpKVType = mCodePredictorRunner->getLinearKVCache().getConfig().kvCacheTypeTRT;
+        auto cpKVType = mCodePredictorRunner->getCacheManager().getKVCacheManager().getConfig().kvCacheType;
         LOG_INFO("CodePredictor KV cache dtype: %s",
             cpKVType == nvinfer1::DataType::kHALF ? "FP16"
                                                   : (cpKVType == nvinfer1::DataType::kFP8 ? "FP8" : "UNKNOWN"));
@@ -647,11 +651,11 @@ void Qwen3OmniTTSRuntime::initializeTTSEmbeddings(cudaStream_t stream)
     CUDA_CHECK(cudaMemcpyAsync(
         ttsIds.rawPointer(), hostTtsIds.data(), kNumTtsTokens * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
 
-    kernel::embeddingLookup(ttsIds, mTextEmbeddingTable, ttsRaw, stream);
+    kernel::embeddingLookup(ttsIds, mTextEmbeddingTable, std::nullopt, ttsRaw, stream);
     // Reshape from [1, 3, hidden] to [3, hidden] for MLP (expects 2D input)
     check::check(ttsRaw.reshape({kNumTtsTokens, thinkerHiddenSize}), "Tensor reshape failed");
-    kernel::invokeTalkerMLP(mCublasHandle, ttsRaw, mTextFC1Weight, mTextFC1Bias, mTextFC2Weight, mTextFC2Bias,
-        ttsProjected, workspace, stream);
+    kernel::invokeTalkerMLP(
+        ttsRaw, mTextFC1Weight, mTextFC1Bias, mTextFC2Weight, mTextFC2Bias, ttsProjected, workspace, stream);
 
     int64_t const hiddenSize = mTalkerConfig.talkerHiddenSize;
     mTtsPadEmbed = rt::Tensor({hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
@@ -686,8 +690,8 @@ bool Qwen3OmniTTSRuntime::projectToTalkerInput(
     // Project all tokens via text_projection MLP
     check::check(mProjectedBuffer.reshape({seqLen, hiddenSize}), "Tensor reshape failed");
     check::check(mMLPWorkspace.reshape({seqLen, thinkerHiddenSize}), "Tensor reshape failed");
-    kernel::invokeTalkerMLP(mCublasHandle, thinkerEmbed, mTextFC1Weight, mTextFC1Bias, mTextFC2Weight, mTextFC2Bias,
-        mProjectedBuffer, mMLPWorkspace, stream);
+    kernel::invokeTalkerMLP(thinkerEmbed, mTextFC1Weight, mTextFC1Bias, mTextFC2Weight, mTextFC2Bias, mProjectedBuffer,
+        mMLPWorkspace, stream);
 
     // Fused kernel: build complete non-streaming prefill buffer
     check::check(output.reshape({outputSeqLen, hiddenSize}), "Tensor reshape failed");
@@ -706,9 +710,14 @@ bool Qwen3OmniTTSRuntime::executeTalkerPrefillStep(
     // Reset Talker KV cache for new sequence
     int32_t* reuseData = mHostReuseKVCacheLengths.dataPointer<int32_t>();
     reuseData[0] = 0; // No KV cache reuse
-    mTalkerLLMRunner->getLinearKVCache().resetForNewSequences(mHostReuseKVCacheLengths, stream);
-    rt::Tensor talkerKV = mTalkerLLMRunner->getLinearKVCache().getKVCacheBuffer();
-    CUDA_CHECK(cudaMemsetAsync(talkerKV.rawPointer(), 0, talkerKV.getMemoryCapacity(), stream));
+    auto& talkerCacheManager = mTalkerLLMRunner->getCacheManager();
+    talkerCacheManager.resetForNewSequences(mHostReuseKVCacheLengths, stream);
+    auto& talkerKVManager = talkerCacheManager.getKVCacheManager();
+    for (int32_t i = 0; i < talkerKVManager.numLayers(); ++i)
+    {
+        rt::Tensor& layerKV = talkerKVManager.getCombinedKVCache(i);
+        CUDA_CHECK(cudaMemsetAsync(layerKV.rawPointer(), 0, layerKV.getMemoryCapacity(), stream));
+    }
 
     auto inputShape = inputEmbeds.getShape();
     if (inputShape.getNumDims() != 3)
@@ -745,9 +754,14 @@ bool Qwen3OmniTTSRuntime::executeCodePredictorPrefillStep(rt::Tensor const& code
     // Reset CodePredictor KV cache for new frame (each frame is independent)
     int32_t* reuseData = mHostReuseKVCacheLengths.dataPointer<int32_t>();
     reuseData[0] = 0; // No KV cache reuse
-    mCodePredictorRunner->getLinearKVCache().resetForNewSequences(mHostReuseKVCacheLengths, stream);
-    rt::Tensor cpKV = mCodePredictorRunner->getLinearKVCache().getKVCacheBuffer();
-    CUDA_CHECK(cudaMemsetAsync(cpKV.rawPointer(), 0, cpKV.getMemoryCapacity(), stream));
+    auto& cpCacheManager = mCodePredictorRunner->getCacheManager();
+    cpCacheManager.resetForNewSequences(mHostReuseKVCacheLengths, stream);
+    auto& cpKVManager = cpCacheManager.getKVCacheManager();
+    for (int32_t i = 0; i < cpKVManager.numLayers(); ++i)
+    {
+        rt::Tensor& layerKV = cpKVManager.getCombinedKVCache(i);
+        CUDA_CHECK(cudaMemsetAsync(layerKV.rawPointer(), 0, layerKV.getMemoryCapacity(), stream));
+    }
 
     int32_t* const hostContextLength = mHostCodePredictorContextLength.dataPointer<int32_t>();
     hostContextLength[0] = kCodePredictorPrefillSeqLen;
@@ -782,7 +796,8 @@ bool Qwen3OmniTTSRuntime::executeCodePredictorDecodingStep(int32_t tokenId, int3
     int32_t const embedIdx = std::min(embeddingTableIndex, kNumRvqLayers - 1);
     // Lookup into mRawCodecEmbed (talkerHiddenSize=2048) — codec embedding tables are in Talker's space
     check::check(mRawCodecEmbed.reshape({1, 1, mTalkerConfig.talkerHiddenSize}), "Tensor reshape failed");
-    kernel::embeddingLookup(mCodePredictorCodecIds, mCodePredictorEmbeddingTables[embedIdx], mRawCodecEmbed, stream);
+    kernel::embeddingLookup(
+        mCodePredictorCodecIds, mCodePredictorEmbeddingTables[embedIdx], std::nullopt, mRawCodecEmbed, stream);
 
     // Save raw (2048-dim) embedding to mCodecHiddensBuffer for residual connection
     // Position mapping: generationStep 1->pos 1, 2->pos 2, ..., 14->pos 14
@@ -797,8 +812,7 @@ bool Qwen3OmniTTSRuntime::executeCodePredictorDecodingStep(int32_t tokenId, int3
     // Project mRawCodecEmbed (2048) → mCodePredictorCodecEmbed (1024) via small_to_mtp_projection
     check::check(mRawCodecEmbed.reshape({1, mTalkerConfig.talkerHiddenSize}), "Tensor reshape failed");
     check::check(mCodePredictorCodecEmbed.reshape({1, mTalkerConfig.codePredictorHiddenSize}), "Tensor reshape failed");
-    kernel::invokeLinearLayer(
-        mCublasHandle, mRawCodecEmbed, mSmallToMtpWeight, mSmallToMtpBias, mCodePredictorCodecEmbed, stream);
+    kernel::invokeLinearLayer(mRawCodecEmbed, mSmallToMtpWeight, mSmallToMtpBias, mCodePredictorCodecEmbed, stream);
 
     int32_t const lmHeadIdx = std::min(generationStep, kNumRvqLayers - 1);
 
@@ -900,7 +914,7 @@ bool Qwen3OmniTTSRuntime::prepareTalkerInput(std::vector<int32_t> const& textTok
     CUDA_CHECK(cudaMemcpyAsync(mGpuTokenIdsBuffer.rawPointer(), textTokenIds.data(), seqLen * sizeof(int32_t),
         cudaMemcpyHostToDevice, stream));
     check::check(mThinkerEmbedBuffer.reshape({1, seqLen, thinkerHiddenSize}), "Tensor reshape failed");
-    kernel::embeddingLookup(mGpuTokenIdsBuffer, mTextEmbeddingTable, mThinkerEmbedBuffer, stream);
+    kernel::embeddingLookup(mGpuTokenIdsBuffer, mTextEmbeddingTable, std::nullopt, mThinkerEmbedBuffer, stream);
     check::check(mThinkerEmbedBuffer.reshape({seqLen, thinkerHiddenSize}), "Tensor reshape failed");
 
     // Determine speaker ID
@@ -1140,18 +1154,17 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t codecToken,
     CUDA_CHECK(cudaMemcpyAsync(
         mCodePredictorCodecIds.rawPointer(), &codecToken, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
     check::check(mRawCodecEmbed.reshape({1, 1, mTalkerConfig.talkerHiddenSize}), "Tensor reshape failed");
-    kernel::embeddingLookup(mCodePredictorCodecIds, mTalkerEmbeddingTable, mRawCodecEmbed, stream);
+    kernel::embeddingLookup(mCodePredictorCodecIds, mTalkerEmbeddingTable, std::nullopt, mRawCodecEmbed, stream);
 
     // Step 2: Project talkerHiddenState (2048) → mSmallToMtpProjectedHidden (1024)
     // talkerHiddenState is mTalkerLastHidden with shape {1, talkerHiddenSize=2048}
     kernel::invokeLinearLayer(
-        mCublasHandle, talkerHiddenState, mSmallToMtpWeight, mSmallToMtpBias, mSmallToMtpProjectedHidden, stream);
+        talkerHiddenState, mSmallToMtpWeight, mSmallToMtpBias, mSmallToMtpProjectedHidden, stream);
 
     // Step 3: Project mRawCodecEmbed (2048) → mCodePredictorCodecEmbed (1024)
     check::check(mRawCodecEmbed.reshape({1, mTalkerConfig.talkerHiddenSize}), "Tensor reshape failed");
     check::check(mCodePredictorCodecEmbed.reshape({1, mTalkerConfig.codePredictorHiddenSize}), "Tensor reshape failed");
-    kernel::invokeLinearLayer(
-        mCublasHandle, mRawCodecEmbed, mSmallToMtpWeight, mSmallToMtpBias, mCodePredictorCodecEmbed, stream);
+    kernel::invokeLinearLayer(mRawCodecEmbed, mSmallToMtpWeight, mSmallToMtpBias, mCodePredictorCodecEmbed, stream);
 
     // Step 4: Concat projected tensors into mCodePredictorPrefillInput [1, 2, codePredictorHiddenSize]
     CUDA_CHECK(cudaMemcpyAsync(mCodePredictorPrefillInput.rawPointer(), mSmallToMtpProjectedHidden.rawPointer(),

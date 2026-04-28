@@ -23,20 +23,25 @@ for large language models and vision-language models on edge devices.
    :maxdepth: 2
    :caption: Examples
 
+   user_guide/examples/index.md
    user_guide/examples/vlm.md
    user_guide/examples/speculative-decoding.md
    user_guide/examples/phi4.md
    user_guide/examples/asr.md
    user_guide/examples/moe.md
    user_guide/examples/tts.md
+   user_guide/examples/experimental-server.md
 
 .. toctree::
    :maxdepth: 2
    :caption: Features
 
    user_guide/features/lora.md
+   user_guide/features/quantization.md
    user_guide/features/reduce-vocab.md
    user_guide/features/FP8KV.md
+   user_guide/features/fp8-embedding.md
+   user_guide/features/streaming.md
    user_guide/features/system-prompt-cache.md
 
 .. toctree::
@@ -48,13 +53,22 @@ for large language models and vision-language models on edge devices.
 
 .. toctree::
    :maxdepth: 2
+   :caption: Performance
+
+   user_guide/performance/performance-benchmarks.md
+
+.. toctree::
+   :maxdepth: 2
    :caption: Software Design
 
+   developer_guide/software-design/llm-loader.md
+   developer_guide/software-design/experimental-quantization.md
    developer_guide/software-design/python-export-pipeline.md
    developer_guide/software-design/engine-builder.md
    developer_guide/software-design/cpp-runtime-overview.md
    developer_guide/software-design/llm-inference-runtime.md
    developer_guide/software-design/llm-inference-specdecode-runtime.md
+   developer_guide/software-design/llm-streaming.md
 
 .. toctree::
    :maxdepth: 2

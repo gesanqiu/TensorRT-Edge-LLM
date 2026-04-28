@@ -260,7 +260,10 @@ private:
     LLMEngineRunnerConfig mTalkerLLMConfig;     //!< Talker LLM configuration
     LLMEngineRunnerConfig mCodePredictorConfig; //!< CodePredictor configuration
 
-    void* mCublasHandle{nullptr}; //!< cuBLAS handle (opaque, managed via dlopen)
+    //! Shared GPU execution context memory for Talker and CodePredictor (kUSER_MANAGED).
+    rt::Tensor mSharedExecContextMemory;
+
+    // cuBLAS handle removed — GEMM is now via CuTe DSL compiled kernels (CuteDslGemmRunner).
 
     // Projects from thinker (embedding) space to talker input space
     rt::Tensor mTextFC1Weight; //!< FC1 weight [2048, 2048] FP16 column-major

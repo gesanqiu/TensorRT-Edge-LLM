@@ -24,15 +24,66 @@ The module contains:
 - EdgeLLMModelForCausalLM: Wrapper for causal language modeling tasks
 """
 
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
 
 from .. import model_utils
 from ..layers.gather_nd import custom_gather_nd
-from ..layers.layers import EdgeLLMDecoderLayer, EdgeLLMHybridBlock
+from ..layers.layers import (EdgeLLMDecoderLayer, EdgeLLMGatedDeltaNetLayer,
+                             EdgeLLMNemotronHBlock)
 from ..layers.reduced_lm_head import reduce_lm_head
+
+
+class BaseEdgeLLMCausalLMWrapper(nn.Module):
+    """
+    Shared utilities for export-time CausalLM wrappers.
+
+    This base class intentionally does not define a unified `forward` signature.
+    Different model families expose different state inputs/outputs, and ONNX
+    export relies on explicit, stable argument ordering per wrapper.
+    """
+
+    def _init_causal_lm_common(
+        self,
+        hf_model: nn.Module,
+        language_model: nn.Module,
+        config: Any,
+        reduced_vocab_size: Optional[int] = None,
+        vocab_map: Optional[torch.Tensor] = None,
+    ) -> None:
+        self.torch_dtype = hf_model.dtype
+        self.config = config
+
+        # Some models use `embed_tokens`, others use `embeddings`.
+        embed_layer = getattr(language_model, 'embed_tokens',
+                              None) or language_model.embeddings
+        self.embed_tokens = embed_layer.to(self.torch_dtype)
+
+        if reduced_vocab_size is not None and vocab_map is not None:
+            print(
+                f"Reducing vocabulary size from {hf_model.lm_head.out_features}"
+                f" to {reduced_vocab_size}")
+            if vocab_map.shape[0] != reduced_vocab_size:
+                raise ValueError(
+                    f"vocab_map size {vocab_map.shape[0]} does not match "
+                    f"reduced_vocab_size {reduced_vocab_size}")
+            self.lm_head = reduce_lm_head(hf_model.lm_head, reduced_vocab_size,
+                                          vocab_map)
+        else:
+            self.lm_head = hf_model.lm_head
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    def _compute_logits(self, hidden_states: torch.Tensor,
+                        last_token_ids: torch.Tensor) -> torch.Tensor:
+        last_hidden_state_gathered = custom_gather_nd(hidden_states,
+                                                      last_token_ids, 1)
+        logits = self.lm_head(last_hidden_state_gathered)
+        return logits.to(torch.float32)
 
 
 class EdgeLLMModel(nn.Module):
@@ -170,8 +221,8 @@ class EdgeLLMModel(nn.Module):
         return hidden_states, present_key_values, all_hidden_states
 
 
-class EdgeLLMHybridModel(nn.Module):
-    """EdgeLLM model for hybrid architectures like Nemotron-Nano (Mamba+Attention+MLP).
+class EdgeLLMNemotronHModel(nn.Module):
+    """EdgeLLM model implementation specialized for Nemotron-H.
 
     Unlike :class:`EdgeLLMModel` which assumes uniform attention+MLP layers,
     this class reads ``config.layers_block_type`` to wrap each block
@@ -191,7 +242,7 @@ class EdgeLLMHybridModel(nn.Module):
         self.block_types: List[str] = list(self.config.layers_block_type)
 
         self.layers = nn.ModuleList([
-            EdgeLLMHybridBlock(hf_layer, self.torch_dtype)
+            EdgeLLMNemotronHBlock(hf_layer, self.torch_dtype)
             for hf_layer in hf_model.layers
         ])
 
@@ -218,7 +269,7 @@ class EdgeLLMHybridModel(nn.Module):
         return len(self.attn_layer_indices)
 
     @property
-    def num_mamba_layers(self) -> int:
+    def num_linear_attn_layers(self) -> int:
         return len(self.mamba_layer_indices)
 
     def forward(
@@ -226,7 +277,7 @@ class EdgeLLMHybridModel(nn.Module):
         inputs_embeds: torch.Tensor,
         past_key_values: Tuple[torch.Tensor, ...],
         conv_states: Tuple[torch.Tensor, ...],
-        ssm_states: Tuple[torch.Tensor, ...],
+        recurrent_states: Tuple[torch.Tensor, ...],
         rope_rotary_cos_sin: torch.Tensor,
         context_lengths: torch.Tensor,
         kvcache_start_index: torch.Tensor,
@@ -236,12 +287,12 @@ class EdgeLLMHybridModel(nn.Module):
             torch.Tensor, ...], Tuple[torch.Tensor, ...]]:
         """
         Returns:
-            (hidden_states, present_key_values, present_conv_states, present_ssm_states)
+            (hidden_states, present_key_values, present_conv_states, present_recurrent_states)
         """
         hidden_states = inputs_embeds
         present_key_values: Tuple[torch.Tensor, ...] = ()
         present_conv_states: Tuple[torch.Tensor, ...] = ()
-        present_ssm_states: Tuple[torch.Tensor, ...] = ()
+        present_recurrent_states: Tuple[torch.Tensor, ...] = ()
 
         attn_idx = 0
         mamba_idx = 0
@@ -252,9 +303,9 @@ class EdgeLLMHybridModel(nn.Module):
             if bt == "mamba":
                 hidden_states, conv_state_out, ssm_state_out = layer.forward_mamba(
                     hidden_states, conv_states[mamba_idx],
-                    ssm_states[mamba_idx])
+                    recurrent_states[mamba_idx], context_lengths)
                 present_conv_states += (conv_state_out, )
-                present_ssm_states += (ssm_state_out, )
+                present_recurrent_states += (ssm_state_out, )
                 mamba_idx += 1
 
             elif bt == "attention":
@@ -273,12 +324,21 @@ class EdgeLLMHybridModel(nn.Module):
             elif bt == "mlp":
                 hidden_states = layer.forward_mlp(hidden_states)
 
+            elif bt == "moe":
+                hidden_states = layer.forward_moe(hidden_states)
+
         hidden_states = self.norm(hidden_states)
-        return hidden_states, present_key_values, present_conv_states, present_ssm_states
+        return hidden_states, present_key_values, present_conv_states, present_recurrent_states
 
 
-class EdgeLLMHybridModelForCausalLM(nn.Module):
-    """Causal LM wrapper for hybrid Mamba+Attention architectures."""
+class EdgeLLMHybridModelForCausalLM(BaseEdgeLLMCausalLMWrapper):
+    """
+    Causal LM wrapper for hybrid LinearAttention+Attention architectures.
+    
+    This wrapper provides a consistent interface for different types of hybrid
+    models, including Nemotron-H and Qwen3-5. It handles model structure differences
+    and provides uniform forward pass behavior.
+    """
 
     def __init__(
         self,
@@ -290,33 +350,22 @@ class EdgeLLMHybridModelForCausalLM(nn.Module):
 
         language_model, config = model_utils.prepare_language_model_and_config(
             hf_model)
-        self.torch_dtype = hf_model.dtype
-        self.config = config
-        embed_layer = getattr(language_model, 'embed_tokens',
-                              None) or language_model.embeddings
-        self.embed_tokens = embed_layer.to(self.torch_dtype)
+        self._init_causal_lm_common(hf_model, language_model, config,
+                                    reduced_vocab_size, vocab_map)
 
-        self.model = EdgeLLMHybridModel(language_model)
-
-        if reduced_vocab_size is not None and vocab_map is not None:
-            print(
-                f"Reducing vocabulary size from {hf_model.lm_head.out_features}"
-                f" to {reduced_vocab_size}")
-            self.lm_head = reduce_lm_head(hf_model.lm_head, reduced_vocab_size,
-                                          vocab_map)
+        if config.model_type == "nemotron_h":
+            self.model = EdgeLLMNemotronHModel(language_model)
+        elif config.model_type == "qwen3_5_text":
+            self.model = EdgeLLMQwen3_5Model(language_model)
         else:
-            self.lm_head = hf_model.lm_head
-
-    @property
-    def device(self):
-        return next(self.parameters()).device
+            raise ValueError(f"Unsupported model type: {config.model_type}")
 
     def forward(
         self,
         inputs_embeds: torch.Tensor,
         past_key_values: Tuple[torch.Tensor, ...],
         conv_states: Tuple[torch.Tensor, ...],
-        ssm_states: Tuple[torch.Tensor, ...],
+        recurrent_states: Tuple[torch.Tensor, ...],
         rope_rotary_cos_sin: torch.Tensor,
         context_lengths: torch.Tensor,
         last_token_ids: torch.Tensor,
@@ -327,13 +376,13 @@ class EdgeLLMHybridModelForCausalLM(nn.Module):
             torch.Tensor, ...], Tuple[torch.Tensor, ...]]:
         """
         Returns:
-            (logits, present_key_values, present_conv_states, present_ssm_states)
+            (logits, present_key_values, present_conv_states, present_recurrent_states)
         """
-        hidden_states, present_key_values, present_conv_states, present_ssm_states = self.model(
+        hidden_states, present_key_values, present_conv_states, present_recurrent_states = self.model(
             inputs_embeds=inputs_embeds,
             past_key_values=past_key_values,
             conv_states=conv_states,
-            ssm_states=ssm_states,
+            recurrent_states=recurrent_states,
             rope_rotary_cos_sin=rope_rotary_cos_sin,
             context_lengths=context_lengths,
             kvcache_start_index=kvcache_start_index,
@@ -341,16 +390,13 @@ class EdgeLLMHybridModelForCausalLM(nn.Module):
             attention_mask=attention_mask,
         )
 
-        last_hidden_state_gathered = custom_gather_nd(hidden_states,
-                                                      last_token_ids, 1)
-        logits = self.lm_head(last_hidden_state_gathered)
-        logits = logits.to(torch.float32)
+        logits = self._compute_logits(hidden_states, last_token_ids)
 
         return logits, tuple(present_key_values), tuple(
-            present_conv_states), tuple(present_ssm_states)
+            present_conv_states), tuple(present_recurrent_states)
 
 
-class EdgeLLMModelForCausalLM(nn.Module):
+class EdgeLLMModelForCausalLM(BaseEdgeLLMCausalLMWrapper):
     """
     EdgeLLM Model for Causal Language Modeling.
     
@@ -384,33 +430,13 @@ class EdgeLLMModelForCausalLM(nn.Module):
 
         language_model, config = model_utils.prepare_language_model_and_config(
             hf_model)
-        self.torch_dtype = hf_model.dtype
-        self.config = config
-        self.embed_tokens = language_model.embed_tokens.to(self.torch_dtype)
+        self._init_causal_lm_common(hf_model, language_model, config,
+                                    reduced_vocab_size, vocab_map)
 
         # Create EdgeLLMModel with the original model
         self.model = EdgeLLMModel(language_model, is_eagle_base)
 
-        # Handle lm_head with optional vocabulary reduction
-        if reduced_vocab_size is not None and vocab_map is not None:
-            # Reduce the vocabulary size of lm_head
-            print(
-                f"Reducing vocabulary size from {hf_model.lm_head.out_features} "
-                f"to {reduced_vocab_size}")
-            assert vocab_map.shape[
-                0] == reduced_vocab_size, f"vocab_map size {vocab_map.shape[0]} does not match reduced_vocab_size {reduced_vocab_size}"
-            self.lm_head = reduce_lm_head(hf_model.lm_head, reduced_vocab_size,
-                                          vocab_map)
-        else:
-            # Keep the original lm_head
-            self.lm_head = hf_model.lm_head
-
         self.is_eagle_base = is_eagle_base
-
-    @property
-    def device(self):
-        """Get the device of the model's parameters."""
-        return next(self.parameters()).device
 
     def forward(
         self,
@@ -461,13 +487,7 @@ class EdgeLLMModelForCausalLM(nn.Module):
             deepstack_visual_embeds=deepstack_visual_embeds,
         )
 
-        # Extract last token hidden states and compute logits
-        # Use custom_gather_nd for all models to support batch dimensions
-        last_hidden_state_gathered = custom_gather_nd(hidden_states,
-                                                      last_token_ids, 1)
-
-        logits = self.lm_head(last_hidden_state_gathered)
-        logits = logits.to(torch.float32)
+        logits = self._compute_logits(hidden_states, last_token_ids)
 
         # Handle different model types
         if self.is_eagle_base:
@@ -508,3 +528,110 @@ class EdgeLLMModelForCausalLM(nn.Module):
 
         # Standard model: return only logits and kv cache (original behavior)
         return logits, tuple(present_key_values)
+
+
+class EdgeLLMQwen3_5Model(nn.Module):
+    """
+    EdgeLLM model implementation specialized for Qwen3.5.
+
+    This model implements the main component for Qwen3.5. It processes input through
+    decoder layers with proper normalization and can output hidden states
+    for Qwen3.5 variants.
+    """
+
+    def __init__(self, hf_model: nn.Module) -> None:
+        super().__init__()
+
+        self.config = hf_model.config
+        self.vocab_size = self.config.vocab_size
+        self.torch_dtype = hf_model.dtype
+        self.norm = hf_model.norm.to(self.torch_dtype)
+        self.layer_types = self.config.layer_types
+
+        self.layers = nn.ModuleList([])
+        for hf_layer in hf_model.layers:
+            if hf_layer.layer_type == "full_attention":
+                layer = EdgeLLMDecoderLayer(hf_layer,
+                                            self.torch_dtype,
+                                            eagle3_draft=False)
+                layer.self_attn.max_position_embeddings = self.config.max_position_embeddings
+            elif hf_layer.layer_type == "linear_attention":
+                layer = EdgeLLMGatedDeltaNetLayer(hf_layer, self.torch_dtype)
+            else:
+                raise ValueError(
+                    f"Unsupported layer type: {hf_layer.layer_type}")
+
+            self.layers.append(layer)
+
+    @property
+    def num_attention_layers(self) -> int:
+        return sum(1 for t in self.layer_types if t == "full_attention")
+
+    @property
+    def num_linear_attn_layers(self) -> int:
+        return sum(1 for t in self.layer_types if t == "linear_attention")
+
+    def forward(
+        self,
+        inputs_embeds: torch.Tensor,
+        past_key_values: Tuple[torch.Tensor, ...],
+        conv_states: Tuple[torch.Tensor, ...],
+        recurrent_states: Tuple[torch.Tensor, ...],
+        rope_rotary_cos_sin: torch.Tensor,
+        context_lengths: torch.Tensor,
+        kvcache_start_index: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...], Tuple[
+            torch.Tensor, ...], Tuple[torch.Tensor, ...]]:
+        """
+        Forward pass of the Qwen3.5 model.
+        
+        Args:
+            inputs_embeds: Input embeddings (batch_size, seq_len, hidden_size)
+            past_key_values: Past KV cache, tuple of (batch_size, 2, num_kv_heads, max_position_embeddings, head_dim)
+            conv_states: Conv states, tuple of (batch_size, conv_channels, conv_kernel)
+            recurrent_states: Recurrent states, tuple of (batch_size, hv, kdim, vdim)
+            rope_rotary_cos_sin: RoPE embeddings (batch_size, seq_len, head_dim)
+            context_lengths: Current position in cache (batch_size,)
+            kvcache_start_index: Start index of KV cache (batch_size,)
+            position_ids: Not used in Qwen3.5 model
+            attention_mask: Not used in Qwen3.5 model
+
+        Returns:
+            (hidden_states, present_key_values, present_conv_states, present_recurrent_states)
+        """
+        hidden_states = inputs_embeds
+        present_key_values: Tuple[torch.Tensor, ...] = ()
+        present_conv_states: Tuple[torch.Tensor, ...] = ()
+        present_recurrent_states: Tuple[torch.Tensor, ...] = ()
+
+        attn_idx = 0
+        gdn_idx = 0
+        for layer in self.layers:
+            if isinstance(layer, EdgeLLMDecoderLayer):
+                hidden_states, present_key_value = layer(
+                    hidden_states=hidden_states,
+                    past_key_value=past_key_values[attn_idx],
+                    rope_rotary_cos_sin=rope_rotary_cos_sin,
+                    context_lengths=context_lengths,
+                    kvcache_start_index=kvcache_start_index,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                )
+                present_key_values += (present_key_value, )
+                attn_idx += 1
+            else:
+                hidden_states, conv_state_out, recurrent_state_out = layer(
+                    hidden_states=hidden_states,
+                    conv_state=conv_states[gdn_idx],
+                    recurrent_state=recurrent_states[gdn_idx],
+                    context_lengths=context_lengths,
+                )
+                present_conv_states += (conv_state_out, )
+                present_recurrent_states += (recurrent_state_out, )
+                gdn_idx += 1
+
+        hidden_states = self.norm(hidden_states)
+
+        return hidden_states, present_key_values, present_conv_states, present_recurrent_states

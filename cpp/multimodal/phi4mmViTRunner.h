@@ -77,8 +77,8 @@ public:
     //! \param[in] stream CUDA stream for execution
     //! \return True if preprocessing succeeded, false otherwise
     bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
-        tokenizer::Tokenizer const* tokenizer, rt::Tensor& ropeRotaryCosSinDevice,
-        cudaStream_t stream) noexcept override;
+        tokenizer::Tokenizer const* tokenizer, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream,
+        bool imageOnly = false) noexcept override;
 
     //! \brief Run inference on the vision encoder and perform HD postprocess
     //! \param[in] stream CUDA stream for execution

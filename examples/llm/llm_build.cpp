@@ -42,7 +42,8 @@ enum LLMBuildOptionId : int
     EAGLE_DRAFT = 709,
     EAGLE_BASE = 710,
     MAX_VERIFY_TREE_SIZE = 711,
-    MAX_DRAFT_TREE_SIZE = 712
+    MAX_DRAFT_TREE_SIZE = 712,
+    PROFILING_DETAILED = 713
 };
 
 struct LLMBuildArgs
@@ -59,6 +60,7 @@ struct LLMBuildArgs
     bool eagleBase{false};
     int64_t maxVerifyTreeSize{60};
     int64_t maxDraftTreeSize{60};
+    bool profilingDetailed{false}; // Enable detailed profiling verbosity for layer info extraction
 };
 
 void printUsage(char const* programName)
@@ -67,7 +69,7 @@ void printUsage(char const* programName)
               << " [--help] --onnxDir <dir> --engineDir <dir> [--maxInputLen <int>] "
                  "[--maxKVCacheCapacity <int>] [--maxBatchSize <int>] [--debug] [--maxLoraRank <int>]"
                  "[--eagleDraft] [--eagleBase] [--maxVerifyTreeSize <int>] "
-                 "[--maxDraftTreeSize <int>]"
+                 "[--maxDraftTreeSize <int>] [--profilingDetailed]"
               << std::endl;
     std::cerr << "Options:" << std::endl;
     std::cerr << "  --help                    Display this help message" << std::endl;
@@ -90,6 +92,9 @@ void printUsage(char const* programName)
               << std::endl;
     std::cerr << "  --maxDraftTreeSize        Maximum input_ids tokens passed into Eagle draft model for draft "
                  "generation. Default = 60"
+              << std::endl;
+    std::cerr << "  --profilingDetailed       Enable detailed profiling verbosity to include ONNX op names "
+                 "in layer info. Use for DLSim analysis."
               << std::endl
               << std::endl;
 }
@@ -107,7 +112,8 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
         {"eagleDraft", no_argument, 0, LLMBuildOptionId::EAGLE_DRAFT},
         {"eagleBase", no_argument, 0, LLMBuildOptionId::EAGLE_BASE},
         {"maxVerifyTreeSize", required_argument, 0, LLMBuildOptionId::MAX_VERIFY_TREE_SIZE},
-        {"maxDraftTreeSize", required_argument, 0, LLMBuildOptionId::MAX_DRAFT_TREE_SIZE}, {0, 0, 0, 0}};
+        {"maxDraftTreeSize", required_argument, 0, LLMBuildOptionId::MAX_DRAFT_TREE_SIZE},
+        {"profilingDetailed", no_argument, 0, LLMBuildOptionId::PROFILING_DETAILED}, {0, 0, 0, 0}};
 
     int opt;
     while ((opt = getopt_long(argc, argv, "", buildOptions, nullptr)) != -1)
@@ -176,6 +182,7 @@ bool parseLLMBuildArgs(LLMBuildArgs& args, int argc, char* argv[])
                 args.maxDraftTreeSize = std::stoi(optarg);
             }
             break;
+        case LLMBuildOptionId::PROFILING_DETAILED: args.profilingDetailed = true; break;
         default: LOG_ERROR("Invalid Argument %c is %s.", opt, optarg); return false;
         }
     }
@@ -226,6 +233,7 @@ int main(int argc, char** argv)
     config.eagleBase = args.eagleBase;
     config.maxVerifyTreeSize = args.maxVerifyTreeSize;
     config.maxDraftTreeSize = args.maxDraftTreeSize;
+    config.profilingDetailed = args.profilingDetailed;
 
     // Create and run the builder
     builder::LLMBuilder llmBuilder(args.onnxDir, args.engineDir, config);

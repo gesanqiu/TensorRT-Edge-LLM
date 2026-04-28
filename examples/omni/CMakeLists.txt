@@ -9,8 +9,8 @@ target_include_directories(
   qwen3_tts_inference PRIVATE ${COMMON_INCLUDE_DIRS}
                               ${CMAKE_SOURCE_DIR}/examples/utils)
 
-target_link_libraries(qwen3_tts_inference PRIVATE edgellmCore edgellmTokenizer
-                                                  exampleUtils commonLibraryExt)
+target_link_libraries(qwen3_tts_inference PRIVATE edgellmCore exampleUtils
+                                                  commonLibraryExt)
 
 add_cross_build_link_options(qwen3_tts_inference)
 

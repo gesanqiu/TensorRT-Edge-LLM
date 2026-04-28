@@ -1,0 +1,30 @@
+{
+    "model_path": "Qwen3-ASR",
+    "roles": {
+      "system": {
+        "prefix": "",
+        "suffix": "\n"
+      },
+      "user": {
+        "prefix": "User: ",
+        "suffix": "\n"
+      },
+      "assistant": {
+        "prefix": "Assistant: ",
+        "suffix": "\n"
+      }
+    },
+    "content_types": {
+      "audio": {
+        "format": "<|audio_pad|>"
+      },
+      "image": {
+        "format": "<|image_pad|>"
+      },
+      "video": {
+        "format": "<|video_pad|>"
+      }
+    },
+    "generation_prompt": "Assistant: ",
+    "default_system_prompt": ""
+}

@@ -459,42 +459,52 @@ void computeLongRopeReference(std::vector<float>& shortCosSinCache, std::vector<
 
 void computeMRopeReference(std::vector<float>& mropeRotaryCosSin, std::vector<int64_t> const& mropePositionIds,
     float rotaryBaseFrequency, int32_t rotaryDim, int32_t rotaryEmbeddingMaxPositions, int32_t batchSize,
-    bool interleaved)
+    bool interleaved, int32_t sectionH, int32_t sectionW)
 {
-    // mropePositionIds: (bs, 3, maxPositionEmbeddings)
-    // mropeRotaryCosSin: (bs, maxPositionEmbeddings, rotaryDim)
+    int32_t const halfDim = rotaryDim / 2;
+    int32_t const numTemporalPairs = halfDim - sectionH - sectionW;
 
     std::vector<float> invFreq;
-    for (int32_t i = 0; i < rotaryDim / 2; ++i)
+    for (int32_t i = 0; i < halfDim; ++i)
     {
         float value = pow(rotaryBaseFrequency, 2 * i / (float) rotaryDim);
         invFreq.emplace_back(value);
     }
 
-    std::vector<std::vector<float>> cosOri(rotaryEmbeddingMaxPositions, std::vector<float>(rotaryDim / 2));
-    std::vector<std::vector<float>> sinOri(rotaryEmbeddingMaxPositions, std::vector<float>(rotaryDim / 2));
+    std::vector<std::vector<float>> cosOri(rotaryEmbeddingMaxPositions, std::vector<float>(halfDim));
+    std::vector<std::vector<float>> sinOri(rotaryEmbeddingMaxPositions, std::vector<float>(halfDim));
     for (int32_t i = 0; i < rotaryEmbeddingMaxPositions; ++i)
     {
-        for (int32_t j = 0; j < (rotaryDim / 2); ++j)
+        for (int32_t j = 0; j < halfDim; ++j)
         {
             cosOri[i][j] = std::cos(i / invFreq[j]);
             sinOri[i][j] = std::sin(i / invFreq[j]);
         }
     }
 
-    int32_t sinOffset = rotaryDim / 2;
+    int32_t const interleavedHLimit = sectionH * 3;
+    int32_t const interleavedWLimit = sectionW * 3;
+
+    // Non-interleaved section boundaries
+    std::vector<int32_t> mRopeSections{0, numTemporalPairs, numTemporalPairs + sectionH, halfDim};
+
+    int32_t sinOffset = halfDim;
     for (int32_t b = 0; b < batchSize; ++b)
     {
         for (int32_t i = 0; i < rotaryEmbeddingMaxPositions; ++i)
         {
             if (interleaved)
             {
-                // Interleaved format: [THWTHWHTHW...TTTT] Qwen3-VL
-                //     mrope section is [24, 20, 20]
-                //     [THWTHWHTHW...TTTT] has 20 groups of THW and 4 additional T
-                for (int32_t j = 0; j < (rotaryDim / 2); ++j)
+                for (int32_t j = 0; j < halfDim; ++j)
                 {
-                    int32_t sec = (j >= 60) ? 0 : (j % 3);
+                    int32_t mod3 = j % 3;
+                    int32_t sec;
+                    if (mod3 == 1 && j < interleavedHLimit)
+                        sec = 1;
+                    else if (mod3 == 2 && j < interleavedWLimit)
+                        sec = 2;
+                    else
+                        sec = 0;
                     int32_t pos
                         = mropePositionIds[b * 3 * rotaryEmbeddingMaxPositions + sec * rotaryEmbeddingMaxPositions + i];
                     int32_t cosDstIdx = b * rotaryEmbeddingMaxPositions * rotaryDim + i * rotaryDim + j;
@@ -504,7 +514,6 @@ void computeMRopeReference(std::vector<float>& mropeRotaryCosSin, std::vector<in
             }
             else
             {
-                std::vector<int32_t> mRopeSections{0, 16, 40, 64}; // cumsum of {16, 24, 24}
                 for (int32_t sec = 0; sec < 3; ++sec)
                 {
                     int32_t pos
@@ -1507,4 +1516,128 @@ void referenceMoeTopkSoftmax(std::vector<float> const& gatingOutput, std::vector
     std::vector<float> softmaxOutput;
     referenceMoeSoftmax(gatingOutput, correctionBias, softmaxOutput, numTokens, numExperts, moeSoftcapping);
     referenceMoeTopK(softmaxOutput, topkWeights, topkIndices, numTokens, numExperts, topk, renormalize);
+}
+
+void referenceSigmoidGroupTopk(std::vector<float> const& logits, std::vector<float> const* correctionBias,
+    std::vector<float>& topkWeights, std::vector<int32_t>& topkIndices, int32_t numTokens, int32_t numExperts,
+    int32_t topK, int32_t nGroup, int32_t topkGroup, bool normTopkProb, float routedScalingFactor)
+{
+    topkWeights.resize(numTokens * topK);
+    topkIndices.resize(numTokens * topK);
+
+    int32_t const expertsPerGroup = numExperts / nGroup;
+
+    for (int32_t t = 0; t < numTokens; t++)
+    {
+        int32_t const tokenOffset = t * numExperts;
+
+        // Step 1: sigmoid
+        std::vector<float> sigmoidScores(numExperts);
+        for (int32_t e = 0; e < numExperts; e++)
+        {
+            sigmoidScores[e] = 1.0f / (1.0f + std::exp(-logits[tokenOffset + e]));
+        }
+
+        // Step 2: biased = sigmoid + correction bias
+        std::vector<float> biasedScores(numExperts);
+        for (int32_t e = 0; e < numExperts; e++)
+        {
+            biasedScores[e] = sigmoidScores[e];
+            if (correctionBias != nullptr)
+            {
+                biasedScores[e] += (*correctionBias)[e];
+            }
+        }
+
+        // Step 3: top-2 per group → groupScores
+        std::vector<float> groupScores(nGroup);
+        for (int32_t g = 0; g < nGroup; g++)
+        {
+            int32_t const groupStart = g * expertsPerGroup;
+            float top1 = -FLT_MAX;
+            float top2 = -FLT_MAX;
+            for (int32_t i = 0; i < expertsPerGroup; i++)
+            {
+                float val = biasedScores[groupStart + i];
+                if (val > top1)
+                {
+                    top2 = top1;
+                    top1 = val;
+                }
+                else if (val > top2)
+                {
+                    top2 = val;
+                }
+            }
+            groupScores[g] = top1 + top2;
+        }
+
+        // Step 4: select topkGroup groups
+        std::vector<bool> groupSelected(nGroup, false);
+        for (int32_t i = 0; i < topkGroup; i++)
+        {
+            int32_t bestGroup = -1;
+            float bestScore = -FLT_MAX;
+            for (int32_t g = 0; g < nGroup; g++)
+            {
+                if (!groupSelected[g] && groupScores[g] > bestScore)
+                {
+                    bestScore = groupScores[g];
+                    bestGroup = g;
+                }
+            }
+            if (bestGroup >= 0)
+            {
+                groupSelected[bestGroup] = true;
+            }
+        }
+
+        // Step 5: mask unselected groups
+        for (int32_t e = 0; e < numExperts; e++)
+        {
+            int32_t const group = e / expertsPerGroup;
+            if (!groupSelected[group])
+            {
+                biasedScores[e] = -FLT_MAX;
+            }
+        }
+
+        // Step 6: top-K from masked biased scores
+        float renormSum = 0.0f;
+        for (int32_t k = 0; k < topK; k++)
+        {
+            int32_t bestExpert = 0;
+            float bestScore = -FLT_MAX;
+            for (int32_t e = 0; e < numExperts; e++)
+            {
+                if (biasedScores[e] > bestScore)
+                {
+                    bestScore = biasedScores[e];
+                    bestExpert = e;
+                }
+            }
+            topkIndices[t * topK + k] = bestExpert;
+            // Gather weight from ORIGINAL sigmoid scores
+            topkWeights[t * topK + k] = sigmoidScores[bestExpert];
+            renormSum += sigmoidScores[bestExpert];
+            // Mask out this expert
+            biasedScores[bestExpert] = -FLT_MAX;
+        }
+
+        // Step 7: renormalize
+        if (normTopkProb && renormSum > 0.0f)
+        {
+            float invSum = 1.0f / renormSum;
+            for (int32_t k = 0; k < topK; k++)
+            {
+                topkWeights[t * topK + k] *= invSum;
+            }
+        }
+
+        // Step 8: scale
+        for (int32_t k = 0; k < topK; k++)
+        {
+            topkWeights[t * topK + k] *= routedScalingFactor;
+        }
+    }
 }

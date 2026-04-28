@@ -27,15 +27,18 @@ namespace multimodal
 //! Enum for supported multimodal model types
 enum class ModelType
 {
-    QWEN2_VL,                  //!< Qwen2-VL model
-    QWEN2_5_VL,                //!< Qwen2.5-VL model
-    QWEN3_VL,                  //!< Qwen3-VL model
-    QWEN3_OMNI_AUDIO_ENCODER,  //!< Qwen3-Omni audio encoder (speech-to-embeddings)
-    QWEN3_OMNI_VISION_ENCODER, //!< Qwen3-Omni vision encoder (image-to-embeddings)
-    QWEN3_OMNI_CODE2WAV,       //!< Qwen3-Omni Code2Wav vocoder (codes-to-waveform)
-    INTERNVL,                  //!< InternVL model
-    PHI4MM,                    //!< Phi-4MM model
-    UNKNOWN                    //!< Unknown or unsupported model type
+    QWEN2_VL,                     //!< Qwen2-VL model
+    QWEN2_5_VL,                   //!< Qwen2.5-VL model
+    QWEN3_VL,                     //!< Qwen3-VL model
+    QWEN3_5,                      //!< Qwen3.5 model
+    QWEN3_OMNI_AUDIO_ENCODER,     //!< Qwen3-Omni audio encoder (speech-to-embeddings)
+    QWEN3_OMNI_VISION_ENCODER,    //!< Qwen3-Omni vision encoder (image-to-embeddings)
+    QWEN3_OMNI_CODE2WAV,          //!< Qwen3-Omni Code2Wav vocoder (codes-to-waveform)
+    INTERNVL,                     //!< InternVL model
+    PHI4MM,                       //!< Phi-4MM model
+    NEMOTRON_OMNI_VISION_ENCODER, //!< Nemotron-Omni vision encoder
+    NEMOTRON_OMNI_AUDIO_ENCODER,  //!< Nemotron-Omni audio encoder
+    UNKNOWN                       //!< Unknown or unsupported model type
 };
 
 //! Convert string to ModelType enum
@@ -49,6 +52,8 @@ inline ModelType stringToModelType(std::string const& modelTypeStr)
         return ModelType::QWEN2_5_VL;
     if (modelTypeStr == "qwen3_vl")
         return ModelType::QWEN3_VL;
+    if (modelTypeStr == "qwen3_5")
+        return ModelType::QWEN3_5;
     if (modelTypeStr == "qwen3_omni" || modelTypeStr == "qwen3_omni_thinker" || modelTypeStr == "qwen3_omni_text"
         || modelTypeStr == "qwen3_asr_thinker" || modelTypeStr == "qwen3_omni_audio_encoder")
         return ModelType::QWEN3_OMNI_AUDIO_ENCODER;
@@ -60,6 +65,10 @@ inline ModelType stringToModelType(std::string const& modelTypeStr)
         return ModelType::INTERNVL;
     if (modelTypeStr == "phi4mm")
         return ModelType::PHI4MM;
+    if (modelTypeStr == "nemotron_omni_vision_encoder")
+        return ModelType::NEMOTRON_OMNI_VISION_ENCODER;
+    if (modelTypeStr == "parakeet")
+        return ModelType::NEMOTRON_OMNI_AUDIO_ENCODER;
     return ModelType::UNKNOWN;
 }
 

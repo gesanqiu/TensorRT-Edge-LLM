@@ -13,4 +13,5 @@ threadpoolctl>=3.6.0
 tokenicer>=0.0.5
 pypcre>=0.2.5
 device-smi>=0.5.1
-optimum==2.0.0
+optimum==2.1.0
+nvidia-modelopt[torch]==0.39.0

@@ -19,12 +19,13 @@ Centralized command configuration
 import os
 from typing import Dict, List, Tuple
 
-from ..config import (DEFAULT_SEARCH_DEPTH, ModelType, TestConfig,
-                      _find_directory)
+from ..config import (DEFAULT_SEARCH_DEPTH, PRE_QUANTIZED_MODELS, ModelType,
+                      TestConfig, _find_directory)
 
 # Available LoRA weights mapping
 AVAILABLE_LORA_WEIGHTS = {
     "Qwen2.5-0.5B-Instruct": "Jailbreak-Detector-2-XL",
+    "Qwen2.5-0.5B-Instruct-FP8": "Jailbreak-Detector-2-XL",
     "Qwen2.5-VL-3B-Instruct": "Qwen2.5-VL-Diagrams2SQL-v2",
 }
 
@@ -51,6 +52,9 @@ def _generate_quantization_commands(
         config: TestConfig) -> List[Tuple[List[str], int]]:
     """Generate quantization commands if needed"""
     commands = []
+    # Pre-quantized models ship with weights already quantized; skip this step entirely.
+    if config.model_name in PRE_QUANTIZED_MODELS:
+        return commands
     # Quantize weights (for non-fp16) and/or KV cache (when fp8_kv_cache is enabled).
     # NOTE: `tensorrt-edgellm-quantize-llm` requires at least one of:
     #   --quantization, --lm_head_quantization, --kv_cache_quantization
@@ -97,6 +101,9 @@ def _generate_llm_export_commands(
     if config.fp8_kv_cache and config.llm_precision == "fp16":
         # KV-cache-only quantization produces a derived model dir that should be exported.
         model_dir = config.get_kv_cache_quantized_model_dir()
+    elif config.model_name in PRE_QUANTIZED_MODELS:
+        # Model is already quantized; export directly from the HF model dir.
+        model_dir = config.get_torch_model_dir()
     elif config.llm_precision != "fp16" and config.llm_precision != "int4_gptq":
         # Use quantized model for export
         model_dir = config.get_quantized_model_dir()
@@ -454,10 +461,10 @@ def generate_inference_commands(
     return commands
 
 
-def generate_benchmark_commands(
+def generate_e2e_bench_commands(
         config: TestConfig,
         executable_files: Dict[str, str]) -> List[Tuple[List[str], int]]:
-    """Generate benchmark commands - returns list of (command, timeout) tuples"""
+    """Generate e2e benchmark commands - returns list of (command, timeout) tuples"""
     commands = []
 
     cmd = [executable_files['llm_inference']]
@@ -488,4 +495,34 @@ def generate_benchmark_commands(
         cmd.append("--debug")
 
     commands.append((cmd, 6000))
+    return commands
+
+
+def generate_kernel_bench_commands(
+        config: TestConfig,
+        executable_files: Dict[str, str]) -> List[Tuple[List[str], int]]:
+    """Generate kernel_bench commands - returns list of (command, timeout) tuples"""
+    commands = []
+
+    cmd = [executable_files['llm_bench']]
+    cmd.extend([
+        f"--engineDir={config.get_llm_engine_dir()}",
+        f"--batchSize={config.batch_size or 1}",
+        f"--warmup={config.warmup or 2}",
+        f"--iterations=10",
+    ])
+
+    if config.bench_mode:
+        cmd.append(f"--mode={config.bench_mode}")
+
+    if config.input_len:
+        cmd.append(f"--inputLen={config.input_len}")
+
+    if config.past_kv_len:
+        cmd.append(f"--pastKVLen={config.past_kv_len}")
+
+    if config.debug:
+        cmd.append("--debug")
+
+    commands.append((cmd, 600))
     return commands

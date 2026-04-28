@@ -21,7 +21,18 @@
  */
 
 #pragma once
+#include "common/cudaMacros.h"
 #include "marlin_dtypes.cuh"
+
+// CUDA 11.4 nvcc has a bug with `if constexpr` in device template code when
+// the condition involves constexpr member functions (`*this`). IF_CONSTEXPR
+// falls back to plain `if` on CUDA < 11.8; the compiler still optimizes away
+// dead branches since conditions are compile-time constants (template params).
+#if defined(__CUDACC__) && defined(CUDA_VERSION) && (CUDA_VERSION < 11080)
+#define IF_CONSTEXPR if
+#else
+#define IF_CONSTEXPR if constexpr
+#endif
 
 namespace MARLIN_NAMESPACE_NAME
 {
@@ -39,9 +50,9 @@ __device__ inline void mma(typename MarlinScalarType<type_id>::FragA const& a_fr
 
     static_assert(k_size == 16 || k_size == 32, "FP16/BF16 support MMA_k == 16, E4M3 supports MMA_k == 16 or 32.");
 
-    if constexpr (k_size == 16)
+    IF_CONSTEXPR(k_size == 16)
     {
-        if constexpr (std::is_same<scalar_t, half>::value)
+        IF_CONSTEXPR(std::is_same<scalar_t, half>::value)
         {
             float* c = reinterpret_cast<float*>(&frag_c);
             asm volatile(
@@ -51,7 +62,7 @@ __device__ inline void mma(typename MarlinScalarType<type_id>::FragA const& a_fr
                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "f"(c[0]), "f"(c[1]), "f"(c[2]),
                 "f"(c[3]));
         }
-        else if constexpr (std::is_same<scalar_t, nv_bfloat16>::value)
+        else IF_CONSTEXPR(std::is_same<scalar_t, nv_bfloat16>::value)
         {
             float* c = reinterpret_cast<float*>(&frag_c);
             asm volatile(
@@ -62,7 +73,7 @@ __device__ inline void mma(typename MarlinScalarType<type_id>::FragA const& a_fr
                 "f"(c[3]));
         }
 #if SUPPORTS_FP8
-        else if constexpr (std::is_same<scalar_t, __nv_fp8_e4m3>::value)
+        else IF_CONSTEXPR(std::is_same<scalar_t, __nv_fp8_e4m3>::value)
         {
             float* c = reinterpret_cast<float*>(&frag_c);
             asm volatile(
@@ -73,10 +84,10 @@ __device__ inline void mma(typename MarlinScalarType<type_id>::FragA const& a_fr
         }
 #endif
     }
-    else if constexpr (k_size == 32)
+    else IF_CONSTEXPR(k_size == 32)
     {
 #if SUPPORTS_FP8
-        if constexpr (std::is_same<scalar_t, __nv_fp8_e4m3>::value)
+        IF_CONSTEXPR(std::is_same<scalar_t, __nv_fp8_e4m3>::value)
         {
             float* c = reinterpret_cast<float*>(&frag_c);
             asm volatile(
@@ -103,9 +114,9 @@ __device__ inline void mma_trans(typename MarlinScalarType<type_id>::FragA const
 
     static_assert(k_size == 16 || k_size == 32, "FP16/BF16 support MMA_k == 16, E4M3 supports MMA_k == 16 or 32.");
 
-    if constexpr (k_size == 16)
+    IF_CONSTEXPR(k_size == 16)
     {
-        if constexpr (std::is_same<scalar_t, half>::value)
+        IF_CONSTEXPR(std::is_same<scalar_t, half>::value)
         {
             float* c = reinterpret_cast<float*>(&frag_c);
             asm volatile(
@@ -115,7 +126,7 @@ __device__ inline void mma_trans(typename MarlinScalarType<type_id>::FragA const
                 : "r"(b[0]), "r"(b2[0]), "r"(b[1]), "r"(b2[1]), "r"(a[0]), "r"(a[1]), "f"(c[0]), "f"(c[1]), "f"(c[2]),
                 "f"(c[3]));
         }
-        else if constexpr (std::is_same<scalar_t, nv_bfloat16>::value)
+        else IF_CONSTEXPR(std::is_same<scalar_t, nv_bfloat16>::value)
         {
             float* c = reinterpret_cast<float*>(&frag_c);
             asm volatile(
@@ -126,7 +137,7 @@ __device__ inline void mma_trans(typename MarlinScalarType<type_id>::FragA const
                 "f"(c[3]));
         }
 #if SUPPORTS_FP8
-        else if constexpr (std::is_same<scalar_t, __nv_fp8_e4m3>::value)
+        else IF_CONSTEXPR(std::is_same<scalar_t, __nv_fp8_e4m3>::value)
         {
             float* c = reinterpret_cast<float*>(&frag_c);
             asm volatile(
@@ -137,10 +148,10 @@ __device__ inline void mma_trans(typename MarlinScalarType<type_id>::FragA const
         }
 #endif
     }
-    else if constexpr (k_size == 32)
+    else IF_CONSTEXPR(k_size == 32)
     {
 #if SUPPORTS_FP8
-        if constexpr (std::is_same<scalar_t, __nv_fp8_e4m3>::value)
+        IF_CONSTEXPR(std::is_same<scalar_t, __nv_fp8_e4m3>::value)
         {
             float* c = reinterpret_cast<float*>(&frag_c);
             asm volatile(

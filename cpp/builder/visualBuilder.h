@@ -40,6 +40,7 @@ struct VisualBuilderConfig
     int64_t minImageTokens{4};           //!< Minimum number of image tokens in a batch
     int64_t maxImageTokens{1024};        //!< Maximum number of image tokens in a batch
     int64_t maxImageTokensPerImage{512}; //!< Maximum number of image tokens per image
+    bool profilingDetailed{false};       //!< Enable detailed profiling verbosity for layer info extraction
 
     //! Convert configuration to JSON format for serialization.
     //! @return JSON object containing all configuration parameters
@@ -143,6 +144,12 @@ private:
     //! @param profile Optimization profile to configure
     //! @return true if setup was successful, false otherwise
     bool setupInternPhi4ViTProfile(nvinfer1::IOptimizationProfile& profile);
+
+    //! Set up optimization profile for Nemotron-Omni RADIO ViT model.
+    //! Configures input for RADIO vision encoder with dynamic tile batching.
+    //! @param profile Optimization profile to configure
+    //! @return true if setup was successful, false otherwise
+    bool setupNemotronOmniViTProfile(nvinfer1::IOptimizationProfile& profile);
 
     //! Copy and save the model configuration with builder config.
     //! Creates a config.json file in the engine directory with both original model config

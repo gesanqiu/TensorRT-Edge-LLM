@@ -118,10 +118,10 @@ class TestModelExport:
         if config.llm_precision == "int4_gptq":
             from pytest_helpers import run_command
 
-            # Install gptqmodel 4.2.5 (stable version that works with GPTQ models)
+            # Install gptqmodel 5.7.0 (stable version that works with GPTQ models)
             install_gptq_cmd = [
                 "bash", "-c",
-                "BUILD_CUDA_EXT=0 pip install -v gptqmodel==4.2.5 --no-build-isolation"
+                "BUILD_CUDA_EXT=0 pip install -v gptqmodel==5.7.0 --no-build-isolation"
             ]
             result = run_command(install_gptq_cmd,
                                  timeout=300,

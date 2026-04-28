@@ -45,6 +45,7 @@ struct LLMBuilderConfig
     int64_t maxVerifyTreeSize{60}; //!< Maximum length of input_ids passed into Eagle base model for tree verification
     int64_t maxDraftTreeSize{60};  //!< Maximum length of input_ids passed into Eagle draft model for draft generation
     bool useTrtNativeOps{false};   //!< Whether to use TensorRT native operations instead of custom plugin
+    bool profilingDetailed{false}; //!< Enable detailed profiling verbosity for layer info extraction
 
     //! Convert configuration to JSON format for serialization.
     //! @return JSON object containing all configuration parameters
@@ -249,14 +250,14 @@ private:
     bool setupKVCacheProfiles(
         nvinfer1::IOptimizationProfile& contextProfile, nvinfer1::IOptimizationProfile& generationProfile);
 
-    //! Set up optimization profiles for SSM state tensors (Mamba layers).
+    //! Set up optimization profiles for recurrent state tensors (Mamba/GDN/linear-attention layers).
     //! @param contextProfile Optimization profile for context processing
     //! @param generationProfile Optimization profile for generation processing
     //! @return true if setup was successful, false otherwise
-    bool setupSSMStateProfiles(
+    bool setupRecurrentStateProfiles(
         nvinfer1::IOptimizationProfile* contextProfile, nvinfer1::IOptimizationProfile* generationProfile);
 
-    //! Set up optimization profiles for conv state tensors (Mamba causal conv1d layers).
+    //! Set up optimization profiles for conv state tensors (causal conv1d layers).
     //! @param contextProfile Optimization profile for context processing
     //! @param generationProfile Optimization profile for generation processing
     //! @return true if setup was successful, false otherwise
@@ -299,13 +300,13 @@ private:
     int32_t mTargetModelOutputHiddenDim{0}; //!< Target output hidden dimension
     int32_t mNumDeepstackFeatures{0};       //!< Number of deepstack features (for Qwen3VL)
     // TODO: Use better mechanism to organize model configuration.
-    int32_t mNumMambaLayers{0}; //!< Number of Mamba layers
-    int32_t mMambaNumHeads{0};  //!< Number of Mamba heads
-    int32_t mMambaHeadDim{0};   //!< Mamba head dimension
-    int32_t mSSMStateSize{0};   //!< SSM state size (dstate)
-    int32_t mConvDim{0};    //!< Conv state dimension (mamba_num_heads * mamba_head_dim + 2 * n_groups * ssm_state_size)
-    int32_t mConvKernel{0}; //!< Conv kernel size (d_conv)
-    Json mModelConfig;      //!< Parsed model configuration
+    int32_t mNumLinearAttnLayers{0};    //!< Number of recurrent layers (Mamba/GDN/linear-attention)
+    int32_t mRecurrentStateNumHeads{0}; //!< Number of recurrent state heads
+    int32_t mRecurrentStateHeadDim{0};  //!< Recurrent state head dimension
+    int32_t mRecurrentStateSize{0};     //!< Recurrent state size
+    int32_t mConvDim{0};                //!< Conv state dimension
+    int32_t mConvKernel{0};             //!< Conv kernel size (d_conv)
+    Json mModelConfig;                  //!< Parsed model configuration
 };
 
 } // namespace builder

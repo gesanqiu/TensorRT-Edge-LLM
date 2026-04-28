@@ -19,12 +19,13 @@ using various quantization schemes supported by NVIDIA ModelOpt.
 Usage:
     # Quantize with FP8 quantization
     python quantize_llm.py --model_dir /path/to/model --output_dir /path/to/output --quantization fp8
-    
-    # Quantize without quantization (default)
-    python quantize_llm.py --model_dir /path/to/model --output_dir /path/to/output
-    
-    # Quantize with different quantization for LM head
-    python quantize_llm.py --model_dir /path/to/model --output_dir /path/to/output --quantization fp8 --lm_head_quantization fp8
+
+    # Quantize Qwen3-Omni with multimodal calibration (auto-detected)
+    python quantize_llm.py --model_dir /path/to/qwen3-omni --output_dir /path/to/output --quantization nvfp4
+
+    # Qwen3-Omni with custom audio/visual calibration datasets
+    python quantize_llm.py --model_dir /path/to/qwen3-omni --output_dir /path/to/output \\
+        --quantization nvfp4 --audio_dataset_dir openslr/librispeech_asr --visual_dataset_dir lmms-lab/MMMU
 """
 
 import argparse
@@ -85,14 +86,31 @@ def main() -> None:
         required=False,
         choices=["fp8"],
         default=None,
-        help=
-        "Quantization method for KV cache (only fp8 is currently supported)")
+        help="Attention quantization: enables FP8 KV cache and FP8 FMHA compute "
+        "(Q/K/V BMM quantizers + BMM2 output quantizer)")
     parser.add_argument(
         "--device",
         type=str,
         required=False,
         default="cuda",
         help="Device to use for model loading and quantization")
+    parser.add_argument("--unified_checkpoint",
+                        action="store_true",
+                        help="Whether to export unified checkpoint")
+    parser.add_argument(
+        "--audio_dataset_dir",
+        type=str,
+        required=False,
+        default="openslr/librispeech_asr",
+        help="Audio dataset for Qwen3-Omni multimodal calibration "
+        "(default: openslr/librispeech_asr)")
+    parser.add_argument(
+        "--visual_dataset_dir",
+        type=str,
+        required=False,
+        default="lmms-lab/MMMU",
+        help="Image dataset for Qwen3-Omni multimodal calibration "
+        "(default: lmms-lab/MMMU)")
 
     args = parser.parse_args()
 
@@ -104,7 +122,10 @@ def main() -> None:
                               dataset_dir=args.dataset_dir,
                               lm_head_quantization=args.lm_head_quantization,
                               kv_cache_quantization=args.kv_cache_quantization,
-                              device=args.device)
+                              device=args.device,
+                              unified_checkpoint=args.unified_checkpoint,
+                              audio_dataset_dir=args.audio_dataset_dir,
+                              visual_dataset_dir=args.visual_dataset_dir)
         print("Model quantization completed successfully!")
     except Exception as e:
         print(f"Error during model quantization: {e}")

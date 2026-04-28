@@ -195,7 +195,8 @@ class InternVLVisionModel(torch.nn.Module):
             pixel_values=pixel_values,
             vision_feature_layer=self.vision_feature_layer,
             vision_feature_select_strategy=self.vision_feature_select_strategy,
-        )
+            return_dict=True,
+        ).pooler_output
         # Reshape to (-1, feature_dim)
         return image_features.reshape(-1, image_features.shape[-1])
 

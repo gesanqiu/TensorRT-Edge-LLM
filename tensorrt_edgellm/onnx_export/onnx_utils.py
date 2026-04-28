@@ -21,10 +21,6 @@ import onnx
 import onnx_graphsurgeon as gs
 import torch
 import torch.nn as nn
-from modelopt.onnx.llm_export_utils.surgeon_utils import fold_fp8_qdq_to_dq
-from modelopt.onnx.quantization.qdq_utils import (fp4qdq_to_2dq,
-                                                  quantize_weights_to_int4,
-                                                  quantize_weights_to_mxfp8)
 
 from ..common import ONNX_OPSET_VERSION
 from ..llm_models.layers.int4_gemm_plugin import int4_dq_gemm_to_plugin
@@ -209,6 +205,109 @@ def fix_model_int4_output_dtypes(
     return onnx_model
 
 
+def _elide_int8_identity_nodes(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
+    """Remove Identity pass-through nodes whose input is an INT8 initializer.
+
+    When ``NemotronHMoEWithSharedExperts`` wraps the plugin, ``torch.onnx.export``
+    deduplicates all identical ``hidden_block_scale`` buffers (zeros, INT8, 1×1×1)
+    into a single ONNX initializer and fans it out to each plugin instance via
+    ``Identity`` nodes.  TRT's QDQ optimizer then complains:
+        "Quantized constant ... is only allowed before DQ or PLUGIN_V2 or kPLUGIN_V3 node"
+    because the Identity nodes interpose between the INT8 constant and the plugin.
+    Removing the Identity nodes and wiring the INT8 initializer directly to each
+    plugin node satisfies both TRT's QDQ rule *and* the plugin's INT8 format requirement.
+    """
+    # Build set of INT8 initializer names
+    int8_initializers = {
+        init.name
+        for init in onnx_model.graph.initializer
+        if init.data_type == onnx.TensorProto.INT8
+    }
+    if not int8_initializers:
+        return onnx_model
+
+    # Build a map: Identity output name → resolved source (INT8 initializer name)
+    # Handles chains: A(int8) → Identity → Identity → plugin
+    identity_map: dict = {}  # identity_output_name -> int8_initializer_name
+
+    def _resolve(name: str):
+        return identity_map.get(name, name)
+
+    changed = True
+    while changed:
+        changed = False
+        for node in onnx_model.graph.node:
+            if node.op_type != "Identity":
+                continue
+            src = node.input[0] if node.input else ""
+            resolved = _resolve(src)
+            if resolved in int8_initializers:
+                out = node.output[0]
+                if identity_map.get(out) != resolved:
+                    identity_map[out] = resolved
+                    changed = True
+
+    if not identity_map:
+        return onnx_model
+
+    # Rewrite consumer node inputs to use the INT8 initializer directly
+    replaced = 0
+    for node in onnx_model.graph.node:
+        for i, inp in enumerate(node.input):
+            if inp in identity_map:
+                node.input[i] = identity_map[inp]
+                replaced += 1
+
+    # Remove the Identity nodes that are now unused (their output was an alias)
+    identity_outputs = set(identity_map.keys())
+    kept = [
+        n for n in onnx_model.graph.node
+        if not (n.op_type == "Identity" and n.output
+                and n.output[0] in identity_outputs)
+    ]
+    removed = len(onnx_model.graph.node) - len(kept)
+
+    if removed or replaced:
+        print(
+            f"[_elide_int8_identity_nodes] Removed {removed} Identity node(s), "
+            f"rewired {replaced} consumer input(s) to INT8 initializer directly."
+        )
+        del onnx_model.graph.node[:]
+        onnx_model.graph.node.extend(kept)
+
+    return onnx_model
+
+
+def _remove_duplicate_nodes(onnx_model: onnx.ModelProto) -> onnx.ModelProto:
+    """Remove exact-duplicate ONNX nodes (same op_type, inputs, and outputs).
+
+    ``fp4qdq_to_2dq`` appends a Cast node for every FP4QDQ node via
+    ``_cast_input_dtypes``, naming it ``<activation>_f16``.  When several
+    FP4QDQ nodes share the same activation (e.g. weight-tied shared-expert
+    norms across MoE layers), identical Cast nodes are appended, leading to
+    "Output name is not unique" in TensorRT's ONNX parser.  Removing later
+    copies is semantically safe: all consumers already reference the same
+    output name, so they transparently use the surviving first node.
+    """
+    seen: set = set()
+    kept = []
+    removed = 0
+    for node in onnx_model.graph.node:
+        key = (node.op_type, tuple(node.input), tuple(node.output))
+        if key in seen:
+            removed += 1
+            continue
+        seen.add(key)
+        kept.append(node)
+    if removed:
+        print(
+            f"[_remove_duplicate_nodes] Removed {removed} exact-duplicate node(s)."
+        )
+        del onnx_model.graph.node[:]
+        onnx_model.graph.node.extend(kept)
+    return onnx_model
+
+
 def export_onnx(model,
                 inputs,
                 output_dir,
@@ -227,6 +326,19 @@ def export_onnx(model,
         dynamic_axes: The dynamic axes of the model
         custom_opsets: Optional dict mapping custom domain names to opset versions
     '''
+    # Lazy imports: these modelopt symbols may not exist in older environments.
+    # Importing here avoids breaking module load when they are unavailable.
+    try:
+        from modelopt.onnx.llm_export_utils.surgeon_utils import \
+            fold_fp8_qdq_to_dq  # noqa: PLC0415
+        from modelopt.onnx.quantization.qdq_utils import (  # noqa: PLC0415
+            fp4qdq_to_2dq, quantize_weights_to_int4, quantize_weights_to_mxfp8)
+    except ImportError:
+        fold_fp8_qdq_to_dq = None
+        fp4qdq_to_2dq = None
+        quantize_weights_to_int4 = None
+        quantize_weights_to_mxfp8 = None
+
     t0 = time.time()
     os.makedirs(output_dir, exist_ok=True)
     onnx_path = f'{output_dir}/model.onnx'
@@ -275,11 +387,25 @@ def export_onnx(model,
     if isinstance(model, EdgeLLMModelForCausalLM) and is_fp4_quantized(
             model.lm_head):
         onnx_model = untie_nvfp4_lm_head_initializer(onnx_model)
-    if is_fp4_quantized(model):
+    if is_fp4_quantized(model) or any(n.op_type == "TRT_FP4QDQ"
+                                      for n in onnx_model.graph.node):
         print(
             "NVFP4 quantization detected in the model, compressing some weights to NVFP4"
         )
         onnx_model = fp4qdq_to_2dq(onnx_model)
+        # fp4qdq_to_2dq._cast_input_dtypes appends a Cast node per FP4QDQ node
+        # using ``input_name + "_f16"`` as the output name.  When multiple FP4QDQ
+        # nodes share the same activation input (e.g. weight-tied shared-expert
+        # norms), multiple identical Cast nodes are created, causing
+        # "Output name is not unique" in TRT's ONNX parser.
+        # Fix: drop exact-duplicate nodes (same op_type + inputs + outputs).
+        onnx_model = _remove_duplicate_nodes(onnx_model)
+        # torch.onnx.export deduplicates identical INT8 buffers (e.g. hidden_block_scale
+        # placeholders) into one initializer and fans them out via Identity nodes.
+        # TRT's QDQ optimizer rejects INT8 constants not directly before DQ/plugin nodes.
+        # Fix: short-circuit Identity pass-throughs so INT8 initializers reach
+        # plugin nodes directly (which IS allowed by TRT's QDQ rule).
+        onnx_model = _elide_int8_identity_nodes(onnx_model)
     if is_mxfp8_quantized(model):
         print(
             "MXFP8 quantization detected in the model, compressing some weights to MXFP8"

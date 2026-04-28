@@ -31,6 +31,12 @@ from valid_precisions import (VALID_LLM_PRECISIONS, VALID_LM_HEAD_PRECISIONS,
 # Global configuration constants
 DEFAULT_SEARCH_DEPTH = 3
 
+# Models that ship pre-quantized (skip tensorrt-edgellm-quantize-llm step).
+# These are exported directly from the HF checkpoint without a quantize-llm step.
+PRE_QUANTIZED_MODELS: frozenset = frozenset({
+    "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
+})
+
 
 def _find_directory(root_dir: str,
                     target_name: str,
@@ -64,6 +70,8 @@ def _find_directory(root_dir: str,
 
         if max_depth is None or current_depth < max_depth:
             for entry in entries:
+                if entry == '.git':
+                    continue
                 entry_path = os.path.join(current_dir, entry)
 
                 if os.path.isdir(entry_path):
@@ -86,8 +94,9 @@ class TaskType(enum.Enum):
     """Supported task types"""
     EXPORT = "export"
     BUILD = "build"
-    BENCHMARK = "benchmark"
+    E2E_BENCH = "e2e_bench"
     INFERENCE = "inference"
+    KERNEL_BENCH = "kernel_bench"
 
 
 @dataclass
@@ -190,6 +199,11 @@ class TestConfig:
 
     warmup: Optional[int] = None
 
+    # kernel_bench parameters
+    bench_mode: Optional[str] = None
+    input_len: Optional[int] = None
+    past_kv_len: Optional[int] = None
+
     # Add TensorRT native operations flag
     trt_native_ops: Optional[bool] = None
 
@@ -199,18 +213,24 @@ class TestConfig:
     # Declarative parameter specifications
     _PARAMETER_SPECS = [
         # Core parameters for engine identification
-        ParameterSpec("max_batch_size", "mxbs",
-                      {TaskType.BUILD, TaskType.BENCHMARK, TaskType.INFERENCE},
-                      {ModelType.LLM, ModelType.VLM}),
-        ParameterSpec("max_input_len", "mxil",
-                      {TaskType.BUILD, TaskType.BENCHMARK, TaskType.INFERENCE},
-                      {ModelType.LLM, ModelType.VLM}),
-        ParameterSpec("max_seq_len", "mxsl",
-                      {TaskType.BUILD, TaskType.BENCHMARK, TaskType.INFERENCE},
-                      {ModelType.LLM, ModelType.VLM}),
+        ParameterSpec(
+            "max_batch_size", "mxbs", {
+                TaskType.BUILD, TaskType.E2E_BENCH, TaskType.INFERENCE,
+                TaskType.KERNEL_BENCH
+            }, {ModelType.LLM, ModelType.VLM}),
+        ParameterSpec(
+            "max_input_len", "mxil", {
+                TaskType.BUILD, TaskType.E2E_BENCH, TaskType.INFERENCE,
+                TaskType.KERNEL_BENCH
+            }, {ModelType.LLM, ModelType.VLM}),
+        ParameterSpec(
+            "max_seq_len", "mxsl", {
+                TaskType.BUILD, TaskType.E2E_BENCH, TaskType.INFERENCE,
+                TaskType.KERNEL_BENCH
+            }, {ModelType.LLM, ModelType.VLM}),
         ParameterSpec("max_lora_rank",
                       "mxlr",
-                      {TaskType.BUILD, TaskType.BENCHMARK, TaskType.INFERENCE},
+                      {TaskType.BUILD, TaskType.E2E_BENCH, TaskType.INFERENCE},
                       {ModelType.LLM, ModelType.VLM},
                       is_required=False),
 
@@ -223,83 +243,83 @@ class TestConfig:
                       is_required=False),
         ParameterSpec("fp8_kv_cache",
                       "fp8kv", {
-                          TaskType.EXPORT, TaskType.BUILD, TaskType.BENCHMARK,
+                          TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
                           TaskType.INFERENCE
                       }, {ModelType.LLM, ModelType.VLM},
                       is_required=False),
         ParameterSpec("is_eagle",
                       "eagle", {
-                          TaskType.EXPORT, TaskType.BUILD, TaskType.BENCHMARK,
+                          TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
                           TaskType.INFERENCE
                       }, {ModelType.LLM, ModelType.VLM},
                       is_required=False),
         ParameterSpec("draft_model_id",
                       "", {
-                          TaskType.EXPORT, TaskType.BUILD, TaskType.BENCHMARK,
+                          TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
                           TaskType.INFERENCE
                       }, {ModelType.LLM, ModelType.VLM},
                       is_required=False),
         ParameterSpec("draft_llm_precision",
                       "", {
-                          TaskType.EXPORT, TaskType.BUILD, TaskType.BENCHMARK,
+                          TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
                           TaskType.INFERENCE
                       }, {ModelType.LLM, ModelType.VLM},
                       is_required=False),
         ParameterSpec("draft_lm_head_precision",
                       "", {
-                          TaskType.EXPORT, TaskType.BUILD, TaskType.BENCHMARK,
+                          TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
                           TaskType.INFERENCE
                       }, {ModelType.LLM, ModelType.VLM},
                       is_required=False),
         ParameterSpec("max_verify_tree_size",
                       "mvts",
-                      {TaskType.BUILD, TaskType.INFERENCE, TaskType.BENCHMARK},
+                      {TaskType.BUILD, TaskType.INFERENCE, TaskType.E2E_BENCH},
                       {ModelType.LLM, ModelType.VLM},
                       is_required=False),
         ParameterSpec("max_draft_tree_size",
                       "mdts",
-                      {TaskType.BUILD, TaskType.INFERENCE, TaskType.BENCHMARK},
+                      {TaskType.BUILD, TaskType.INFERENCE, TaskType.E2E_BENCH},
                       {ModelType.LLM, ModelType.VLM},
                       is_required=False),
         ParameterSpec("eagle_draft_top_k",
-                      "edtk", {TaskType.INFERENCE, TaskType.BENCHMARK},
+                      "edtk", {TaskType.INFERENCE, TaskType.E2E_BENCH},
                       {ModelType.LLM, ModelType.VLM},
                       is_required=False),
         ParameterSpec("eagle_draft_step",
-                      "edst", {TaskType.INFERENCE, TaskType.BENCHMARK},
+                      "edst", {TaskType.INFERENCE, TaskType.E2E_BENCH},
                       {ModelType.LLM, ModelType.VLM},
                       is_required=False),
 
         # VLM-specific parameters
         ParameterSpec("min_image_tokens", "mnit",
-                      {TaskType.BUILD, TaskType.BENCHMARK, TaskType.INFERENCE},
+                      {TaskType.BUILD, TaskType.E2E_BENCH, TaskType.INFERENCE},
                       {ModelType.VLM}),
         ParameterSpec("max_image_tokens", "mxit",
-                      {TaskType.BUILD, TaskType.BENCHMARK, TaskType.INFERENCE},
+                      {TaskType.BUILD, TaskType.E2E_BENCH, TaskType.INFERENCE},
                       {ModelType.VLM}),
         ParameterSpec("max_image_tokens_per_image", "mxpiit",
-                      {TaskType.BUILD, TaskType.BENCHMARK, TaskType.INFERENCE},
+                      {TaskType.BUILD, TaskType.E2E_BENCH, TaskType.INFERENCE},
                       {ModelType.VLM}),
         ParameterSpec("visual_precision",
                       "vit", {
-                          TaskType.EXPORT, TaskType.BUILD, TaskType.BENCHMARK,
+                          TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
                           TaskType.INFERENCE
                       }, {ModelType.VLM},
                       is_required=False),
 
         # Inference/Benchmark parameters
         ParameterSpec("test_case", "",
-                      {TaskType.INFERENCE, TaskType.BENCHMARK},
+                      {TaskType.INFERENCE, TaskType.E2E_BENCH},
                       {ModelType.LLM, ModelType.VLM}),
         ParameterSpec("batch_size",
-                      "bs", {TaskType.BENCHMARK, TaskType.INFERENCE},
+                      "bs", {TaskType.E2E_BENCH, TaskType.INFERENCE},
                       {ModelType.LLM, ModelType.VLM},
                       is_required=False),
 
         # Vocabulary reduction parameters
         ParameterSpec("reduced_vocab_size",
                       "rvs", {
-                          TaskType.EXPORT, TaskType.BUILD, TaskType.BENCHMARK,
+                          TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
                           TaskType.INFERENCE
                       }, {ModelType.LLM, ModelType.VLM},
                       is_required=False),
@@ -312,9 +332,20 @@ class TestConfig:
                       is_required=False),
         ParameterSpec("trt_native_ops",
                       "ootb", {
-                          TaskType.EXPORT, TaskType.BUILD, TaskType.BENCHMARK,
+                          TaskType.EXPORT, TaskType.BUILD, TaskType.E2E_BENCH,
                           TaskType.INFERENCE
                       }, {ModelType.LLM, ModelType.VLM},
+                      is_required=False),
+
+        # kernel_bench parameters
+        ParameterSpec("bench_mode",
+                      "mode", {TaskType.KERNEL_BENCH}, {ModelType.LLM},
+                      is_required=False),
+        ParameterSpec("input_len",
+                      "il", {TaskType.KERNEL_BENCH}, {ModelType.LLM},
+                      is_required=False),
+        ParameterSpec("past_kv_len",
+                      "pkv", {TaskType.KERNEL_BENCH}, {ModelType.LLM},
                       is_required=False),
     ]
 
@@ -471,6 +502,13 @@ class TestConfig:
                 parsed_params['vocab_reduction_method'] = part[3:]
             elif part.startswith('vrms'):
                 parsed_params['vocab_reduction_max_samples'] = int(part[4:])
+            # For kernel_bench parameters
+            elif part.startswith('mode_'):
+                parsed_params['bench_mode'] = part[5:]
+            elif part.startswith('il') and part[2:].isdigit():
+                parsed_params['input_len'] = int(part[2:])
+            elif part.startswith('pkv') and part[3:].isdigit():
+                parsed_params['past_kv_len'] = int(part[3:])
             # For inference parameters
             elif part.startswith('ootb'):
                 parsed_params['trt_native_ops'] = True
@@ -634,34 +672,96 @@ class TestConfig:
             ValueError: If llm_models_dir is not set or model directory is not found
         """
 
-        # Models in llm_models_dir
+        # Models in llm_models_dir (/scratch.trt_llm_data/llm-models)
         LLM_MODELS_DIR_MAP = {
-            "Qwen2.5-0.5B-Instruct": "Qwen2.5-0.5B-Instruct",
-            "Qwen2.5-1.5B-Instruct": "Qwen2.5-1.5B-Instruct",
-            "Qwen2.5-3B-Instruct": "Qwen2.5-3B-Instruct",
-            "Qwen2.5-7B-Instruct": "Qwen2.5-7B-Instruct",
-            "Qwen2.5-VL-3B-Instruct": "Qwen2.5-VL-3B-Instruct",
-            "Qwen2.5-VL-7B-Instruct": "Qwen2.5-VL-7B-Instruct",
-            "Qwen2-VL-2B-Instruct": "Qwen2-VL-2B-Instruct",
-            "InternVL3-1B": "InternVL3-1B-hf",
-            "InternVL3-2B": "InternVL3-2B-hf",
-            "Llama-3.1-8B-Instruct": "llama-3.1-model/Llama-3.1-8B-Instruct",
-            "Llama-3.2-1B": "llama-3.2-models/Llama-3.2-1B",
-            "Llama-3.2-3B": "llama-3.2-models/Llama-3.2-3B",
-            "Qwen3-0.6B": "Qwen3/Qwen3-0.6B",
-            "Qwen3-1.7B": "Qwen3/Qwen3-1.7B",
-            "Qwen3-8B": "Qwen3/Qwen3-8B",
-            "Qwen3-4B-Instruct-2507": "Qwen3/Qwen3-4B-Instruct-2507",
-            "Qwen3-VL-2B-Instruct": "Qwen3/Qwen3-VL-2B-Instruct",
-            "Qwen3-VL-4B-Instruct": "Qwen3/Qwen3-VL-4B-Instruct",
-            "Qwen3-VL-8B-Instruct": "Qwen3/Qwen3-VL-8B-Instruct",
-            "Phi-4-multimodal-instruct": "Phi-4-multimodal-instruct",
+            "Qwen2.5-0.5B-Instruct":
+            "Qwen2.5-0.5B-Instruct",
+            "Qwen2.5-1.5B-Instruct":
+            "Qwen2.5-1.5B-Instruct",
+            "Qwen2.5-3B-Instruct":
+            "Qwen2.5-3B-Instruct",
+            "Qwen2.5-7B-Instruct":
+            "Qwen2.5-7B-Instruct",
+            "Qwen2.5-VL-3B-Instruct":
+            "Qwen2.5-VL-3B-Instruct",
+            "Qwen2.5-VL-7B-Instruct":
+            "Qwen2.5-VL-7B-Instruct",
+            "Qwen2-VL-2B-Instruct":
+            "Qwen2-VL-2B-Instruct",
+            "InternVL3-1B":
+            "InternVL3-1B-hf",
+            "InternVL3-2B":
+            "InternVL3-2B-hf",
+            "Llama-3.1-8B-Instruct":
+            "llama-3.1-model/Llama-3.1-8B-Instruct",
+            "Llama-3.2-1B":
+            "llama-3.2-models/Llama-3.2-1B",
+            "Llama-3.2-3B":
+            "llama-3.2-models/Llama-3.2-3B",
+            "Qwen3-0.6B":
+            "Qwen3/Qwen3-0.6B",
+            "Qwen3-1.7B":
+            "Qwen3/Qwen3-1.7B",
+            "Qwen3-8B":
+            "Qwen3/Qwen3-8B",
+            "Qwen3-4B-Instruct-2507":
+            "Qwen3/Qwen3-4B-Instruct-2507",
+            "Qwen3-VL-2B-Instruct":
+            "Qwen3/Qwen3-VL-2B-Instruct",
+            "Qwen3-VL-4B-Instruct":
+            "Qwen3/Qwen3-VL-4B-Instruct",
+            "Qwen3-VL-8B-Instruct":
+            "Qwen3/Qwen3-VL-8B-Instruct",
+            "Qwen3.5-0.8B":
+            "Qwen3.5-0.8B",
+            "Qwen3.5-2B":
+            "Qwen3.5-2B",
+            "Qwen3.5-4B":
+            "Qwen3.5-4B",
+            "Qwen3.5-9B":
+            "Qwen3.5-9B",
+            "Qwen3.5-27B":
+            "Qwen3.5-27B",
+            "Phi-4-multimodal-instruct":
+            "Phi-4-multimodal-instruct",
+            # Pre-quantized models in llm_models_dir
+            "Llama-3.2-1B-FP8":
+            "llama-3.2-models/Llama-3.2-1B-FP8",
+            "Phi-4-FP8":
+            "Phi-4-FP8",
+            "Phi-4-multimodal-instruct-FP8":
+            "Phi-4-multimodal-instruct-FP8",
+            # ASR and TTS models
+            "Qwen3-ASR-0.6B":
+            "Qwen3/Qwen3-ASR-0.6B",
+            "Qwen3-TTS-12Hz-0.6B-CustomVoice":
+            "Qwen3/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+            # Nemotron-H 30B (BF16 base + pre-quantized NVFP4)
+            "NVIDIA-Nemotron-3-Nano-30B-A3B-BF16":
+            "NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+            # Pre-quantized NVFP4 model: exported directly without quantize-llm step
+            "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4":
+            "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
         }
 
-        # GPTQ models in edgellm_data_dir
+        # GPTQ and pre-quantized models in edgellm_data_dir (/scratch.edge_llm_cache)
         GPTQ_MODELS_DIR_MAP = {
             "Qwen2.5-7B-Instruct-GPTQ-Int4": "Qwen2.5-7B-Instruct-GPTQ-Int4",
             "InternVL3-1B-GPTQ-Int4": "InternVL3-1B-hf-GPTQ-Int4",
+            # Pre-quantized models (edge_llm_cache/models/)
+            "NVIDIA-Nemotron-3-Nano-4B-NVFP4":
+            "NVIDIA-Nemotron-3-Nano-4B-NVFP4",
+            "NVIDIA-Nemotron-3-Nano-4B-FP8": "NVIDIA-Nemotron-3-Nano-4B-FP8",
+            # Pre-quantized unified checkpoints (edge_llm_cache/quantized_models/)
+            "Qwen2.5-0.5B-Instruct-FP8": "Qwen2.5-0.5B-Instruct-FP8",
+            "Qwen2.5-0.5B-Instruct-FP8-KV": "Qwen2.5-0.5B-Instruct-FP8-KV",
+            "Qwen2.5-0.5B-Instruct-NVFP4": "Qwen2.5-0.5B-Instruct-NVFP4",
+            "Qwen3-0.6B-FP8": "Qwen3-0.6B-FP8",
+            "Qwen3-0.6B-INT8-SQ": "Qwen3-0.6B-INT8-SQ",
+            "Qwen3-1.7B-FP8": "Qwen3-1.7B-FP8",
+            "Qwen3-1.7B-NVFP4": "Qwen3-1.7B-NVFP4",
+            "Qwen3-VL-4B-Instruct-NVFP4": "Qwen3-VL-4B-Instruct-NVFP4",
+            "Qwen3-VL-2B-Instruct-INT4-AWQ": "Qwen3-VL-2B-Instruct-INT4-AWQ",
         }
 
         # Determine search directory and model path
@@ -701,7 +801,7 @@ class TestConfig:
                 "eagle3": "EAGLE3-LLaMA3.1-Instruct-8B",
             },
             "Qwen3-8B": {
-                "eagle3": "Qwen3/qwen3_8b_eagle3",
+                "eagle3": "qwen3_8b_eagle3",
             },
             "Qwen3-4B-Instruct-2507": {
                 "v2": "EAGLE3-Qwen3-4B-v2",
@@ -711,10 +811,18 @@ class TestConfig:
                 "eagle3": "EAGLE3-Qwen3-VL-4B-v1.1",
             },
             "Qwen3-1.7B": {
-                "eagle3": "Qwen3/Qwen3-1.7B_eagle3",
+                "eagle3": "Qwen3-1.7B_eagle3",
+            },
+            # Pre-quantized base models with pre-quantized EAGLE3 drafts
+            # (unified checkpoints in /scratch.edge_llm_cache/quantized_models/)
+            "Qwen3-1.7B-NVFP4": {
+                "eagle3": "Qwen3-1.7B-eagle3-NVFP4",
+            },
+            "Qwen3-VL-4B-Instruct-NVFP4": {
+                "eagle3": "EAGLE3-Qwen3-VL-4B-v1.1-NVFP4",
             },
             "Qwen3-VL-8B-Instruct": {
-                "v0": "Qwen3/qwen3-vl-8b-eagle3-v0",
+                "v0": "qwen3-vl-8b-eagle3-v0",
             },
             # Add more mappings as needed
         }
@@ -903,11 +1011,10 @@ class TestConfig:
     def get_chat_template_file(self) -> Optional[str]:
         """
         Get custom chat template file path for models that require it.
-        
+
         Returns:
             Path to chat template JSON file, or None if no custom template for this model
         """
-
         return None
 
     def get_output_json_file(self) -> str:

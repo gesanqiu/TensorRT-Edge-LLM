@@ -227,7 +227,7 @@ bool AudioBuilder::parseConfig()
 
     // Auto-detect build type from config.json contents
     // Code2Wav config can be either nested in "code2wav_config" or at top-level with "num_quantizers"
-    bool const hasAudioConfig = mModelConfig.contains("audio_config");
+    bool const hasAudioConfig = mModelConfig.contains("audio_config") || mModelConfig.contains("sound_config");
     bool const hasCode2WavConfig = mModelConfig.contains("code2wav_config")
         || (mModelConfig.contains("num_quantizers") && mModelConfig.contains("upsample_rates"));
 
@@ -268,7 +268,14 @@ bool AudioBuilder::parseConfig()
     switch (mBuildType)
     {
     case AudioBuildType::CODE2WAV: return parseCode2WavConfig();
-    case AudioBuildType::AUDIO_ENCODER: return parseAudioEncoderConfig();
+    case AudioBuildType::AUDIO_ENCODER:
+    {
+        if (mModelType == multimodal::ModelType::NEMOTRON_OMNI_AUDIO_ENCODER)
+        {
+            return parseNemotronOmniAudioConfig();
+        }
+        return parseAudioEncoderConfig();
+    }
     default: LOG_ERROR("Unknown build type"); return false;
     }
 }
@@ -353,6 +360,22 @@ bool AudioBuilder::parseCode2WavConfig()
     return true;
 }
 
+bool AudioBuilder::parseNemotronOmniAudioConfig()
+{
+    // Nemotron-Omni uses sound_config instead of audio_config
+    auto const& soundConfig = mModelConfig["sound_config"];
+
+    if (!soundConfig.contains("num_mel_bins"))
+    {
+        LOG_ERROR("sound_config.num_mel_bins not found in config.json");
+        return false;
+    }
+    mMelBins = soundConfig["num_mel_bins"].get<int32_t>();
+
+    LOG_INFO("Nemotron-Omni AudioEncoder config: mel_bins=%d", mMelBins);
+    return true;
+}
+
 bool AudioBuilder::setupAudioEncoderProfile(
     nvinfer1::IBuilder& builder, nvinfer1::IBuilderConfig& config, nvinfer1::INetworkDefinition const& network)
 {
@@ -365,6 +388,9 @@ bool AudioBuilder::setupAudioEncoderProfile(
     switch (mModelType)
     {
     case multimodal::ModelType::QWEN3_OMNI_AUDIO_ENCODER: result = setupQwen3OmniAudioEncoderProfile(*profile); break;
+    case multimodal::ModelType::NEMOTRON_OMNI_AUDIO_ENCODER:
+        result = setupNemotronOmniAudioEncoderProfile(*profile);
+        break;
     default: LOG_ERROR("Unsupported model type for audio encoder: %d", static_cast<int>(mModelType)); return false;
     }
 
@@ -488,6 +514,37 @@ bool AudioBuilder::setupQwen3OmniCode2WavProfile(
     if (!result)
     {
         LOG_ERROR("Failed to setup Qwen3-Omni Code2Wav profile");
+    }
+    return result;
+}
+
+bool AudioBuilder::setupNemotronOmniAudioEncoderProfile(nvinfer1::IOptimizationProfile& profile)
+{
+    bool result = true;
+
+    // Nemotron-Omni Parakeet audio encoder inputs:
+    //   input_features: [batch_size, seq_len, mel_bins]
+    //   attention_mask: [batch_size, seq_len]
+    // The seq_len corresponds to mel spectrogram frames (~16kHz audio / 160 hop_length).
+    // Parakeet subsamples by factor 8, so output is seq_len/8 tokens.
+
+    // Align to subsampling factor (3× stride-2 CNN requires divisible seq_len)
+    constexpr int64_t kSubFactor = 8;
+    auto alignUp = [](int64_t x, int64_t a) { return (x + a - 1) / a * a; };
+    int64_t minSeqLen = alignUp(mBuilderConfig.minTimeSteps, kSubFactor);
+    int64_t maxSeqLen = alignUp(mBuilderConfig.maxTimeSteps, kSubFactor);
+    int64_t optSeqLen = alignUp((minSeqLen + maxSeqLen) / 2, kSubFactor);
+    constexpr int64_t kBatch = 1;
+
+    result &= setOptimizationProfile(&profile, "input_features", createDims({kBatch, minSeqLen, mMelBins}),
+        createDims({kBatch, optSeqLen, mMelBins}), createDims({kBatch, maxSeqLen, mMelBins}));
+
+    result &= setOptimizationProfile(&profile, "attention_mask", createDims({kBatch, minSeqLen}),
+        createDims({kBatch, optSeqLen}), createDims({kBatch, maxSeqLen}));
+
+    if (!result)
+    {
+        LOG_ERROR("Failed to setup Nemotron-Omni audio encoder profile");
     }
     return result;
 }

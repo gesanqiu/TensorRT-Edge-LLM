@@ -22,9 +22,12 @@
 #include "runtime/imageUtils.h"
 
 #include <cstdint>
+#include <filesystem>
+#include <memory>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <variant>
 #include <vector>
 
@@ -47,6 +50,13 @@ struct Message
     std::string role;                     //!< Message role (system, user, assistant)
     std::vector<MessageContent> contents; //!< Contents of the message
 };
+
+// Streaming types (StreamChannel, StreamChunk, SlotStreamState, FinishReason,
+// StreamChannelFinalizer, and the four streaming free functions) live in
+// `runtime/streaming.h`. LLMGenerationRequest::streamChannels holds a vector
+// of shared_ptr<StreamChannel>, which only needs a forward declaration here —
+// consumers that actually manipulate channels include `runtime/streaming.h`.
+class StreamChannel;
 
 /*! \brief LLM Generation Request structure
  */
@@ -93,6 +103,12 @@ struct LLMGenerationRequest
     bool enableThinking{false};
     // Always disable speculative decoding for this request even if Eagle Draft engine is loaded.
     bool disableSpecDecode{false};
+
+    //! Per-slot streaming channels. Size 0 disables streaming globally.
+    //! When non-empty the size must equal `requests.size()` and individual entries may be null
+    //! to opt out on a per-slot basis. Channels must not already be finished or concurrently
+    //! attached to another in-flight request.
+    std::vector<std::shared_ptr<StreamChannel>> streamChannels;
 };
 
 /*! \brief LLM Generation Response structure
@@ -209,6 +225,79 @@ void compactVector(std::vector<int32_t> const& batchMapping, std::vector<T>& vec
  * @return Vector mapping old batch indices to new indices (-1 for evicted batches)
  */
 std::vector<int32_t> buildBatchMapping(std::vector<int8_t> const& finishedStates);
+
+//=============================================================================
+// Embedding Loading Utilities
+//=============================================================================
+
+/*! \brief FP8 embedding block size (fixed at 128)
+ *
+ *  This matches the quantization granularity: scales shape is [vocabSize, hiddenSize/128]
+ */
+inline constexpr int64_t kFP8EmbeddingBlockSize = 128;
+
+/*! \brief Embedding data - supports both FP16 and FP8 formats
+ *
+ *  The embedding table datatype determines the format:
+ *  - FP16: table is FP16, tableScalingFactor is empty
+ *  - FP8: table is FP8 (E4M3), tableScalingFactor contains FP32 per-group scales
+ *
+ *  The kernel functions automatically dispatch based on table.getDataType().
+ */
+struct EmbeddingData
+{
+    rt::Tensor table;              //!< Embedding table [vocabSize, hiddenSize] (FP16 or FP8)
+    rt::Tensor tableScalingFactor; //!< FP32 per-group scales [vocabSize, hiddenSize/128] (only if FP8)
+
+    //! \brief Returns scales as OptionalInputTensor (std::nullopt when FP16, reference when FP8)
+    rt::OptionalInputTensor scalesAsOptional() const
+    {
+        return tableScalingFactor.getShape().volume() > 0 ? rt::OptionalInputTensor{tableScalingFactor} : std::nullopt;
+    }
+};
+
+/*! \brief Load embedding table from safetensors file (auto-detects FP16 vs FP8 by dtype)
+ *
+ *  Loads embedding.safetensors and detects format by checking the "embedding" tensor dtype:
+ *  - FP8: loads "embedding" (FP8) + "embedding_scale" (FP32)
+ *  - FP16: loads "embedding" (FP16)
+ *
+ *  \param embeddingPath Path to embedding.safetensors file
+ *  \param stream CUDA stream for async operations
+ *  \return EmbeddingData with loaded tensors and format flag
+ *  \throws std::runtime_error if file not found, tensors missing, or invalid dtypes
+ */
+EmbeddingData loadEmbeddingTable(std::filesystem::path const& embeddingPath, cudaStream_t stream);
+
+/*!
+ * @brief Clamp max generation length against KV-cache capacity across the full active batch
+ *
+ * Uses the smallest remaining KV budget across all active sequences so the shared
+ * generation limit cannot overrun any batch item.
+ *
+ * @param effectivePrefillLengths Effective prefill lengths for each active sequence
+ * @param requestedMaxGenerateLength User-requested max generation length
+ * @param kvCacheCapacity Total KV-cache capacity available to the runtime
+ * @param kvCacheReserveLength Extra KV reserve required by the runtime mode
+ * @return Clamped max generation length, never below 0
+ */
+int32_t clampMaxGenerateLengthForKVCapacity(std::vector<int32_t> const& effectivePrefillLengths,
+    int32_t requestedMaxGenerateLength, int32_t kvCacheCapacity, int32_t kvCacheReserveLength);
+
+/*!
+ * @brief Generate multimodal indices for embeddingLookupMultimodal kernel
+ *
+ * Scans input IDs and generates sequential indices for audio/image embeddings.
+ * Audio and image indices are tracked independently, both globally across batches.
+ *
+ * @param inputIds Input token IDs on CPU [batchSize, seqLen]
+ * @param audioTokenId Special token ID for audio, or std::nullopt if no audio
+ * @param imageTokenId Special token ID for image, or std::nullopt if no image
+ * @param vocabSize Vocabulary size (tokens >= vocabSize are treated as image tokens)
+ * @return multimodalIndices tensor on CPU [batchSize, seqLen]
+ */
+rt::Tensor generateMultimodalIndices(rt::Tensor const& inputIds, std::optional<int32_t> audioTokenId,
+    std::optional<int32_t> imageTokenId, int32_t vocabSize);
 
 } // namespace rt
 } // namespace trt_edgellm

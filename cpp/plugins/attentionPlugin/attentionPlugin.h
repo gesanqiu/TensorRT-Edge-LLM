@@ -43,8 +43,10 @@ public:
     //! \param[in] supportsSpecDecode Whether to support speculative decoding (Tree attention)
     //! \param[in] enableFp8KVCache Whether to enable FP8 KV cache
     //! \param[in] slidingWindowSize Sliding window size (-1 = no sliding window)
+    //! \param[in] qkvScales Optional [q, k, v] FP8 dequant scales (required when enableFp8KVCache)
     AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
-        int32_t supportsSpecDecode, int32_t enableFp8KVCache, int32_t slidingWindowSize = -1);
+        int32_t supportsSpecDecode, int32_t enableFp8KVCache, int32_t slidingWindowSize = -1,
+        std::vector<float> const& qkvScales = {});
 
     //! \brief Constructor for deserialization
     //! \param[in] name Plugin instance name
@@ -178,6 +180,12 @@ protected:
     int32_t mSMVersion; //!< CUDA SM version
 
     int32_t mEnableFp8KVCache{}; //!< Whether FP8 KV cache is enabled
+    //! Host QKV dequant scales [q, k, v] (quant→orig).
+    //! - q scale: used to quantize FP16 Q to FP8 (CuTe DSL path) and folded into softmaxScale.
+    //! - k scale: used for FP8 KV cache quantization/dequantization and folded into softmaxScale.
+    //! - v scale: used for FP8 KV cache quantization/dequantization and folded into scaleOutput.
+    //! Attention output is always FP16; downstream Q/DQ for o_proj is handled by the TRT graph.
+    std::vector<float> mQkvScales{1.f, 1.f, 1.f};
 
     //! Sliding window size for attention (-1 = no sliding window, >0 = window size)
     int32_t mSlidingWindowSize = -1;

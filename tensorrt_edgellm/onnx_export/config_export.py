@@ -13,9 +13,145 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from ..version import __version__
+
+_NEMOTRON_H_CHAR_TO_BLOCK_TYPE: Dict[str, str] = {
+    "M": "mamba",
+    "*": "attention",
+    "-": "mlp",
+    "E": "moe",
+}
+
+
+def _resolve_hybrid_block_types(config_dict: Dict[str, Any]) -> list[str]:
+    """Resolve hybrid block sequence from config, including Nemotron-H MoE ('E')."""
+    layers_block_type = config_dict.get("layers_block_type", [])
+    if layers_block_type:
+        return [str(block) for block in layers_block_type]
+
+    pattern = config_dict.get("hybrid_override_pattern", "")
+    if not pattern:
+        return []
+
+    return [_NEMOTRON_H_CHAR_TO_BLOCK_TYPE.get(ch, ch) for ch in pattern]
+
+
+def _nemotron_h_config_layers_block_type(self) -> List[str]:
+    """Replacement ``layers_block_type`` property for :class:`NemotronHConfig`.
+
+    Extends the original implementation to support ``'E'`` (MoE expert block)
+    in ``hybrid_override_pattern`` in addition to the existing ``'M'``,
+    ``'*'``, and ``'-'`` characters.
+    """
+    pattern = getattr(self, "hybrid_override_pattern", "")
+    if not pattern:
+        return []
+    return [_NEMOTRON_H_CHAR_TO_BLOCK_TYPE.get(c, c) for c in pattern]
+
+
+def _patch_nemotron_h_config(config) -> None:
+    """Monkey-patch *NemotronHConfig* to support ``'E'`` → ``"moe"`` block type.
+
+    The stock ``configuration_nemotron_h.py`` shipped with the 4B/8B models
+    only recognises ``'M'``, ``'*'``, and ``'-'`` in its
+    ``hybrid_override_pattern``.  The 30B-A3B model introduces ``'E'`` for
+    MoE layers, which causes a ``KeyError`` in the original
+    ``layers_block_type`` property.
+
+    Calling this function replaces the property on the class the first time
+    and is a no-op on subsequent calls (idempotent).
+    """
+    config_class = type(config)
+    if getattr(config_class, "_edgellm_moe_patched", False):
+        return
+    config_class.layers_block_type = property(
+        _nemotron_h_config_layers_block_type)
+    config_class._edgellm_moe_patched = True
+
+
+def _select_rope_parameters(config_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Select effective RoPE parameters from config in transformers-compatible order."""
+    rope_parameters = config_dict.get("rope_parameters")
+    if rope_parameters is None:
+        rope_parameters = config_dict.get("rope_scaling")
+
+    if not isinstance(rope_parameters, dict):
+        return {}
+
+    # Per-layer rope configuration (e.g. Gemma/ModernBERT style nested dict):
+    # choose full_attention first, then first available layer type, then first dict value.
+    layer_types = config_dict.get("layer_types")
+    if layer_types and set(rope_parameters.keys()).issubset(set(layer_types)):
+        if isinstance(rope_parameters.get("full_attention"), dict):
+            return dict(rope_parameters["full_attention"])
+        for layer_type in layer_types:
+            layer_params = rope_parameters.get(layer_type)
+            if isinstance(layer_params, dict):
+                return dict(layer_params)
+        return {}
+
+    if "full_attention" in rope_parameters and isinstance(
+            rope_parameters["full_attention"], dict):
+        return dict(rope_parameters["full_attention"])
+
+    return dict(rope_parameters)
+
+
+def _normalize_rope_scaling(rope_params: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize rope type aliases for runtime compatibility."""
+    rope_scaling = dict(rope_params)
+    rope_type = rope_scaling.get("rope_type", rope_scaling.get("type"))
+    if rope_type is not None:
+        rope_scaling.setdefault("rope_type", rope_type)
+        rope_scaling.setdefault("type", rope_type)
+    return rope_scaling
+
+
+def _export_rope_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Export RoPE fields with compatibility for old/new transformers config formats."""
+    rope_config = {}
+    rope_params = _select_rope_parameters(config_dict)
+
+    # Rope theta can live in top-level or rope parameter dicts.
+    if "rope_theta" in config_dict:
+        rope_config["rope_theta"] = config_dict["rope_theta"]
+    elif "rope_theta" in rope_params:
+        rope_config["rope_theta"] = rope_params["rope_theta"]
+    else:
+        raise KeyError("Required field 'rope_theta' not found in config")
+
+    if rope_params:
+        rope_config["rope_scaling"] = _normalize_rope_scaling(rope_params)
+    else:
+        rope_config["rope_scaling"] = None
+
+    # Handle LongRoPE original max position field in both old/new layouts.
+    if rope_config["rope_scaling"] is not None:
+        rope_scaling = rope_config["rope_scaling"]
+        rope_type = rope_scaling.get("rope_type")
+        if rope_type == "longrope":
+            original_max = rope_scaling.get(
+                "original_max_position_embeddings",
+                config_dict.get("original_max_position_embeddings"))
+            if original_max is None:
+                raise KeyError(
+                    "Required field 'original_max_position_embeddings' not found in config"
+                )
+            rope_config["original_max_position_embeddings"] = original_max
+
+    # Handle partial_rotary_factor in top-level and rope params.
+    if "partial_rotary_factor" in config_dict:
+        rope_config["partial_rotary_factor"] = config_dict[
+            "partial_rotary_factor"]
+    elif "partial_rotary_factor" in rope_params:
+        rope_config["partial_rotary_factor"] = rope_params[
+            "partial_rotary_factor"]
+    else:
+        rope_config["partial_rotary_factor"] = 1.0
+
+    return rope_config
 
 
 def _export_native_llm_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
@@ -31,7 +167,7 @@ def _export_native_llm_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
     required_fields = [
         "vocab_size", "max_position_embeddings", "hidden_size",
         "intermediate_size", "num_hidden_layers", "num_attention_heads",
-        "num_key_value_heads", "rope_theta", "rope_scaling"
+        "num_key_value_heads"
     ]
 
     llm_config = {}
@@ -40,15 +176,8 @@ def _export_native_llm_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
             raise KeyError(f"Required field '{field}' not found in config")
         llm_config[field] = config_dict[field]
 
-    # Handle LongRoPE (rope_scaling already validated in required_fields)
-    rope_scaling = config_dict["rope_scaling"]
-    if rope_scaling and rope_scaling.get("type", None) == "longrope":
-        if "original_max_position_embeddings" not in config_dict:
-            raise KeyError(
-                f"Required field 'original_max_position_embeddings' not found in config"
-            )
-        llm_config["original_max_position_embeddings"] = config_dict[
-            "original_max_position_embeddings"]
+    # Export rope configuration
+    llm_config.update(_export_rope_config(config_dict))
 
     # Handle head_dim
     if "head_dim" in config_dict:
@@ -60,18 +189,33 @@ def _export_native_llm_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
         llm_config["head_dim"] = config_dict["hidden_size"] // config_dict[
             "num_attention_heads"]
 
-    if "partial_rotary_factor" in config_dict:
-        llm_config["partial_rotary_factor"] = config_dict[
-            "partial_rotary_factor"]
-    else:
-        llm_config["partial_rotary_factor"] = 1.0
-
     # Gemma3n LAuReL config
     if "laurel_rank" in config_dict:
         llm_config["laurel_rank"] = config_dict["laurel_rank"]
 
     llm_config["model_type"] = "llm"
     return llm_config
+
+
+def _validate_hybrid_config(llm_config: Dict[str, Any]) -> None:
+    """Validate that all required hybrid config fields are present."""
+    # Required output fields for any hybrid model config (Mamba, GDN, or future variants).
+    # C++ runtime/builder reads exactly these keys with no fallback.
+    required_fields = [
+        "num_linear_attn_layers",
+        "num_attention_layers",
+        "recurrent_state_num_heads",
+        "recurrent_state_head_dim",
+        "recurrent_state_size",
+        "conv_dim",
+        "conv_kernel",
+    ]
+
+    missing = [f for f in required_fields if f not in llm_config]
+    if missing:
+        raise KeyError(
+            f"Hybrid model config missing required linear attention fields: {missing}. "
+            f"Required fields: {required_fields}")
 
 
 def _export_hybrid_mamba_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
@@ -85,19 +229,21 @@ def _export_hybrid_mamba_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
         "num_attention_heads",
         "num_key_value_heads",
     ]
-    optional_fields_with_defaults = {
-        "rope_theta": 10000.0,
-        "rope_scaling": None,
-    }
-
     llm_config = {}
     for field in required_fields:
         if field not in config_dict:
             raise KeyError(f"Required field '{field}' not found in config")
         llm_config[field] = config_dict[field]
 
-    for field, default in optional_fields_with_defaults.items():
-        llm_config[field] = config_dict.get(field, default)
+    rope_params = _select_rope_parameters(config_dict)
+    has_rope = ("rope_theta" in config_dict) or ("rope_theta" in rope_params)
+    llm_config["use_rope"] = has_rope
+    if has_rope:
+        llm_config.update(_export_rope_config(config_dict))
+    else:
+        llm_config["rope_theta"] = 10000.0
+        llm_config["rope_scaling"] = None
+        llm_config["partial_rotary_factor"] = 1.0
 
     if "head_dim" in config_dict:
         llm_config["head_dim"] = config_dict["head_dim"]
@@ -105,40 +251,123 @@ def _export_hybrid_mamba_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
         llm_config["head_dim"] = config_dict["hidden_size"] // config_dict[
             "num_attention_heads"]
 
-    if "partial_rotary_factor" in config_dict:
-        llm_config["partial_rotary_factor"] = config_dict[
-            "partial_rotary_factor"]
-    else:
-        llm_config["partial_rotary_factor"] = 1.0
+    if "partial_rotary_factor" not in llm_config:
+        if "partial_rotary_factor" in config_dict:
+            llm_config["partial_rotary_factor"] = config_dict[
+                "partial_rotary_factor"]
+        else:
+            llm_config["partial_rotary_factor"] = 1.0
 
-    layers_block_type = config_dict.get("layers_block_type", [])
-    if not layers_block_type:
-        pattern = config_dict.get("hybrid_override_pattern", "")
-        num_mamba = pattern.count("M")
-        num_attention = pattern.count("*")
-    else:
-        num_mamba = sum(1 for t in layers_block_type if t == "mamba")
-        num_attention = sum(1 for t in layers_block_type if t == "attention")
+    layers_block_type = _resolve_hybrid_block_types(config_dict)
+    num_mamba = sum(1 for t in layers_block_type if t == "mamba")
+    num_attention = sum(1 for t in layers_block_type if t == "attention")
 
-    llm_config["num_mamba_layers"] = num_mamba
+    llm_config["num_linear_attn_layers"] = num_mamba
     llm_config["num_attention_layers"] = num_attention
-    llm_config["mamba_num_heads"] = config_dict.get("mamba_num_heads", 0)
-    llm_config["mamba_head_dim"] = config_dict.get("mamba_head_dim", 0)
-    llm_config["ssm_state_size"] = config_dict.get("ssm_state_size", 0)
-
-    mamba_num_heads = llm_config["mamba_num_heads"]
-    mamba_head_dim = llm_config["mamba_head_dim"]
-    ssm_state_size = llm_config["ssm_state_size"]
+    llm_config["recurrent_state_num_heads"] = config_dict["mamba_num_heads"]
+    llm_config["recurrent_state_head_dim"] = config_dict["mamba_head_dim"]
+    llm_config["recurrent_state_size"] = config_dict["ssm_state_size"]
     n_groups = config_dict.get("n_groups",
                                config_dict.get("mamba_n_groups", 1))
-    llm_config[
-        "conv_dim"] = mamba_num_heads * mamba_head_dim + 2 * n_groups * ssm_state_size
+    llm_config["conv_dim"] = (
+        llm_config["recurrent_state_num_heads"] *
+        llm_config["recurrent_state_head_dim"] +
+        2 * n_groups * llm_config["recurrent_state_size"])
     llm_config["conv_kernel"] = config_dict.get(
         "conv_kernel", config_dict.get("mamba_d_conv", 4))
 
-    llm_config["use_rope"] = "rope_theta" in config_dict
+    _validate_hybrid_config(llm_config)
+
+    # Emit canonical per-layer config for HybridCacheManager when layers_block_type
+    # is available (e.g. Qwen3.5 GDN models with explicit layer type lists).
+    # For hybrid_override_pattern models (Nemotron-H), the C++ scalar fallback
+    # (num_attention_layers + num_linear_attn_layers) handles routing correctly.
+    layers_block_type = config_dict.get("layers_block_type", [])
+    if layers_block_type:
+        layer_types = []
+        kv_layer_configs = []
+        for lt in layers_block_type:
+            if lt == "mamba":
+                layer_types.append("mamba")
+                kv_layer_configs.append(None)
+            elif lt == "attention":
+                layer_types.append("attention")
+                kv_layer_configs.append({
+                    "num_kv_heads":
+                    llm_config["num_key_value_heads"],
+                    "head_dim":
+                    llm_config["head_dim"],
+                })
+            # Skip non-stateful layer types (e.g. "mlp", "moe") — they
+            # have no KV cache or recurrent state and must not appear in
+            # the per-layer routing table consumed by HybridCacheManager.
+        llm_config["layer_types"] = layer_types
+        llm_config["kv_layer_configs"] = kv_layer_configs
 
     llm_config["model_type"] = "hybrid_mamba"
+    return llm_config
+
+
+def _export_hybrid_gdn_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Export hybrid GDN model configuration by extending native LLM config."""
+    # Reuse native exporter
+    llm_config = _export_native_llm_config(config_dict)
+
+    # Hybrid stack metadata (full_attention / linear_attention)
+    layer_types = config_dict.get("layer_types", [])
+    llm_config["layer_types"] = layer_types
+    if layer_types:
+        llm_config["num_attention_layers"] = sum(1 for t in layer_types
+                                                 if t == "full_attention")
+        llm_config["num_linear_attn_layers"] = sum(1 for t in layer_types
+                                                   if t == "linear_attention")
+    else:
+        # Fallback for incomplete configs: assume all layers are full attention.
+        llm_config["num_attention_layers"] = config_dict["num_hidden_layers"]
+        llm_config["num_linear_attn_layers"] = 0
+
+    # Emit canonical per-layer KV config for HybridCacheManager
+    if layer_types:
+        kv_layer_configs = []
+        for lt in layer_types:
+            if lt in ("full_attention", "attention"):
+                kv_layer_configs.append({
+                    "num_kv_heads":
+                    llm_config["num_key_value_heads"],
+                    "head_dim":
+                    llm_config["head_dim"],
+                })
+            elif lt == "linear_attention":
+                kv_layer_configs.append(None)
+            else:
+                kv_layer_configs.append(None)
+        # Normalize layer_types to "attention"/"mamba" for C++ parser
+        normalized_types = []
+        for lt in layer_types:
+            if lt in ("full_attention", "attention"):
+                normalized_types.append("attention")
+            elif lt == "linear_attention":
+                normalized_types.append("mamba")
+            else:
+                normalized_types.append(lt)
+        llm_config["layer_types"] = normalized_types
+        llm_config["kv_layer_configs"] = kv_layer_configs
+
+    # Linear-attention (GDN) related dimensions
+    llm_config["linear_num_key_heads"] = config_dict["linear_num_key_heads"]
+    llm_config["recurrent_state_num_heads"] = config_dict[
+        "linear_num_value_heads"]
+    llm_config["recurrent_state_head_dim"] = config_dict["linear_key_head_dim"]
+    llm_config["recurrent_state_size"] = config_dict["linear_value_head_dim"]
+    llm_config["conv_dim"] = (2 * llm_config["linear_num_key_heads"] *
+                              llm_config["recurrent_state_head_dim"] +
+                              llm_config["recurrent_state_num_heads"] *
+                              llm_config["recurrent_state_size"])
+    llm_config["conv_kernel"] = config_dict["linear_conv_kernel_dim"]
+
+    _validate_hybrid_config(llm_config)
+
+    llm_config["model_type"] = "hybrid_gdn"
     return llm_config
 
 
@@ -147,7 +376,7 @@ def _export_eagle_base_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
     required_fields = [
         "vocab_size", "max_position_embeddings", "hidden_size",
         "intermediate_size", "num_hidden_layers", "num_attention_heads",
-        "num_key_value_heads", "rope_theta", "rope_scaling"
+        "num_key_value_heads"
     ]
 
     eagle_config = {}
@@ -155,6 +384,8 @@ def _export_eagle_base_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
         if field not in config_dict:
             raise KeyError(f"Required field '{field}' not found in config")
         eagle_config[field] = config_dict[field]
+
+    eagle_config.update(_export_rope_config(config_dict))
 
     # Handle head_dim
     if "head_dim" in config_dict:
@@ -165,11 +396,6 @@ def _export_eagle_base_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
         )
         eagle_config["head_dim"] = config_dict["hidden_size"] // config_dict[
             "num_attention_heads"]
-    if "partial_rotary_factor" in config_dict:
-        eagle_config["partial_rotary_factor"] = config_dict[
-            "partial_rotary_factor"]
-    else:
-        eagle_config["partial_rotary_factor"] = 1.0
 
     eagle_config["model_type"] = f"eagle3_base"
     return eagle_config
@@ -179,8 +405,7 @@ def _export_eagle_draft_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
     """Export EAGLE draft configuration with required fields."""
     required_fields = [
         "hidden_size", "max_position_embeddings", "intermediate_size",
-        "num_hidden_layers", "num_attention_heads", "num_key_value_heads",
-        "rope_theta", "rope_scaling"
+        "num_hidden_layers", "num_attention_heads", "num_key_value_heads"
     ]
 
     draft_config = {}
@@ -188,6 +413,8 @@ def _export_eagle_draft_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
         if field not in config_dict:
             raise KeyError(f"Required field '{field}' not found in config")
         draft_config[field] = config_dict[field]
+
+    draft_config.update(_export_rope_config(config_dict))
 
     # Handle head_dim
     if "head_dim" in config_dict:
@@ -236,6 +463,13 @@ def export_vision_config(config: Any) -> Dict[str, Any]:
     # Add TensorRT Edge-LLM version
     config_dict['edgellm_version'] = __version__
 
+    # Export RoPE configuration from text_config if it exists, otherwise from top-level config
+    if isinstance(config_dict.get("text_config"), dict):
+        config_dict["text_config"].update(
+            _export_rope_config(config_dict["text_config"]))
+    else:
+        config_dict.update(_export_rope_config(config_dict))
+
     # Set top-level model_type for C++ builder/runtime
     # Check if this is Qwen3-Omni vision (has vision_config.model_type = qwen3_omni_vision_encoder)
     if 'vision_config' in config_dict and config_dict['vision_config'].get(
@@ -247,9 +481,17 @@ def export_vision_config(config: Any) -> Dict[str, Any]:
 
 
 def export_llm_config(config: Any,
-                      model_type: str,
+                      export_type: str,
                       trt_native_ops: bool = False) -> Dict[str, Any]:
-    """Export configuration based on model type and EAGLE version."""
+    """Export configuration based on export type and EAGLE version.
+
+    Args:
+        config: HuggingFace model config object.
+        export_type: Edge-LLM export category — one of ``'llm'``,
+            ``'eagle3_base'``, or ``'eagle_draft'``.  Hybrid models
+            (nemotron_h, qwen3_5) are auto-detected via ``config.model_type``.
+        trt_native_ops: Whether TRT native ops are enabled.
+    """
     config_dict = config.to_dict()
 
     # Extract model name from config class
@@ -270,16 +512,18 @@ def export_llm_config(config: Any,
             )
         config_dict = config_dict["text_config"]
 
-    if model_type == 'llm':
-        output_config = _export_native_llm_config(config_dict)
-    elif model_type == 'hybrid_mamba':
+    if config.model_type == 'nemotron_h':
         output_config = _export_hybrid_mamba_config(config_dict)
-    elif model_type == 'eagle3_base':
+    elif config.model_type in ['qwen3_5_text', 'qwen3_5']:
+        output_config = _export_hybrid_gdn_config(config_dict)
+    elif export_type == 'llm':
+        output_config = _export_native_llm_config(config_dict)
+    elif export_type == 'eagle3_base':
         output_config = _export_eagle_base_config(config_dict)
-    elif model_type == 'eagle_draft':
+    elif export_type == 'eagle_draft':
         output_config = _export_eagle_draft_config(config_dict)
     else:
-        raise ValueError(f"Unsupported model type: {model_type}")
+        raise ValueError(f"Unsupported export type: {export_type}")
 
     # Add model name to output
     output_config["model"] = model_name
@@ -313,6 +557,14 @@ def export_audio_config(config: Any) -> Dict[str, Any]:
     # Set top-level model_type for C++ builder (reads top-level, not audio_config.model_type)
     config_dict['model_type'] = 'qwen3_omni_audio_encoder'
 
+    return config_dict
+
+
+def export_action_config(config: Any) -> Dict[str, Any]:
+    """Export action configuration without modification."""
+    config_dict = config.to_dict()
+    # Add TensorRT Edge-LLM version
+    config_dict['edgellm_version'] = __version__
     return config_dict
 
 
@@ -395,7 +647,7 @@ def export_talker_config(full_qwen3_omni_config: Any) -> Dict[str, Any]:
     # Top-level LLM fields (vocab_size, hidden_size, etc.)
     result = export_llm_config(
         full_qwen3_omni_config.talker_config.text_config,
-        model_type='llm',
+        export_type='llm',
         trt_native_ops=False)
 
     talker_config_raw = config_dict["talker_config"]

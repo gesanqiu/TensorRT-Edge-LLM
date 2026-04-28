@@ -172,8 +172,9 @@ void selectiveStateUpdateMultiStepReferenceFp32(
     std::vector<half> const* dtBias,    // [nheads] (optional, half)
     std::vector<half> const* z,         // [batch, seqLen, nheads, dim] (optional)
     bool dtSoftplus,
-    std::vector<half>& outputRef, // [batch, seqLen, nheads, dim]
-    std::vector<half>& stateRef   // [batch, nheads, dim, dstate]
+    std::vector<half>& outputRef,                     // [batch, seqLen, nheads, dim]
+    std::vector<half>& stateRef,                      // [batch, nheads, dim, dstate]
+    std::vector<int32_t> const* contextLens = nullptr // [batch] (optional)
 )
 {
     int32_t const headsPerGroup = nheads / ngroups;
@@ -186,6 +187,15 @@ void selectiveStateUpdateMultiStepReferenceFp32(
     {
         for (int32_t b = 0; b < batch; ++b)
         {
+            int32_t const cl = contextLens ? (*contextLens)[b] : seqLen;
+            if (t >= cl)
+            {
+                for (int32_t h = 0; h < nheads; ++h)
+                    for (int32_t d = 0; d < dim; ++d)
+                        outputRef[b * seqLen * nheads * dim + t * nheads * dim + h * dim + d] = __float2half(0.f);
+                continue;
+            }
+
             for (int32_t h = 0; h < nheads; ++h)
             {
                 int32_t const group = h / headsPerGroup;
@@ -738,7 +748,8 @@ TEST(MambaSelectiveStateUpdate, PaddedBoth_Dim80to128_Dstate80to128)
 // same result as calling the reference one step at a time.
 // =============================================================================
 
-void runMambaMultiStepTest(MambaTestConfig const& config, int32_t seqLen)
+void runMambaMultiStepTest(
+    MambaTestConfig const& config, int32_t seqLen, std::vector<int32_t> const* contextLens = nullptr)
 {
     cudaStream_t stream{nullptr};
 
@@ -782,7 +793,7 @@ void runMambaMultiStepTest(MambaTestConfig const& config, int32_t seqLen)
     selectiveStateUpdateMultiStepReferenceFp32(batch, nheads, dim, dstate, ngroups, seqLen, stateHostInit, xHost,
         dtHost, AHost, BHost, CHost, config.useSkipConnection ? &DHost : nullptr,
         config.useDtBias ? &dtBiasHost : nullptr, config.useSiluGating ? &zHost : nullptr, config.dtSoftplus, refOutput,
-        refState);
+        refState, contextLens);
 
     auto stateDevice = rt::Tensor({batch, nheads, dim, dstate}, rt::DeviceType::kGPU, DataType::kHALF);
     auto xDevice = rt::Tensor({batch, seqLen, nheads, dim}, rt::DeviceType::kGPU, DataType::kHALF);
@@ -824,8 +835,17 @@ void runMambaMultiStepTest(MambaTestConfig const& config, int32_t seqLen)
     rt::OptionalInputTensor DOpt = DDevice.isEmpty() ? std::nullopt : std::optional(std::cref(DDevice));
     rt::OptionalInputTensor zOpt = zDevice.isEmpty() ? std::nullopt : std::optional(std::cref(zDevice));
 
+    rt::Tensor clDevice;
+    if (contextLens)
+    {
+        clDevice = rt::Tensor({batch}, rt::DeviceType::kGPU, DataType::kINT32);
+        CUDA_CHECK(cudaMemcpy(
+            clDevice.rawPointer(), contextLens->data(), contextLens->size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+    }
+    rt::OptionalInputTensor clOpt = clDevice.isEmpty() ? std::nullopt : std::optional(std::cref(clDevice));
+
     invokeSelectiveStateUpdatePrefill(xDevice, ADevice, BDevice, CDevice, dtDevice, dtBiasOpt, DOpt, zOpt, stateDevice,
-        outputDevice, config.dtSoftplus, stream);
+        outputDevice, config.dtSoftplus, clOpt, stream);
 
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
@@ -912,4 +932,36 @@ TEST(MambaSelectiveStateUpdate, MultiStep_NemotronLike_SeqLen8)
     config.useDtBias = true;
     config.dtSoftplus = true;
     runMambaMultiStepTest(config, 8);
+}
+
+TEST(MambaSelectiveStateUpdate, Padding_MixedContextLengths)
+{
+    MambaTestConfig config{};
+    config.batch = 2;
+    config.nheads = 8;
+    config.dim = 64;
+    config.dstate = 64;
+    config.ngroups = 1;
+    config.useSiluGating = false;
+    config.useSkipConnection = true;
+    config.useDtBias = true;
+    config.dtSoftplus = true;
+    std::vector<int32_t> cl = {5, 16};
+    runMambaMultiStepTest(config, 16, &cl);
+}
+
+TEST(MambaSelectiveStateUpdate, Padding_AllShorter)
+{
+    MambaTestConfig config{};
+    config.batch = 2;
+    config.nheads = 8;
+    config.dim = 64;
+    config.dstate = 64;
+    config.ngroups = 1;
+    config.useSiluGating = false;
+    config.useSkipConnection = true;
+    config.useDtBias = true;
+    config.dtSoftplus = true;
+    std::vector<int32_t> cl = {3, 7};
+    runMambaMultiStepTest(config, 16, &cl);
 }

@@ -341,18 +341,22 @@ def insert_lora_and_save(onnx_dir: str):
         # Add LoRA output to original output
         final_output = gs.Variable(f"{gemm_name}/lora_add_output",
                                    dtype=np.float16)
-        final_output.outputs = output_tensor.outputs.copy()
+        # Before the Add node: it also consumes output_tensor. Only rewire consumers
+        # that existed for the GEMM, or we would replace the Add's input with
+        # final_output (the Add output) and create a graph cycle.
+        gemm_consumers = list(output_tensor.outputs)
         graph.layer(name=f"{gemm_name}/lora_add",
                     op="Add",
                     inputs=[output_tensor, lora_out],
                     outputs=[final_output])
 
-        # Update the output connections
-        for out_node in final_output.outputs:
-            if final_output not in out_node.inputs:
-                out_node.inputs.append(final_output)
-            if output_tensor in out_node.inputs:
-                out_node.inputs.remove(output_tensor)
+        # Replace at the same input index; remove+append broke multi-input ops (e.g.
+        # Reshape must keep data vs shape tensor order for TensorRT shape inference).
+        for out_node in gemm_consumers:
+            for idx, inp in enumerate(out_node.inputs):
+                if inp is output_tensor:
+                    out_node.inputs[idx] = final_output
+                    break
 
     graph.cleanup().toposort().fold_constants().cleanup()
 

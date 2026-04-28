@@ -1,6 +1,11 @@
 # Accuracy Benchmark for TensorRT Edge LLM
 
-This directory contains tools for running accuracy benchmarks on TensorRT Edge LLM models. Two types of benchmarks are supported: **Accuracy Tests** and **ROUGE Similarity Tests**.
+This directory contains tools for running accuracy benchmarks on TensorRT Edge LLM models.
+
+Supported benchmark types:
+- **Accuracy Tests** — Multiple choice correctness (MMLU, MMMU, MMStar, OmniBench)
+- **ROUGE Similarity Tests** — Text generation quality (GSM8K, HumanEval, MTBench)
+- **Audio Score Tests** — Speech generation WER + speaker similarity (Seed-TTS-eval, MiniMax)
 
 ## Prerequisites
 
@@ -126,6 +131,11 @@ Located in `example_datasets/` directory. Use `scripts/prepare_dataset.py` to co
 - **MMMU_Pro** (`mmmu.py`): Enhanced version of MMMU
 - **MMStar** (`mmstar.py`): Multimodal benchmark with visual reasoning
 
+**Audio TTS:**
+- **SeedTTSEval** (`tts_eval.py`): [Seed-TTS-eval](https://github.com/BytedanceSpeech/seed-tts-eval) benchmark (test-zh, test-en, test-hard)
+- **MiniMaxMultilingual** (`tts_eval.py`): [MiniMax TTS Multilingual Test Set](https://huggingface.co/datasets/MiniMaxAI/TTS-Multilingual-Test-Set) (24 languages)
+- **OmniBench** (`omnibench.py`): [OmniBench](https://huggingface.co/datasets/m-a-p/OmniBench) audio+image+text multimodal understanding (1142 samples)
+
 ### Framework
 - **EdgeLLM Dataset** (`edgellm_dataset.py`): Base class for custom dataset implementations
 
@@ -135,11 +145,15 @@ Located in `example_datasets/` directory. Use `scripts/prepare_dataset.py` to co
 - **`calculate_correctness.py`**: Calculate accuracy scores for multiple choice datasets
 - **`generate_reference.py`**: Generate reference responses using vLLM
 - **`calculate_rouge_score.py`**: Calculate ROUGE similarity scores
+- **`calculate_tts_score.py`**: Calculate WER and speaker similarity (Seed-TTS-eval methodology)
 
 ## Output Metrics
 
 - **Accuracy Tests**: Overall accuracy percentage, subject-specific accuracy, detailed statistics
 - **ROUGE Tests**: Rouge-1, Rouge-2, Rouge-L, Rouge-Lsum scores
+- **Audio WER**: English via Whisper-large-v3, Chinese via Paraformer-zh (Seed-TTS-eval standard)
+- **Audio SIM**: Speaker similarity via WavLM-large embeddings, optionally loading a finetuned checkpoint with `--wavlm_checkpoint`
+- **OmniBench**: Multimodal accuracy across audio+image+text understanding
 
 ## Important Notes
 

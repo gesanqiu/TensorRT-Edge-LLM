@@ -22,7 +22,6 @@ import json
 import os
 import re
 
-import pytest
 from pytest_helpers import run_command
 
 
@@ -150,15 +149,14 @@ def check_accuracy_with_dataset(output_json_file,
             rougeL_score = rouge_score.get("rougeL", 0)
 
             if rouge1_score < rouge1_threshold or rougeL_score < rougeL_threshold:
-                failure_details = [
+                result['threshold_failure'] = "\n".join([
                     f"ROUGE score below threshold for {test_case_name}",
                     f"Rouge1: {rouge1_score:.4f} (threshold: {rouge1_threshold})",
                     f"Rouge2: {rouge_score.get('rouge2', 0):.4f}",
                     f"RougeL: {rougeL_score:.4f} (threshold: {rougeL_threshold})",
                     f"RougeLsum: {rouge_score.get('rougeLsum', 0):.4f}",
                     f"Number of predictions: {num_predictions}"
-                ]
-                pytest.fail("\n".join(failure_details))
+                ])
 
         except Exception as e:
             raise RuntimeError(f"Failed to run ROUGE script: {str(e)}")
@@ -205,12 +203,11 @@ def check_accuracy_with_dataset(output_json_file,
                 accuracy_threshold = ACCURACY_THRESHOLDS.get(
                     test_case_name, 0.30)
                 if accuracy < accuracy_threshold:
-                    failure_details = [
+                    result['threshold_failure'] = "\n".join([
                         f"Accuracy below threshold for {test_case_name}",
                         f"Accuracy: {accuracy:.4f} ({accuracy*100:.2f}%) - {correct_count}/{total_count} correct",
                         f"Threshold: {accuracy_threshold:.4f} ({accuracy_threshold*100:.2f}%)",
-                    ]
-                    pytest.fail("\n".join(failure_details))
+                    ])
             else:
                 raise RuntimeError(
                     f"Could not parse accuracy from output: {output}")

@@ -1,5 +1,21 @@
 # Customization Guide
 
+## Recommended: Checkpoint-Based Loader
+
+New model enablement should target `experimental/llm_loader/` first. The older `tensorrt_edgellm` customization points later in this page remain useful for legacy exports.
+
+| Area | Files | What to update |
+|------|-------|----------------|
+| Text model | `experimental/llm_loader/models/<family>/` | Add a native `torch.nn.Module` implementation when the default decoder is not enough. Keep parameter names aligned with the HuggingFace checkpoint. |
+| Registration | `experimental/llm_loader/__init__.py` | Register custom text classes with `register_model("<model_type>", ModelClass)`. |
+| Checkpoint parsing | `experimental/llm_loader/config.py`, `experimental/llm_loader/checkpoint/` | Add model-specific config fields, tensor remapping, fused-weight splitting, or metadata handling. |
+| Encoder export | `experimental/llm_loader/onnx/export_encoder.py` | Register visual or audio encoder builders and config extraction rules. |
+| Export CLI/server | `experimental/llm_loader/export_all_cli.py`, `experimental/server/` | Add model-type classification for LLM-only, VLM, audio, TTS, or omni checkpoints. |
+| Custom ops | `experimental/llm_loader/models/ops.py`, `experimental/llm_loader/onnx/dynamo_translations.py`, `experimental/llm_loader/onnx/onnx_custom_schemas.py` | Add torch stubs, ONNX translations, and schemas for new TensorRT plugin calls. |
+| Runtime/plugins | `cpp/plugins/`, `cpp/runtime/`, `cpp/multimodal/` | Add plugin/runtime support only when the exported graph or model I/O needs new runtime behavior. |
+
+Update the supported-models documentation and add focused export tests for each new model family. Keep checkpoint metadata, tensor key remapping, ONNX custom-op translations, and runtime sidecar requirements aligned with the [Checkpoint-Based Model Loader Design](../software-design/llm-loader.md).
+
 ## Customization Architecture
 
 TensorRT Edge-LLM follows a clear data flow from models through to inference, with customization points at each layer:
@@ -93,11 +109,11 @@ graph TB
 
 The architecture layer provides base classes that wrap HuggingFace models and adapt them for TensorRT Edge-LLM's optimized inference pipeline.
 
-- [`EdgeLLMModel`](../../../tensorrt_edgellm/llm_models/models/llm_model.py): The core model class that wraps a HuggingFace model and replaces its decoder layers with optimized variants.
+- [`EdgeLLMModel`](../../../../tensorrt_edgellm/llm_models/models/llm_model.py): The core model class that wraps a HuggingFace model and replaces its decoder layers with optimized variants.
 
-- [`EdgeLLMDecoderLayer`](../../../tensorrt_edgellm/llm_models/layers/layers.py): Optimized decoder layer that wraps HuggingFace attention and MLP modules.
+- [`EdgeLLMDecoderLayer`](../../../../tensorrt_edgellm/llm_models/layers/layers.py): Optimized decoder layer that wraps HuggingFace attention and MLP modules.
 
-- [`EdgeLLMAttention`](../../../tensorrt_edgellm/llm_models/layers/layers.py): Multi-headed attention using the custom attention plugin.
+- [`EdgeLLMAttention`](../../../../tensorrt_edgellm/llm_models/layers/layers.py): Multi-headed attention using the custom attention plugin.
 
 TensorRT Edge-LLM automatically detects and supports Llama-style and Qwen-style architectures:
 - **Llama-style models**: Use `LlamaAttention` and `LlamaMLP`
@@ -209,15 +225,15 @@ quantized_model = quantize_model(model, quant_cfg, calib_dataloader)
 
 #### LLM Model Export
 
-The [`export_llm_model()`](../../../tensorrt_edgellm/onnx_export/llm_export.py) function handles LLM and EAGLE base model export. To add support for new model architectures, you may need to customize:
+The [`export_llm_model()`](../../../../tensorrt_edgellm/onnx_export/llm_export.py) function handles LLM and EAGLE base model export. To add support for new model architectures, you may need to customize:
 
-- **Inputs**: Modify [`create_dummy_inputs()`](../../../tensorrt_edgellm/onnx_export/llm_export.py) to add model-specific inputs (e.g., `deepstack_visual_embeds` for Qwen3-VL)
-- **Dynamic Axes**: Update [`export_model_to_onnx()`](../../../tensorrt_edgellm/onnx_export/llm_export.py) to define dynamic dimensions for new inputs/outputs
+- **Inputs**: Modify [`create_dummy_inputs()`](../../../../tensorrt_edgellm/onnx_export/llm_export.py) to add model-specific inputs (e.g., `deepstack_visual_embeds` for Qwen3-VL)
+- **Dynamic Axes**: Update [`export_model_to_onnx()`](../../../../tensorrt_edgellm/onnx_export/llm_export.py) to define dynamic dimensions for new inputs/outputs
 - **Input/Output Names**: Ensure ONNX input and output names align with the C++ runtime expectations
 
 #### Multimodal Model Export
 
-The [`visual_export()`](../../../tensorrt_edgellm/onnx_export/visual_export.py) function exports the visual encoder of VLMs to ONNX. Supported models are defined in [visual_models](../../../tensorrt_edgellm/visual_models).
+The [`visual_export()`](../../../../tensorrt_edgellm/onnx_export/visual_export.py) function exports the visual encoder of VLMs to ONNX. Supported models are defined in [visual_models](../../../../tensorrt_edgellm/visual_models).
 
 HuggingFace visual models often contain ONNX-incompatible logic (flash attention, shape-dependent initialization, complex post-processing). To add a new multimodal encoder, you may need to extend the original class with a wrapper that:
 
@@ -225,7 +241,7 @@ HuggingFace visual models often contain ONNX-incompatible logic (flash attention
 - **Replaces unsupported operations**: Use standard PyTorch ops instead of flash attention
 - **Delegates complex preprocessing/postprocessing to C++ runtime**: Handle operations like dynamic indexing at runtime
 
-See existing [visual_models](../../../tensorrt_edgellm/visual_models) implementations for reference.
+See existing [visual_models](../../../../tensorrt_edgellm/visual_models) implementations for reference.
 
 ### 3. Custom Operators
 
@@ -263,7 +279,7 @@ register_attention_plugin_onnx_symbolic_functions()
 
 ### 1. LLM Builder Customization
 
-The [`LLMBuilder`](../../../cpp/builder/builder.h) class builds TensorRT engines from ONNX models. The CLI tool [`llm_build`](../../../examples/llm/llm_build.cpp) provides a command-line interface:
+The [`LLMBuilder`](../../../../cpp/builder/llmBuilder.h) class builds TensorRT engines from ONNX models. The CLI tool [`llm_build`](../../../../examples/llm/llm_build.cpp) provides a command-line interface:
 
 The builder automatically creates **two optimization profiles** for different inference phases:
 
@@ -272,7 +288,7 @@ The builder automatically creates **two optimization profiles** for different in
 | 0 | Context (Prefill) | `[batch, 1..maxInputLen]` | Process initial prompts with variable length |
 | 1 | Generation (Decode) | `[batch, 1]` | Autoregressive token generation |
 
-To support new model architectures, you need to extend the optimization profile setup methods in [`builder.cpp`](../../../cpp/builder/builder.cpp):
+To support new model architectures, you need to extend the optimization profile setup methods in [`llmBuilder.cpp`](../../../../cpp/builder/llmBuilder.cpp):
 
 - `setupCommonProfiles()`: Context lengths, RoPE embeddings, KV cache (shared by all models)
 - `setupVanillaProfiles()`: Standard LLM input_ids and last_token_ids
@@ -282,11 +298,11 @@ To support new model architectures, you need to extend the optimization profile 
 
 ### 2. Multimodal Builder Customization
 
-The [`VisualBuilder`](../../../cpp/builder/builder.h) class builds TensorRT engines for visual encoders. The CLI tool [`visual_build`](../../../examples/multimodal/visual_build.cpp) provides a command-line interface:
+The [`VisualBuilder`](../../../../cpp/builder/visualBuilder.h) class builds TensorRT engines for visual encoders. The CLI tool [`visual_build`](../../../../examples/multimodal/visual_build.cpp) provides a command-line interface:
 
 To support new visual encoders, you have two options:
 
-1. **Extend VisualBuilder**: Add a new profile setup method (e.g., `setupYourViTProfile()`) in [`builder.cpp`](../../../cpp/builder/builder.cpp). Define optimization profiles with input shapes calculated from `minImageTokens` and `maxImageTokens`.
+1. **Extend VisualBuilder**: Add a new profile setup method (e.g., `setupYourViTProfile()`) in [`visualBuilder.cpp`](../../../../cpp/builder/visualBuilder.cpp). Define optimization profiles with input shapes calculated from `minImageTokens` and `maxImageTokens`.
 
 2. **Use trtexec**: Build the engine directly with TensorRT's command-line tool for simpler models.
 
@@ -296,16 +312,16 @@ To support new visual encoders, you have two options:
 
 ### 1. Text Processing and Tokenization
 
-The [`Tokenizer`](../../../cpp/tokenizer/tokenizer.h) class provides text encoding/decoding with HuggingFace-compatible loading. It uses a modular architecture:
+The [`Tokenizer`](../../../../cpp/tokenizer/tokenizer.h) class provides text encoding/decoding with HuggingFace-compatible loading. It uses a modular architecture:
 
-- **`PreTokenizer`** ([`preTokenizer.h`](../../../cpp/tokenizer/preTokenizer.h)): Regex-based text splitting before encoding
-- **`TokenEncoder`** ([`tokenEncoder.h`](../../../cpp/tokenizer/tokenEncoder.h)): BPE encoding algorithm with vocabulary management
+- **`PreTokenizer`** ([`preTokenizer.h`](../../../../cpp/tokenizer/preTokenizer.h)): Regex-based text splitting before encoding
+- **`TokenEncoder`** ([`tokenEncoder.h`](../../../../cpp/tokenizer/tokenEncoder.h)): BPE encoding algorithm with vocabulary management
 
 The tokenizer automatically loads from the engine directory (uses `tokenizer.json` and `tokenizer_config.json`). To support new tokenization schemes, extend `TokenEncoder` with additional algorithms (e.g., SentencePiece, WordPiece).
 
 ### 2. Sampling Parameters
 
-The [`SamplingParams`](../../../cpp/sampler/sampling.h) structure controls token generation randomness. Supported parameters:
+The [`SamplingParams`](../../../../cpp/sampler/sampling.h) structure controls token generation randomness. Supported parameters:
 
 | Parameter | Range | Effect |
 |-----------|-------|--------|
@@ -313,16 +329,16 @@ The [`SamplingParams`](../../../cpp/sampler/sampling.h) structure controls token
 | `top_k` | 0 - vocab_size | **0**: Disabled. **1**: Greedy. **50**: Sample from top 50 tokens |
 | `top_p` | 0.0 - 1.0 | **1.0**: Disabled. **0.9**: Nucleus sampling (top 90% prob mass) |
 
-To add more sampling params (e.g., repetition_penalty, logits_bias) or custom sampling algorithms (e.g., beam search), extend the sampling functions in [`sampling.cu`](../../../cpp/sampler/sampling.cu).
+To add more sampling params (e.g., repetition_penalty, logits_bias) or custom sampling algorithms (e.g., beam search), extend the sampling functions in [`sampling.cu`](../../../../cpp/sampler/sampling.cu).
 
 ### 3. Multimodal Runner
 
-The [`MultimodalRunner`](../../../cpp/multimodal/multimodalRunner.h) base class provides the interface for visual encoder processing in VLMs. The factory method `MultimodalRunner::create()` automatically instantiates the appropriate runner based on model type.
+The [`MultimodalRunner`](../../../../cpp/multimodal/multimodalRunner.h) base class provides the interface for visual encoder processing in VLMs. The factory method `MultimodalRunner::create()` automatically instantiates the appropriate runner based on model type.
 
 **Existing Runners:**
-- [`QwenViTRunner`](../../../cpp/multimodal/qwenViTRunner.h): Qwen2-VL, Qwen2.5-VL, Qwen3-VL
-- [`InternViTRunner`](../../../cpp/multimodal/internViTRunner.h): InternVL3
-- [`Phi4MMViTRunner`](../../../cpp/multimodal/phi4mmViTRunner.h): Phi-4-multimodal
+- [`QwenViTRunner`](../../../../cpp/multimodal/qwenViTRunner.h): Qwen2-VL, Qwen2.5-VL, Qwen3-VL
+- [`InternViTRunner`](../../../../cpp/multimodal/internViTRunner.h): InternVL3
+- [`Phi4MMViTRunner`](../../../../cpp/multimodal/phi4mmViTRunner.h): Phi-4-multimodal
 
 **To add support for a new VLM**, create a new runner class that inherits from `MultimodalRunner` and implements:
 
@@ -335,20 +351,20 @@ Then register the new runner in `MultimodalRunner::create()` factory method.
 
 ### 4. Runtime Features
 
-The [`LLMInferenceRuntime`](../../../cpp/runtime/llmInferenceRuntime.h) provides high-level inference APIs with several optimization features:
+The [`LLMInferenceRuntime`](../../../../cpp/runtime/llmInferenceRuntime.h) provides high-level inference APIs with several optimization features:
 
 - **CUDA Graph Capture**: Reduces kernel launch overhead by capturing and replaying execution sequences via `captureDecodingCUDAGraph()`
 - **System Prompt Caching**: Caches KV states for frequently-used system prompts via `genAndSaveSystemPromptKVCache()` to reduce first-token latency
 - **LoRA Switching**: Dynamically switches between LoRA adapters at runtime without engine rebuild
-- **EAGLE3 Speculative Decoding**: Accelerates generation using draft-then-verify approach via [`llmInferenceSpecDecodeRuntime`](../../../cpp/runtime/llmInferenceSpecDecodeRuntime.h) with tree-based draft proposal and verification
+- **EAGLE3 Speculative Decoding**: Accelerates generation using draft-then-verify approach via [`llmInferenceSpecDecodeRuntime`](../../../../cpp/runtime/llmInferenceSpecDecodeRuntime.h) with tree-based draft proposal and verification
 
-To extend runtime capabilities, modify [`LLMEngineRunner`](../../../cpp/runtime/llmEngineRunner.h) for core execution logic or [`LLMInferenceRuntime`](../../../cpp/runtime/llmInferenceRuntime.cpp) for high-level request handling.
+To extend runtime capabilities, modify [`LLMEngineRunner`](../../../../cpp/runtime/llmEngineRunner.h) for core execution logic or [`LLMInferenceSpecDecodeRuntime`](../../../../cpp/runtime/llmInferenceSpecDecodeRuntime.cpp) for high-level request handling.
 
 ---
 
 ## Layer 5: Application
 
-The [`llm_inference`](../../../examples/llm/llm_inference.cpp) example provides a reference implementation for building custom applications.
+The [`llm_inference`](../../../../examples/llm/llm_inference.cpp) example provides a reference implementation for building custom applications.
 
 ### Building Custom Applications
 

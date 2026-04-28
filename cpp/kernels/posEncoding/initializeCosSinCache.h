@@ -70,11 +70,14 @@ void initializeLongRopeCosSin(float* shortCosSinCache, float* longCosSinCache, f
  * @param rotaryDim Rotary dimension
  * @param rotaryEmbeddingMaxPositions Maximum positions
  * @param batchSize Batch size
- * @param interleaved Whether to use interleaved MRoPE
+ * @param interleaved Whether to use interleaved MRoPE (Qwen3-VL/Qwen3.5 style)
+ * @param sectionH Number of frequency pairs for height dimension
+ * @param sectionW Number of frequency pairs for width dimension
  * @param stream CUDA stream
  */
 void initializeMRopeCosSin(float* cosSinCache, int64_t* mropePositionIds, float rotaryBaseFrequency, int64_t rotaryDim,
-    int64_t rotaryEmbeddingMaxPositions, int64_t batchSize, bool interleaved, cudaStream_t stream);
+    int64_t rotaryEmbeddingMaxPositions, int64_t batchSize, bool interleaved, int32_t sectionH, int32_t sectionW,
+    cudaStream_t stream);
 
 /*!
  * @brief Initialize MRoPE cos/sin cache for text-only inputs with sequential positions.
@@ -83,14 +86,15 @@ void initializeMRopeCosSin(float* cosSinCache, int64_t* mropePositionIds, float 
  * MRoPE sections. This is the correct default for text-only and audio-only modes where
  * no spatial position information is available.
  *
- * @param cosSinCache Output cos/sin cache, shape [1, maxPositions, rotaryDim]
+ * @param cosSinCache Output cos/sin cache, shape [batchSize, maxPositions, rotaryDim]
  * @param rotaryBaseFrequency Base frequency
  * @param rotaryDim Rotary dimension
  * @param maxPositions Maximum number of positions
+ * @param batchSize Number of batch slots to initialize
  * @param stream CUDA stream
  */
-void initializeTextOnlyMRopeCosSin(
-    float* cosSinCache, float rotaryBaseFrequency, int64_t rotaryDim, int64_t maxPositions, cudaStream_t stream);
+void initializeTextOnlyMRopeCosSin(float* cosSinCache, float rotaryBaseFrequency, int64_t rotaryDim,
+    int64_t maxPositions, int64_t batchSize, cudaStream_t stream);
 
 } // namespace kernel
 } // namespace trt_edgellm

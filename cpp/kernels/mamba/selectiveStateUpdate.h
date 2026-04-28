@@ -70,6 +70,6 @@ void invokeSelectiveStateUpdatePrefill(trt_edgellm::rt::Tensor const& x, trt_edg
     trt_edgellm::rt::Tensor const& B, trt_edgellm::rt::Tensor const& C, trt_edgellm::rt::Tensor const& dt,
     trt_edgellm::rt::OptionalInputTensor dt_bias, trt_edgellm::rt::OptionalInputTensor D,
     trt_edgellm::rt::OptionalInputTensor z, trt_edgellm::rt::Tensor& state, trt_edgellm::rt::Tensor& output,
-    bool dt_softplus, cudaStream_t stream);
+    bool dt_softplus, trt_edgellm::rt::OptionalInputTensor contextLengths, cudaStream_t stream);
 
 } // namespace mamba_ssm

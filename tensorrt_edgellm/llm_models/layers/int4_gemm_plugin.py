@@ -502,7 +502,11 @@ class Int4GemmPluginModule(nn.Module):
             )
         self.qweight = source.qweight
         self.qzeros = source.qzeros
-        self.scales = source.scales
+        # GPTQModel.load() may auto-detect a native bfloat16 dtype for
+        # scales; the int4 gemm plugin requires float16.
+        self.scales = source.scales.to(
+            torch.float16
+        ) if source.scales.dtype != torch.float16 else source.scales
         self.g_idx = source.g_idx
         if self.bias is not None and source.bias is not None:
             self.bias = source.bias
@@ -538,10 +542,16 @@ def replace_quant_linear_with_plugin(model: nn.Module) -> nn.Module:
     """
 
     from gptqmodel.nn_modules.qlinear.torch import TorchQuantLinear
-    from gptqmodel.nn_modules.qlinear.torch_fused import TorchFusedQuantLinear
+    try:
+        from gptqmodel.nn_modules.qlinear.torch_fused import \
+            TorchFusedQuantLinear
+    except ImportError:
+        TorchFusedQuantLinear = None
 
+    _quant_types = tuple(t for t in (TorchQuantLinear, TorchFusedQuantLinear)
+                         if t is not None)
     for name, module in model.named_modules():
-        if not isinstance(module, (TorchQuantLinear, TorchFusedQuantLinear)):
+        if not isinstance(module, _quant_types):
             continue
         new_module = Int4GemmPluginModule(
             bits=module.bits,

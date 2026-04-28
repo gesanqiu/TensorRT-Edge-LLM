@@ -212,13 +212,16 @@ def main():
 
     # Calculate subject-specific accuracy if subjects are available
     valid_subjects = [s for s in subjects if s is not None]
+    subject_accuracy = {}
     if valid_subjects:
         print("Subject-Specific Accuracy:")
         subject_accuracy = calculate_subject_accuracy(predictions, answers,
                                                       subjects)
 
-        for subject, stats in subject_accuracy.items():
-            if subject is not None:  # Skip None subjects
+        for subject, stats in sorted(subject_accuracy.items(),
+                                     key=lambda x: x[1]['accuracy'],
+                                     reverse=True):
+            if subject is not None:
                 print(
                     f"{subject}: {stats['accuracy']:.4f} ({stats['accuracy']*100:.2f}%) - {stats['correct']}/{stats['total']} correct"
                 )
@@ -227,7 +230,7 @@ def main():
 
     return {
         'overall_accuracy': overall_correctness,
-        'subject_accuracy': subject_accuracy if valid_subjects else {},
+        'subject_accuracy': subject_accuracy,
         'skipped_count': skipped_count,
         'total_count': total_count,
         'valid_count': valid_count

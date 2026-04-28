@@ -21,3 +21,10 @@ target_link_libraries(audio_build PRIVATE ${NV_ONNX_PARSER_LIB}
 target_include_directories(audio_build PRIVATE ${ONNX_PARSER_INCLUDE_DIR}
                                                ${COMMON_INCLUDE_DIRS})
 add_cross_build_link_options(audio_build)
+
+add_executable(action_build action_build.cpp)
+target_link_libraries(action_build PRIVATE ${NV_ONNX_PARSER_LIB}
+                                           commonLibraryExt edgellmBuilder)
+target_include_directories(action_build PRIVATE ${ONNX_PARSER_INCLUDE_DIR}
+                                                ${COMMON_INCLUDE_DIRS})
+add_cross_build_link_options(action_build)

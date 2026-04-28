@@ -1431,8 +1431,8 @@ CUBIN_EXPORT __global__
 #endif
 #endif
         uint32_t const batchSize,
-        float const* __restrict__ kCacheScale, // Device memory scalar for K cache. Used only for int8/fp8 KV cache.
-        float const* __restrict__ vCacheScale, // Device memory scalar for V cache. Used only for int8/fp8 KV cache.
+        float const kCacheScale, // K dequant scale (quant->orig). 1.0 when KV cache is not quantized.
+        float const vCacheScale, // V dequant scale (quant->orig). 1.0 when KV cache is not quantized.
         uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr)
 {
     assert(allowMultiBlockMode || gridDim.x == 1);
@@ -1641,7 +1641,7 @@ CUBIN_EXPORT __global__
     };
     if (warpIdx.z == 0)
     {
-        float const kScale = (isKVCacheQuantized ? kCacheScale[0] : 1.f);
+        float const kScale = (isKVCacheQuantized ? kCacheScale : 1.f);
         float const qkScale = qScale * kScale
             * rsqrtf(validElemsPerHead); // qkScale is applied onto Q*K.T before softmax.
         CircIdx<nbKBuffers> idxCurrSMemKBuf{nbKBuffers - 1};
@@ -2383,7 +2383,7 @@ CUBIN_EXPORT __global__
             }
         }
 
-        float const vScale = (isKVCacheQuantized ? vCacheScale[0] : 1.f);
+        float const vScale = (isKVCacheQuantized ? vCacheScale : 1.f);
         float voScale = vScale;
         if (seqIterInit < nbSeqIters)
         { // otherwise rcpRowSum will be NAN.
@@ -2648,8 +2648,8 @@ CUBIN_EXPORT __global__ __launch_bounds__(256, nbCtaPerSM) void kernel_mha(
     BeamSearchParams const beamSearchParams,
 #endif
     uint32_t const batchSize,
-    float const* __restrict__ kCacheScale, // Device memory scalar for K cache. Used only for int8/fp8 KV cache.
-    float const* __restrict__ vCacheScale, // Device memory scalar for V cache. Used only for int8/fp8 KV cache.
+    float const kCacheScale, // K dequant scale (quant->orig). 1.0 when KV cache is not quantized.
+    float const vCacheScale, // V dequant scale (quant->orig). 1.0 when KV cache is not quantized.
     uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr)
 {
 #if SPEC_DEC
@@ -2712,8 +2712,8 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
     BeamSearchParams const& beamSearchParams,
 #endif
     uint32_t batchSize,
-    float const* __restrict__ kCacheScale, // Device memory scalar for K cache. Used only for int8/fp8 KV cache.
-    float const* __restrict__ vCacheScale, // Device memory scalar for V cache. Used only for int8/fp8 KV cache.
+    float const kCacheScale, // K dequant scale (quant->orig). 1.0 when KV cache is not quantized.
+    float const vCacheScale, // V dequant scale (quant->orig). 1.0 when KV cache is not quantized.
 #if SPEC_DEC
     SpecDecParams const& specDecParams,
 #endif

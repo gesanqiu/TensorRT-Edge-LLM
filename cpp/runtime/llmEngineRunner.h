@@ -19,7 +19,7 @@
 
 #include "common/hashUtils.h"
 #include "common/tensor.h"
-#include "runtime/linearKVCache.h"
+#include "runtime/hybridCacheManager.h"
 #include "runtime/llmRuntimeUtils.h"
 
 #include <NvInferRuntime.h>
@@ -64,14 +64,17 @@ struct LLMEngineRunnerConfig
     int32_t audioTokenId{0};         //!< Special token ID for audio in Qwen3-Omni
     int32_t imageTokenId{0};         //!< Special token ID for image in Qwen3-Omni
 
-    // Hybrid Mamba+Attention model configuration
-    int32_t numMambaLayers{0};     //!< Number of Mamba (SSM) layers (0 for pure attention models)
-    int32_t numAttentionLayers{0}; //!< Number of attention layers (equals numDecoderLayers for pure attention)
-    int32_t mambaNumHeads{0};      //!< Number of Mamba heads
-    int32_t mambaHeadDim{0};       //!< Dimension of each Mamba head
-    int32_t ssmStateSize{0};       //!< SSM state dimension (dstate)
-    int32_t convDim{0};            //!< Conv1d dimension (intermediate_size + 2 * n_groups * ssm_state_size)
-    int32_t convKernel{0};         //!< Conv1d kernel width
+    // Hybrid model configuration
+    int32_t numLinearAttnLayers{0};    //!< Number of recurrent layers (0 for pure attention models)
+    int32_t numAttentionLayers{0};     //!< Number of attention layers (equals numDecoderLayers for pure attention)
+    int32_t recurrentStateNumHeads{0}; //!< Number of recurrent heads (hv for GDN, mamba_num_heads for Mamba)
+    int32_t recurrentStateHeadDim{0};  //!< Dimension of each recurrent head (k for GDN, mamba_head_dim for Mamba)
+    int32_t recurrentStateSize{0};     //!< Recurrent state dimension (v for GDN, dstate for Mamba)
+    int32_t convDim{0};                //!< Conv1d channel dimension
+    int32_t convKernel{0};             //!< Conv1d kernel width
+
+    std::vector<rt::HybridCacheManager::LayerType> layerTypes{}; //!< Per-layer type routing
+    std::vector<rt::KVLayerConfig> kvLayerConfigs{};             //!< Per-layer KV config
 };
 
 //! The class wraps the TensorRT engine built for auto-regressive style decoder model.
@@ -81,7 +84,7 @@ struct LLMEngineRunnerConfig
 //!     decoding at the same time (no continuous batching).
 //! The LLMEngineRunner will:
 //!     1. Hold TensorRT resources of the LLM engine (TRT IRuntime, CUDA Engine, Execution Contexts).
-//!     2. Hold the LinearKVCache resources that support till maxSupportedBatchSize and maxSequenceLength.
+//!     2. Hold the HybridCacheManager resources that support till maxSupportedBatchSize and maxSequenceLength.
 //!     3. Hold the Rope CosSinCache tensor required for positional encoding.
 class LLMEngineRunner
 {
@@ -101,14 +104,28 @@ public:
     //! @brief Destructor
     ~LLMEngineRunner() noexcept;
 
+    /*!
+     * @brief Get the required context memory size for this engine
+     * @return Required context memory size in bytes
+     */
+    int64_t getRequiredContextMemorySize() const;
+
+    /*!
+     * @brief Set shared context memory for the execution context
+     * @param sharedContextMemory Tensor containing the shared device memory (must be on GPU)
+     * @return True on success, false if the tensor is too small
+     * @note The tensor size must be >= getRequiredContextMemorySize(). Must be called before execution.
+     */
+    bool setContextMemory(rt::Tensor& sharedContextMemory);
+
     //! API entry to get the Rope CosSinCache tensor.
     //! The API is useful when the rope cos/sin cache depends on the context which cannot be initialized
     //! in advance when creating the LLMEngineRunner instance.
     rt::Tensor& getRopeCosSinCacheTensor() noexcept;
 
-    //! @brief Get reference to the linear KV cache (also owns Mamba SSM/conv state buffers for hybrid models)
-    //! @return Reference to LinearKVCache
-    rt::LinearKVCache& getLinearKVCache() noexcept;
+    //! @brief Get reference to the cache manager
+    //! @return Reference to HybridCacheManager
+    rt::HybridCacheManager& getCacheManager() noexcept;
 
     //! @brief Get engine configuration
     //! @return Engine configuration structure
@@ -235,7 +252,6 @@ public:
 private:
     std::unique_ptr<nvinfer1::IRuntime> mRuntime;                      //!< TensorRT runtime
     std::unique_ptr<nvinfer1::ICudaEngine> mEngine;                    //!< TensorRT engine
-    rt::Tensor mExecContextMemory{};                                   //!< Device memory for the execution contexts
     std::unique_ptr<nvinfer1::IExecutionContext> mTRTExecutionContext; //!< Prefill and Generation execution context
 
     //! Holds the CUDA graph captured for the decoding step. Each CUDA graph is associated with a unique key value
@@ -268,9 +284,9 @@ private:
     //!     plus generated tokens (including the length in "current" run).
     rt::Tensor mSequenceContextLengths{};
 
-    //! The LinearKVCache tensor that carried for the LLM model execution.
-    //! Also owns Mamba SSM and conv state buffers for hybrid models.
-    rt::LinearKVCache mKVCache{};
+    //! The HybridCacheManager that carries cache state for the LLM model execution.
+    //! Owns KV caches (attention layers) and recurrent/conv state buffers (Mamba layers).
+    rt::HybridCacheManager mCacheManager{};
 
     //! Dummy input tensor used to reserve space for unused input tensors. We always keep this tensor as zero tensor
     //! because to "void" some computation (ex. use as empty lora weights as if there is no LoRA GEMM).
@@ -362,8 +378,8 @@ private:
     //! @return The KV cache type
     nvinfer1::DataType getKVCacheType() const;
 
-    //! @brief Get the SSM state dtype from the engine binding (layer 0)
-    nvinfer1::DataType getSSMStateType() const;
+    //! @brief Get the recurrent state dtype from the engine binding (layer 0)
+    nvinfer1::DataType getRecurrentStateType() const;
 
     //! @brief Get the conv state dtype from the engine binding (layer 0)
     nvinfer1::DataType getConvStateType() const;
@@ -389,11 +405,11 @@ private:
     bool bindTRTNativeKVCacheToEngine(int32_t activeBatchSize);
 
     /*!
-     * @brief Bind SSM state buffers for Mamba layers to the engine
+     * @brief Bind recurrent state buffers for recurrent layers to the engine
      * @param activeBatchSize Number of active sequences
      * @return True on success, false on failure
      */
-    bool bindSSMStateToEngine(int32_t activeBatchSize);
+    bool bindRecurrentStateToEngine(int32_t activeBatchSize);
 
     /*!
      * @brief Bind conv state tensors to the TensorRT execution context

@@ -123,7 +123,7 @@ bool Phi4MMViTRunner::allocateBuffer(cudaStream_t stream)
     mVitInput
         = rt::Tensor({mConfig.maxNumBlocks, mConfig.numChannels, mConfig.blockImageSizeH, mConfig.blockImageSizeW},
             rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "Phi4MMViTRunner::mVitInput");
-    setTensorAddressStatus &= mContext->setTensorAddress(binding_names::kVisualInput, mVitInput.rawPointer());
+    setTensorAddressStatus &= mVisualContext->setTensorAddress(binding_names::kVisualInput, mVitInput.rawPointer());
     LOG_INFO("mConfig.maxNumBlocks: %d, mConfig.outHiddenSize: %d", mConfig.maxNumBlocks, mConfig.outHiddenSize);
 
     // In Phi-4MM, each block generates 256 tokens, so output size is maxNumBlocks*256
@@ -142,7 +142,7 @@ bool Phi4MMViTRunner::allocateBuffer(cudaStream_t stream)
     mOutputEmbedding = rt::Tensor({totalCapacity, mConfig.outHiddenSize}, rt::DeviceType::kGPU,
         nvinfer1::DataType::kHALF, "Phi4MMViTRunner::mOutputEmbedding");
     setTensorAddressStatus
-        &= mContext->setTensorAddress(binding_names::kVisualOutput, mEngineOutputEmbedding.rawPointer());
+        &= mVisualContext->setTensorAddress(binding_names::kVisualOutput, mEngineOutputEmbedding.rawPointer());
     if (!setTensorAddressStatus)
     {
         LOG_ERROR("Failed to set tensor address to the engine");
@@ -329,7 +329,8 @@ void Phi4MMViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
         for (auto const& image : req.imageBuffers)
         {
             // Add thumbnail image by default
-            imageUtils::resizeImage(image, mThumbnailImageHost, mConfig.blockImageSizeW, mConfig.blockImageSizeH);
+            imageUtils::resizeImage(image, mThumbnailImageHost, mConfig.blockImageSizeW, mConfig.blockImageSizeH,
+                imageUtils::InterpolationMode::kBICUBIC);
             formatPatch(mThumbnailImageHost, imageTokenLengths, numImage, totalNumBlocks, true, stream);
 
             if (doResize)
@@ -337,7 +338,8 @@ void Phi4MMViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
                 auto [resizedHeight, resizedWidth] = imageUtils::computeBestBlockGridForResize(image.height,
                     image.width, mConfig.minImageTokensPerImage, mConfig.maxImageTokensPerImage,
                     mConfig.blockImageSizeH, mConfig.blockImageSizeW);
-                imageUtils::resizeImage(image, mResizedImageHost, resizedWidth, resizedHeight);
+                imageUtils::resizeImage(
+                    image, mResizedImageHost, resizedWidth, resizedHeight, imageUtils::InterpolationMode::kBICUBIC);
                 blockGridHWPerBatch.push_back(
                     {resizedHeight / mConfig.blockImageSizeH, resizedWidth / mConfig.blockImageSizeW});
                 formatPatch(mResizedImageHost, imageTokenLengths, numImage, totalNumBlocks, false, stream);
@@ -439,15 +441,18 @@ void Phi4MMViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
 
 bool Phi4MMViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
-    rt::Tensor& /*ropeRotaryCosSinDevice*/, cudaStream_t stream) noexcept
+    rt::Tensor& /*ropeRotaryCosSinDevice*/, cudaStream_t stream, bool imageOnly) noexcept
 {
     std::vector<int64_t> imageTokenLengths;
     std::vector<int64_t> numImages;
     mImagesBlockGridHW.clear();
     try
     {
-        imagePreprocess(request, imageTokenLengths, numImages, mImagesBlockGridHW, true, stream);
-        textPreprocess(request, batchedInputIds, numImages, imageTokenLengths, tokenizer);
+        imagePreprocess(request, imageTokenLengths, numImages, mImagesBlockGridHW, !imageOnly, stream);
+        if (!imageOnly)
+        {
+            textPreprocess(request, batchedInputIds, numImages, imageTokenLengths, tokenizer);
+        }
     }
     catch (std::exception const& e)
     {
@@ -469,7 +474,8 @@ bool Phi4MMViTRunner::infer(cudaStream_t stream)
         TIME_STAGE(metrics::StageNames::kMULTIMODAL_PROCESSING, stream);
 
         bool setEngineIOStatus{true};
-        setEngineIOStatus &= mContext->setInputShape(binding_names::kVisualInput, mVitInput.getShape().getTRTDims());
+        setEngineIOStatus
+            &= mVisualContext->setInputShape(binding_names::kVisualInput, mVitInput.getShape().getTRTDims());
 
         if (!setEngineIOStatus)
         {
@@ -477,7 +483,7 @@ bool Phi4MMViTRunner::infer(cudaStream_t stream)
             return false;
         }
 
-        bool const enqueueStatus = mContext->enqueueV3(stream);
+        bool const enqueueStatus = mVisualContext->enqueueV3(stream);
 
         // Transform raw ViT tokens on GPU in one batched kernel (Phi4MM HD transform)
         // Flatten all images across batches

@@ -87,7 +87,7 @@ index bec3b70e7..91bcc9301 100644
  ###################################################################################################
  
 diff --git a/cpp/kernels/fmha_v2/setup.py b/cpp/kernels/fmha_v2/setup.py
-index cc3931caa..5dbbd2507 100644
+index cc3931caa..c730e68c6 100644
 --- a/cpp/kernels/fmha_v2/setup.py
 +++ b/cpp/kernels/fmha_v2/setup.py
 @@ -1947,7 +1947,7 @@ def get_hopper_instruction_traits(instruction_traits, kernel_spec):
@@ -108,7 +108,25 @@ index cc3931caa..5dbbd2507 100644
      # only generate certain needed combinations of input_layout and mask types for trt-llm.
      if "GENERATE_CUBIN" in os.environ:
          if kspec.sage_block_sizes:
-@@ -3520,8 +3520,6 @@ struct FusedMultiHeadAttentionKernelMetaInfoV2
+@@ -1984,12 +1984,13 @@ def selected_mask_types(kspec):
+             # NOTE: 72/80 are added for vision transformer
+             if kspec.head_size not in [32, 64, 72, 80, 128]:
+                 padding_mask = '0'
+-        # only cross attention (head_size = 32/64/128) needs contiguous_q_kv input layout + padding mask / custom_mask.
++        # cross attention and MQA/GQA LLMs use contiguous_q_kv input layout.
++        # EdgeLLM needs all mask types for whitelisted head sizes.
+         elif kspec.input_layout == InputLayout.CONTIGUOUS_Q_KV:
+-            causal_mask = '0'
+-            sliding_or_chunked_causal_mask = '0'
+-            if kspec.head_size not in [32, 64, 72, 128]:
++            if kspec.head_size not in [32, 64, 72, 128, 256]:
+                 padding_mask = '0'
++                causal_mask = '0'
++                sliding_or_chunked_causal_mask = '0'
+                 custom_mask = '0'
+         # paged kv cache is always needed in gpt variants.
+         # cross-attention also needs paged kv cache.
+@@ -3520,8 +3521,6 @@ struct FusedMultiHeadAttentionKernelMetaInfoV2
      bool mEnableSkipSoftmax;{launcher_line}
  }};
  
@@ -117,7 +135,7 @@ index cc3931caa..5dbbd2507 100644
  
  }} // namespace kernels
  TRTLLM_NAMESPACE_END
-@@ -3530,13 +3528,7 @@ TRTLLM_NAMESPACE_END
+@@ -3530,13 +3529,7 @@ TRTLLM_NAMESPACE_END
          source_content = '''\
  {copyright}
  
@@ -132,7 +150,7 @@ index cc3931caa..5dbbd2507 100644
  
  //--- Cubin Arrays
  {cubins}
-@@ -3544,17 +3536,7 @@ TRTLLM_NAMESPACE_END
+@@ -3544,17 +3537,7 @@ TRTLLM_NAMESPACE_END
  //--- Cubin Lengths
  {cubin_lens}
  
@@ -151,7 +169,7 @@ index cc3931caa..5dbbd2507 100644
  
  // FIXME: These are duplicated declarations, we should remove them in the future.
  constexpr int32_t kSM_70 = 70;
-@@ -3562,6 +3544,7 @@ constexpr int32_t kSM_72 = 72;
+@@ -3562,6 +3545,7 @@ constexpr int32_t kSM_72 = 72;
  constexpr int32_t kSM_75 = 75;
  constexpr int32_t kSM_80 = 80;
  constexpr int32_t kSM_86 = 86;
@@ -159,7 +177,7 @@ index cc3931caa..5dbbd2507 100644
  constexpr int32_t kSM_89 = 89;
  constexpr int32_t kSM_90 = 90;
  constexpr int32_t kSM_100 = 100;
-@@ -3569,6 +3552,7 @@ constexpr int32_t kSM_100f = 10100;
+@@ -3569,6 +3553,7 @@ constexpr int32_t kSM_100f = 10100;
  constexpr int32_t kSM_103 = 103;
  constexpr int32_t kSM_120 = 120;
  constexpr int32_t kSM_121 = 121;
@@ -167,7 +185,7 @@ index cc3931caa..5dbbd2507 100644
  
  // FIXME: These are duplicated declarations, we should remove them in the future.
  enum Data_type
-@@ -3621,8 +3605,7 @@ extern const FusedMultiHeadAttentionKernelMetaInfoV2 sMhaKernelMetaInfosV2[] = {
+@@ -3621,8 +3606,7 @@ extern const FusedMultiHeadAttentionKernelMetaInfoV2 sMhaKernelMetaInfosV2[] = {
  {metadata_v2}
  }};
  
@@ -177,7 +195,7 @@ index cc3931caa..5dbbd2507 100644
  '''.format(**locals(), copyright=copyright)
      else:
          # Non-GENERATE_CUBIN mode: use old behavior
-@@ -4965,6 +4948,55 @@ def enumerate_hmma_flash_kernels(specs, sm=80, dtype='fp16', head_size_v=0):
+@@ -4965,6 +4949,60 @@ def enumerate_hmma_flash_kernels(specs, sm=80, dtype='fp16', head_size_v=0):
                                            head_size_v)
  
  
@@ -195,45 +213,50 @@ index cc3931caa..5dbbd2507 100644
 +    elif sm in [80, 86, 87, 89, 90, 100, 101, 120, 121]:
 +        sm_mma = 80
 +
-+    tiled_head_dim_q_kv_step = [[0, 64, 64, 32],
-+                                [0, 128, 64, 32],
-+                                [1, 128, 64, 128]]
-+    for tiled, head_size, q_loop_step, kv_loop_step in tiled_head_dim_q_kv_step:
-+            specs.append(
-+                kernel_spec(
-+                    sm=sm,
-+                    sm_mma=sm_mma,
-+                    dtype=dtype,
-+                    flash_attention=True,
-+                    tiled=tiled,
-+                    seq_len=0,  # means any sequence here
-+                    kv_loop_step=kv_loop_step,
-+                    limit_qk_fragments=False,
-+                    limit_v_fragments=False,
-+                    head_size=head_size,
-+                    head_size_v=head_size_v,
-+                    warps_m=4,
-+                    warps_n=1,
-+                    version=2,
-+                    interleaved=False,
-+                    ldgsts_q=True,
-+                    ldgsts_k=True,
-+                    ldgsts_v=True,
-+                    share_smem_k_v=False,
-+                    loop_step=q_loop_step,
-+                    has_noloop=1,
-+                    noloop_step=q_loop_step,
-+                    unroll_threshold=1,
-+                    has_scale_max=False,
-+                    ctas_per_head=1,
-+                    input_layout=input_layout,
-+                    enable_attn_logit_softcapping=enable_attn_logit_softcapping,
-+                    is_mtp=(head_size == 576 and head_size_v == 512)))
++    # (tiled, head_size, q_step, kv_step, limit_fragments, ldgsts_kv)
++    kernel_configs = [
++        (0, 64, 64, 32, False, True),
++        (0, 128, 64, 32, False, True),
++        (1, 128, 64, 128, False, True),
++        (0, 256, 64, 16, True, False),
++        (1, 256, 64, 128, False, True),
++    ]
++    for tiled, head_size, q_loop_step, kv_loop_step, lim_frag, ldg_kv in kernel_configs:
++        specs.append(
++            kernel_spec(
++                sm=sm,
++                sm_mma=sm_mma,
++                dtype=dtype,
++                flash_attention=True,
++                tiled=tiled,
++                seq_len=0,  # means any sequence here
++                kv_loop_step=kv_loop_step,
++                limit_qk_fragments=lim_frag,
++                limit_v_fragments=lim_frag,
++                head_size=head_size,
++                head_size_v=head_size_v,
++                warps_m=4,
++                warps_n=1,
++                version=2,
++                interleaved=False,
++                ldgsts_q=True,
++                ldgsts_k=ldg_kv,
++                ldgsts_v=ldg_kv,
++                share_smem_k_v=False,
++                loop_step=q_loop_step,
++                has_noloop=1,
++                noloop_step=q_loop_step,
++                unroll_threshold=1,
++                has_scale_max=False,
++                ctas_per_head=1,
++                input_layout=input_layout,
++                enable_attn_logit_softcapping=enable_attn_logit_softcapping,
++                is_mtp=(head_size == 576 and head_size_v == 512)))
 +
  # Note this will be used in TRT-LLM.
  def enumerate_hmma_flash_kernels_base(specs,
                                        sm=80,
-@@ -6405,6 +6437,29 @@ def enumerate_kernels():
+@@ -6405,6 +6443,29 @@ def enumerate_kernels():
  
      specs = []
  
@@ -246,7 +269,7 @@ index cc3931caa..5dbbd2507 100644
 +            if 'ENABLE_SM10X' in os.environ:
 +                sm_list.extend([100, 101])
 +        for sm in sm_list:
-+            for input_layout in [InputLayout.PACKED_QKV, InputLayout.CONTIGUOUS_Q_KV, InputLayout.SEPARATE_Q_K_V]:
++            for input_layout in [InputLayout.SEPARATE_Q_K_V]:
 +                enumerate_hmma_flash_kernels_edge_llm(specs, sm=sm, dtype='fp16_fp32', input_layout=input_layout)
 +
 +        # TRT-EdgeLLM uses the head_interleaved=False mode.

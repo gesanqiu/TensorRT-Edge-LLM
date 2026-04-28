@@ -151,6 +151,44 @@ struct DVec<half>
 };
 //! \endcond
 
+//! \cond INTERNAL
+/*!
+ * @brief Vectorization specialization for uint8_t[16]
+ *
+ * Used for byte-granularity copies, e.g. compacting FP8 KV caches where
+ * the element type is 1 byte and no arithmetic is performed on the values.
+ * Uses uint4 (16 bytes) for optimal 128-bit memory coalescing.
+ */
+template <>
+struct DVec<uint8_t>
+{
+    uint4 data;                              //!< Storage for 16 bytes as uint4
+    static constexpr uint32_t vec_size = 16; //!< Vector size (elements per load)
+
+    __device__ __forceinline__ uint8_t& operator[](uint32_t idx)
+    {
+        return reinterpret_cast<uint8_t*>(&data)[idx];
+    }
+
+    __device__ __forceinline__ uint8_t const& operator[](uint32_t idx) const
+    {
+        return reinterpret_cast<uint8_t const*>(&data)[idx];
+    }
+
+    //! @brief Load 16 bytes from global memory (must be 16-byte aligned)
+    __device__ __forceinline__ void load(uint8_t const* ptr)
+    {
+        data = *(reinterpret_cast<uint4 const*>(ptr));
+    }
+
+    //! @brief Store 16 bytes to global memory (must be 16-byte aligned)
+    __device__ __forceinline__ void store(uint8_t* ptr) const
+    {
+        *(reinterpret_cast<uint4*>(ptr)) = data;
+    }
+};
+//! \endcond
+
 #if SUPPORTS_FP8
 //! \cond INTERNAL
 /*!

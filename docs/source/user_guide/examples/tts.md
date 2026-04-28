@@ -20,8 +20,8 @@ The export pipeline loads the Qwen3-TTS model via the `qwen-tts` package. Instal
 cd TensorRT-Edge-LLM
 python3 -m venv venv-qwen3-tts
 source venv-qwen3-tts/bin/activate
-pip3 install qwen-tts       # install qwen3-tts and its required dependencies.
 pip3 install .              # install TensorRT Edge-LLM export dependencies
+pip3 install qwen-tts       # install qwen3-tts and its required dependencies.
 ```
 
 ---

@@ -1,5 +1,7 @@
 # Vocabulary Reduction
 
+> **Scope:** Vocabulary reduction is supported by the legacy `tensorrt_edgellm` export tools. It is not supported by the checkpoint-based `llm_loader` export path.
+
 ## Overview
 
 Vocabulary reduction optimizes LM head computation by reducing the vocabulary size to a subset of relevant tokens. This feature **only speeds up the LM head layer** — the rest of the model remains unchanged.

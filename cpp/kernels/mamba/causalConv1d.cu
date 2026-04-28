@@ -39,12 +39,14 @@
 namespace mamba_ssm
 {
 
-// Prefill causal conv1d kernel (templated).
-template <typename T>
-__global__ void causalConv1dKernel(T const* x, T const* weight, T const* bias, T* out, int32_t batch, int32_t seqLen,
-    int32_t outSeqLen, int32_t dim, int32_t width, int32_t stride, int32_t padding, int32_t dilation,
-    int64_t xStrideBatch, int64_t xStrideSeq, int64_t xStrideDim, int64_t weightStrideChannel,
-    int64_t weightStrideKernel, int64_t outStrideBatch, int64_t outStrideSeq, int64_t outStrideDim)
+// Prefill causal conv1d: sliding window with device-adaptive seq-parallel.
+// Maintains a shift register of width input values per thread, reading 1 new value per output
+// instead of width. Uses gridDim.z to distribute contiguous chunks across SMs.
+//
+// Two variants: template kWidth for compile-time unroll, runtime width as fallback.
+template <typename T, int32_t kWidth>
+__global__ void causalConv1dKernelT(T const* __restrict__ x, T const* __restrict__ weight, T const* bias,
+    T* __restrict__ out, int32_t seqLen, int32_t outSeqLen, int32_t dim, int32_t padding, int32_t const* contextLengths)
 {
     int32_t const batchIdx = blockIdx.x;
     int32_t const dimIdx = static_cast<int32_t>(blockIdx.y * blockDim.x + threadIdx.x);
@@ -53,35 +55,147 @@ __global__ void causalConv1dKernel(T const* x, T const* weight, T const* bias, T
         return;
     }
 
-    int64_t const xBatchOffset = static_cast<int64_t>(batchIdx) * xStrideBatch;
-    int64_t const outBatchOffset = static_cast<int64_t>(batchIdx) * outStrideBatch;
-    int64_t const weightChannelOffset = static_cast<int64_t>(dimIdx) * weightStrideChannel;
-    float const biasValue = bias == nullptr ? 0.F : conversion::toFloat(bias[dimIdx]);
+    int32_t const effectiveSeqLen = contextLengths ? contextLengths[batchIdx] : seqLen;
+    float const biasVal = (bias != nullptr) ? conversion::toFloat(bias[dimIdx]) : 0.0F;
 
-    for (int32_t outPos = 0; outPos < outSeqLen; ++outPos)
+    float w[kWidth];
+#pragma unroll
+    for (int32_t k = 0; k < kWidth; ++k)
     {
-        float acc = biasValue;
-        int32_t const inBase = outPos * stride - padding;
-        for (int32_t k = 0; k < width; ++k)
+        w[k] = conversion::toFloat(weight[static_cast<int64_t>(dimIdx) * kWidth + k]);
+    }
+
+    int64_t const batchOff = static_cast<int64_t>(batchIdx) * seqLen * dim;
+    int64_t const outBatchOff = static_cast<int64_t>(batchIdx) * outSeqLen * dim;
+
+    int32_t const zBlocks = static_cast<int32_t>(gridDim.z);
+    int32_t const chunkSize = (outSeqLen + zBlocks - 1) / zBlocks;
+    int32_t const chunkStart = static_cast<int32_t>(blockIdx.z) * chunkSize;
+    int32_t const chunkEnd = chunkStart + chunkSize < outSeqLen ? chunkStart + chunkSize : outSeqLen;
+    if (chunkStart >= outSeqLen)
+    {
+        return;
+    }
+
+    float xBuf[kWidth];
+#pragma unroll
+    for (int32_t k = 0; k < kWidth - 1; ++k)
+    {
+        int32_t const inPos = chunkStart + k - padding;
+        xBuf[k] = (inPos >= 0 && inPos < effectiveSeqLen)
+            ? conversion::toFloat(x[batchOff + static_cast<int64_t>(inPos) * dim + dimIdx])
+            : 0.0F;
+    }
+
+    for (int32_t outPos = chunkStart; outPos < chunkEnd; ++outPos)
+    {
+        if (outPos >= effectiveSeqLen)
         {
-            int32_t const inPos = inBase + k * dilation;
-            if (inPos >= 0 && inPos < seqLen)
-            {
-                int64_t const xIdx = xBatchOffset + static_cast<int64_t>(inPos) * xStrideSeq
-                    + static_cast<int64_t>(dimIdx) * xStrideDim;
-                int64_t const wIdx = weightChannelOffset + static_cast<int64_t>(k) * weightStrideKernel;
-                acc += conversion::toFloat(x[xIdx]) * conversion::toFloat(weight[wIdx]);
-            }
+            conversion::convertAndStore(&out[outBatchOff + static_cast<int64_t>(outPos) * dim + dimIdx], 0.0F);
+            xBuf[kWidth - 1] = 0.0F;
         }
-        int64_t const outIdx = outBatchOffset + static_cast<int64_t>(outPos) * outStrideSeq
-            + static_cast<int64_t>(dimIdx) * outStrideDim;
-        conversion::convertAndStore(&out[outIdx], acc);
+        else
+        {
+            int32_t const newInPos = outPos + kWidth - 1 - padding;
+            xBuf[kWidth - 1] = (newInPos >= 0 && newInPos < effectiveSeqLen)
+                ? conversion::toFloat(x[batchOff + static_cast<int64_t>(newInPos) * dim + dimIdx])
+                : 0.0F;
+
+            float acc = biasVal;
+#pragma unroll
+            for (int32_t k = 0; k < kWidth; ++k)
+            {
+                acc += xBuf[k] * w[k];
+            }
+            conversion::convertAndStore(&out[outBatchOff + static_cast<int64_t>(outPos) * dim + dimIdx], acc);
+        }
+#pragma unroll
+        for (int32_t k = 0; k < kWidth - 1; ++k)
+        {
+            xBuf[k] = xBuf[k + 1];
+        }
+    }
+}
+
+// Runtime width fallback
+template <typename T>
+__global__ void causalConv1dKernel(T const* __restrict__ x, T const* __restrict__ weight, T const* bias,
+    T* __restrict__ out, int32_t seqLen, int32_t outSeqLen, int32_t dim, int32_t width, int32_t padding,
+    int32_t const* contextLengths)
+{
+    int32_t const batchIdx = blockIdx.x;
+    int32_t const dimIdx = static_cast<int32_t>(blockIdx.y * blockDim.x + threadIdx.x);
+    if (dimIdx >= dim)
+    {
+        return;
+    }
+
+    int32_t const effectiveSeqLen = contextLengths ? contextLengths[batchIdx] : seqLen;
+    float const biasVal = (bias != nullptr) ? conversion::toFloat(bias[dimIdx]) : 0.0F;
+
+    constexpr int32_t kMaxWidth = 8;
+    float w[kMaxWidth];
+    for (int32_t k = 0; k < width && k < kMaxWidth; ++k)
+    {
+        w[k] = conversion::toFloat(weight[static_cast<int64_t>(dimIdx) * width + k]);
+    }
+
+    int64_t const batchOff = static_cast<int64_t>(batchIdx) * seqLen * dim;
+    int64_t const outBatchOff = static_cast<int64_t>(batchIdx) * outSeqLen * dim;
+
+    // Contiguous chunk for this z-block
+    int32_t const zBlocks = static_cast<int32_t>(gridDim.z);
+    int32_t const chunkSize = (outSeqLen + zBlocks - 1) / zBlocks;
+    int32_t const chunkStart = static_cast<int32_t>(blockIdx.z) * chunkSize;
+    int32_t const chunkEnd = chunkStart + chunkSize < outSeqLen ? chunkStart + chunkSize : outSeqLen;
+    if (chunkStart >= outSeqLen)
+    {
+        return;
+    }
+
+    // Pre-fill shift register
+    float xBuf[kMaxWidth];
+    for (int32_t k = 0; k < width - 1; ++k)
+    {
+        int32_t const inPos = chunkStart + k - padding;
+        xBuf[k] = (inPos >= 0 && inPos < effectiveSeqLen)
+            ? conversion::toFloat(x[batchOff + static_cast<int64_t>(inPos) * dim + dimIdx])
+            : 0.0F;
+    }
+
+    for (int32_t outPos = chunkStart; outPos < chunkEnd; ++outPos)
+    {
+        if (outPos >= effectiveSeqLen)
+        {
+            conversion::convertAndStore(&out[outBatchOff + static_cast<int64_t>(outPos) * dim + dimIdx], 0.0F);
+            xBuf[width - 1] = 0.0F;
+        }
+        else
+        {
+            int32_t const newInPos = outPos + width - 1 - padding;
+            xBuf[width - 1] = (newInPos >= 0 && newInPos < effectiveSeqLen)
+                ? conversion::toFloat(x[batchOff + static_cast<int64_t>(newInPos) * dim + dimIdx])
+                : 0.0F;
+
+            float acc = biasVal;
+#pragma unroll
+            for (int32_t k = 0; k < width; ++k)
+            {
+                acc += xBuf[k] * w[k];
+            }
+            conversion::convertAndStore(&out[outBatchOff + static_cast<int64_t>(outPos) * dim + dimIdx], acc);
+        }
+#pragma unroll
+        for (int32_t k = 0; k < width - 1; ++k)
+        {
+            xBuf[k] = xBuf[k + 1];
+        }
     }
 }
 
 void invokeCausalConv1d(trt_edgellm::rt::Tensor const& x, trt_edgellm::rt::Tensor const& weight,
     trt_edgellm::rt::OptionalInputTensor bias, trt_edgellm::rt::Tensor& out, int32_t stride, int32_t padding,
-    int32_t dilation, cudaStream_t stream)
+    int32_t dilation, trt_edgellm::rt::OptionalInputTensor contextLengths, cudaStream_t stream)
 {
     int32_t const batch = static_cast<int32_t>(x.getShape()[0]);
     int32_t const seqLen = static_cast<int32_t>(x.getShape()[1]);
@@ -89,82 +203,72 @@ void invokeCausalConv1d(trt_edgellm::rt::Tensor const& x, trt_edgellm::rt::Tenso
     int32_t const width = static_cast<int32_t>(weight.getShape()[2]);
     int32_t const outSeqLen = static_cast<int32_t>(out.getShape()[1]);
 
-    int64_t const xStrideBatch = x.getStride(0);
-    int64_t const xStrideSeq = x.getStride(1);
-    int64_t const xStrideDim = x.getStride(2);
-    int64_t const weightStrideChannel = weight.getStride(0);
-    int64_t const weightStrideKernel = weight.getStride(2);
-    int64_t const outStrideBatch = out.getStride(0);
-    int64_t const outStrideSeq = out.getStride(1);
-    int64_t const outStrideDim = out.getStride(2);
-
-    int32_t constexpr kThreads = 256;
-    dim3 const block(kThreads);
-    dim3 const grid(batch, static_cast<uint32_t>((dim + kThreads - 1) / kThreads));
-
     if (x.getDataType() != nvinfer1::DataType::kHALF || weight.getDataType() != nvinfer1::DataType::kHALF
         || out.getDataType() != nvinfer1::DataType::kHALF)
     {
         throw std::runtime_error("invokeCausalConv1d: only FP16 (half) is supported.");
     }
-    half const* biasPtr = bias.has_value() ? bias->get().dataPointer<half>() : nullptr;
-    causalConv1dKernel<half><<<grid, block, 0, stream>>>(x.dataPointer<half>(), weight.dataPointer<half>(), biasPtr,
-        out.dataPointer<half>(), batch, seqLen, outSeqLen, dim, width, stride, padding, dilation, xStrideBatch,
-        xStrideSeq, xStrideDim, weightStrideChannel, weightStrideKernel, outStrideBatch, outStrideSeq, outStrideDim);
-    CUDA_CHECK(cudaPeekAtLastError());
-}
 
-// Decode kernel: conv_state dot weight + bias.
-template <typename T>
-__global__ void causalConv1dDecodeKernel(
-    T const* convState, T const* weight, T const* bias, T* output, int32_t dim, int32_t width)
-{
-    int32_t const batchIdx = blockIdx.x;
-    int32_t const dimIdx = static_cast<int32_t>(blockIdx.y * blockDim.x + threadIdx.x);
-    if (dimIdx >= dim)
+    bool const isContiguous = (x.getStride(2) == 1 && x.getStride(1) == dim && out.getStride(2) == 1
+        && out.getStride(1) == dim && weight.getStride(2) == 1);
+
+    if (!isContiguous || stride != 1 || dilation != 1 || width > 8)
     {
-        return;
-    }
-
-    float acc = (bias != nullptr) ? conversion::toFloat(bias[dimIdx]) : 0.0F;
-
-    int64_t const stateOffset = (static_cast<int64_t>(batchIdx) * dim + dimIdx) * width;
-    int64_t const weightOffset = static_cast<int64_t>(dimIdx) * width;
-
-    for (int32_t k = 0; k < width; ++k)
-    {
-        acc += conversion::toFloat(convState[stateOffset + k]) * conversion::toFloat(weight[weightOffset + k]);
-    }
-
-    int64_t const outIdx = static_cast<int64_t>(batchIdx) * dim + dimIdx;
-    conversion::convertAndStore(&output[outIdx], acc);
-}
-
-void invokeCausalConv1dDecode(trt_edgellm::rt::Tensor const& convState, trt_edgellm::rt::Tensor const& weight,
-    trt_edgellm::rt::OptionalInputTensor bias, trt_edgellm::rt::Tensor& out, cudaStream_t stream)
-{
-    int32_t const batch = static_cast<int32_t>(convState.getShape()[0]);
-    int32_t const dim = static_cast<int32_t>(convState.getShape()[1]);
-    int32_t const width = static_cast<int32_t>(convState.getShape()[2]);
-
-    if (convState.getDataType() != nvinfer1::DataType::kHALF || weight.getDataType() != nvinfer1::DataType::kHALF
-        || out.getDataType() != nvinfer1::DataType::kHALF)
-    {
-        throw std::runtime_error("invokeCausalConv1dDecode: only FP16 (half) is supported.");
+        throw std::runtime_error("invokeCausalConv1d: requires contiguous [B,S,D], stride=1, dilation=1, width<=8.");
     }
 
     int32_t constexpr kThreads = 256;
     dim3 const block(kThreads);
-    dim3 const grid(batch, static_cast<uint32_t>((dim + kThreads - 1) / kThreads));
+    uint32_t const dimBlocks = static_cast<uint32_t>((dim + kThreads - 1) / kThreads);
+
+    // Adaptive seq-parallel: add z-blocks only when dim-blocks under-utilize the SMs
+    int32_t smCount = 0;
+    int32_t deviceId = 0;
+    cudaGetDevice(&deviceId);
+    cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, deviceId);
+    uint32_t seqBlocks = 1;
+    if (dimBlocks < static_cast<uint32_t>(smCount) * 2)
+    {
+        seqBlocks = (static_cast<uint32_t>(smCount) * 4 + dimBlocks - 1) / dimBlocks;
+    }
+    if (seqBlocks > static_cast<uint32_t>(outSeqLen))
+    {
+        seqBlocks = static_cast<uint32_t>(outSeqLen);
+    }
+    dim3 const grid(batch, dimBlocks, seqBlocks);
+
     half const* biasPtr = bias.has_value() ? bias->get().dataPointer<half>() : nullptr;
-    causalConv1dDecodeKernel<half><<<grid, block, 0, stream>>>(
-        convState.dataPointer<half>(), weight.dataPointer<half>(), biasPtr, out.dataPointer<half>(), dim, width);
+    int32_t const* clPtr = contextLengths.has_value() ? contextLengths->get().dataPointer<int32_t>() : nullptr;
+    half const* xPtr = x.dataPointer<half>();
+    half const* wPtr = weight.dataPointer<half>();
+    half* outPtr = out.dataPointer<half>();
+
+    switch (width)
+    {
+    case 2:
+        causalConv1dKernelT<half, 2>
+            <<<grid, block, 0, stream>>>(xPtr, wPtr, biasPtr, outPtr, seqLen, outSeqLen, dim, padding, clPtr);
+        break;
+    case 3:
+        causalConv1dKernelT<half, 3>
+            <<<grid, block, 0, stream>>>(xPtr, wPtr, biasPtr, outPtr, seqLen, outSeqLen, dim, padding, clPtr);
+        break;
+    case 4:
+        causalConv1dKernelT<half, 4>
+            <<<grid, block, 0, stream>>>(xPtr, wPtr, biasPtr, outPtr, seqLen, outSeqLen, dim, padding, clPtr);
+        break;
+    default:
+        causalConv1dKernel<half>
+            <<<grid, block, 0, stream>>>(xPtr, wPtr, biasPtr, outPtr, seqLen, outSeqLen, dim, width, padding, clPtr);
+        break;
+    }
     CUDA_CHECK(cudaPeekAtLastError());
 }
 
 // Capture last `width` time-steps from x into conv_state (transposed).
 template <typename T>
-__global__ void captureConvStateKernel(T const* x, T* convState, int32_t seqLen, int32_t dim, int32_t width)
+__global__ void captureConvStateKernel(
+    T const* x, T* convState, int32_t seqLen, int32_t dim, int32_t width, int32_t const* contextLengths)
 {
     int32_t const batchIdx = blockIdx.x;
     int32_t const dimIdx = static_cast<int32_t>(blockIdx.y * blockDim.x + threadIdx.x);
@@ -173,8 +277,9 @@ __global__ void captureConvStateKernel(T const* x, T* convState, int32_t seqLen,
         return;
     }
 
-    int32_t const tailLen = (seqLen >= width) ? width : seqLen;
-    int32_t const tailStart = seqLen - tailLen;
+    int32_t const effectiveSeqLen = contextLengths ? contextLengths[batchIdx] : seqLen;
+    int32_t const tailLen = (effectiveSeqLen >= width) ? width : effectiveSeqLen;
+    int32_t const tailStart = effectiveSeqLen - tailLen;
     int32_t const dstOffset = width - tailLen;
 
     for (int32_t t = 0; t < tailLen; ++t)
@@ -185,7 +290,8 @@ __global__ void captureConvStateKernel(T const* x, T* convState, int32_t seqLen,
     }
 }
 
-void invokeCaptureConvState(trt_edgellm::rt::Tensor const& x, trt_edgellm::rt::Tensor& convState, cudaStream_t stream)
+void invokeCaptureConvState(trt_edgellm::rt::Tensor const& x, trt_edgellm::rt::Tensor& convState,
+    trt_edgellm::rt::OptionalInputTensor contextLengths, cudaStream_t stream)
 {
     int32_t const batch = static_cast<int32_t>(x.getShape()[0]);
     int32_t const seqLen = static_cast<int32_t>(x.getShape()[1]);
@@ -200,17 +306,19 @@ void invokeCaptureConvState(trt_edgellm::rt::Tensor const& x, trt_edgellm::rt::T
     size_t const elemSize = sizeof(half);
     CUDA_CHECK(cudaMemsetAsync(convState.rawPointer(), 0, static_cast<size_t>(batch) * dim * width * elemSize, stream));
 
+    int32_t const* clPtr = contextLengths.has_value() ? contextLengths->get().dataPointer<int32_t>() : nullptr;
     int32_t constexpr kThreads = 256;
     dim3 const block(kThreads);
     dim3 const grid(batch, static_cast<uint32_t>((dim + kThreads - 1) / kThreads));
     captureConvStateKernel<half>
-        <<<grid, block, 0, stream>>>(x.dataPointer<half>(), convState.dataPointer<half>(), seqLen, dim, width);
+        <<<grid, block, 0, stream>>>(x.dataPointer<half>(), convState.dataPointer<half>(), seqLen, dim, width, clPtr);
     CUDA_CHECK(cudaPeekAtLastError());
 }
 
-// Shift conv_state left by 1, insert new column at position width-1.
+// Decode kernel: shift conv_state left by 1, insert new column, then dot with weight + bias
 template <typename T>
-__global__ void convStateShiftInsertKernel(T* convState, T const* newCol, int32_t batch, int32_t dim, int32_t width)
+__global__ void causalConv1dDecodeKernel(
+    T* convState, T const* newCol, T const* weight, T const* bias, T* output, int32_t dim, int32_t width)
 {
     int32_t const batchIdx = blockIdx.x;
     int32_t const dimIdx = static_cast<int32_t>(blockIdx.y * blockDim.x + threadIdx.x);
@@ -220,32 +328,47 @@ __global__ void convStateShiftInsertKernel(T* convState, T const* newCol, int32_
     }
 
     int64_t const rowOffset = (static_cast<int64_t>(batchIdx) * dim + dimIdx) * width;
+    int64_t const weightOffset = static_cast<int64_t>(dimIdx) * width;
     T* row = convState + rowOffset;
 
+    float acc = (bias != nullptr) ? conversion::toFloat(bias[dimIdx]) : 0.0F;
+
+    // Shift left and compute dot product
     for (int32_t k = 0; k < width - 1; ++k)
     {
-        row[k] = row[k + 1];
+        T val = row[k + 1];
+        row[k] = val;
+        acc += conversion::toFloat(val) * conversion::toFloat(weight[weightOffset + k]);
     }
-    row[width - 1] = newCol[static_cast<int64_t>(batchIdx) * dim + dimIdx];
+    // Insert new column and accumulate last weight element
+    T newVal = newCol[static_cast<int64_t>(batchIdx) * dim + dimIdx];
+    row[width - 1] = newVal;
+    acc += conversion::toFloat(newVal) * conversion::toFloat(weight[weightOffset + width - 1]);
+
+    int64_t const outIdx = static_cast<int64_t>(batchIdx) * dim + dimIdx;
+    conversion::convertAndStore(&output[outIdx], acc);
 }
 
-void invokeConvStateShiftInsert(
-    trt_edgellm::rt::Tensor& convState, trt_edgellm::rt::Tensor const& newCol, cudaStream_t stream)
+void invokeCausalConv1dDecode(trt_edgellm::rt::Tensor& convState, trt_edgellm::rt::Tensor const& newCol,
+    trt_edgellm::rt::Tensor const& weight, trt_edgellm::rt::OptionalInputTensor bias, trt_edgellm::rt::Tensor& out,
+    cudaStream_t stream)
 {
     int32_t const batch = static_cast<int32_t>(convState.getShape()[0]);
     int32_t const dim = static_cast<int32_t>(convState.getShape()[1]);
     int32_t const width = static_cast<int32_t>(convState.getShape()[2]);
 
-    if (convState.getDataType() != nvinfer1::DataType::kHALF || newCol.getDataType() != nvinfer1::DataType::kHALF)
+    if (convState.getDataType() != nvinfer1::DataType::kHALF || newCol.getDataType() != nvinfer1::DataType::kHALF
+        || weight.getDataType() != nvinfer1::DataType::kHALF || out.getDataType() != nvinfer1::DataType::kHALF)
     {
-        throw std::runtime_error("invokeConvStateShiftInsert: only FP16 (half) is supported.");
+        throw std::runtime_error("invokeCausalConv1dDecode: only FP16 (half) is supported.");
     }
 
     int32_t constexpr kThreads = 256;
     dim3 const block(kThreads);
     dim3 const grid(batch, static_cast<uint32_t>((dim + kThreads - 1) / kThreads));
-    convStateShiftInsertKernel<half>
-        <<<grid, block, 0, stream>>>(convState.dataPointer<half>(), newCol.dataPointer<half>(), batch, dim, width);
+    half const* biasPtr = bias.has_value() ? bias->get().dataPointer<half>() : nullptr;
+    causalConv1dDecodeKernel<half><<<grid, block, 0, stream>>>(convState.dataPointer<half>(),
+        newCol.dataPointer<half>(), weight.dataPointer<half>(), biasPtr, out.dataPointer<half>(), dim, width);
     CUDA_CHECK(cudaPeekAtLastError());
 }
 

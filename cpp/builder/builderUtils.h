@@ -71,7 +71,7 @@ bool setOptimizationProfile(nvinfer1::IOptimizationProfile* profile, char const*
 std::string printNetworkInfo(nvinfer1::INetworkDefinition const* network, std::string const& prefix = "");
 
 //! Print detailed information about an optimization profile.
-//! Shows the min, optimal, and max dimensions for each input in the profile.
+//! Shows the min, optimal, and max dimensions for each dynamic input in the profile.
 //! @param profile Optimization profile to analyze
 //! @param profileName Name of the profile for display purposes
 //! @param network TensorRT network definition for input analysis

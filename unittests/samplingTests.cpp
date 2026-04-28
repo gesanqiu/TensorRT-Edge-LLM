@@ -281,6 +281,18 @@ TEST_F(SamplingTest, TemperatureZeroParameterOverride)
     }
 }
 
+TEST_F(SamplingTest, ShouldUseNonGreedySampling)
+{
+    EXPECT_FALSE(trt_edgellm::shouldUseNonGreedySampling(1.0f, 0, 1.0f));
+    EXPECT_FALSE(trt_edgellm::shouldUseNonGreedySampling(0.0f, 0, 1.0f));
+    EXPECT_FALSE(trt_edgellm::shouldUseNonGreedySampling(0.7f, 1, 0.95f)); // topK=1 forces greedy
+    EXPECT_FALSE(trt_edgellm::shouldUseNonGreedySampling(1.2f, 1, 0.5f));  // topK=1 forces greedy
+    EXPECT_TRUE(trt_edgellm::shouldUseNonGreedySampling(0.7f, 0, 1.0f));
+    EXPECT_TRUE(trt_edgellm::shouldUseNonGreedySampling(1.2f, 0, 1.0f));
+    EXPECT_TRUE(trt_edgellm::shouldUseNonGreedySampling(1.0f, 2, 1.0f));
+    EXPECT_TRUE(trt_edgellm::shouldUseNonGreedySampling(1.0f, 0, 0.95f));
+}
+
 // Unified sampling tests (accuracy only)
 class SamplingTestSuites : public SamplingTest
 {

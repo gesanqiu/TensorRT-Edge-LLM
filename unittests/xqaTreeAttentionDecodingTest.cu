@@ -135,7 +135,7 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
         {
             numErrorWithin1E_3++;
         }
-        if (__hisnan(outHost[i]))
+        if (isnan(__half2float(outHost[i])))
         {
             NanValueDetected = true;
         }
@@ -215,8 +215,6 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
         thrust::device_vector<__nv_fp8_e4m3> kvInputFp8Device(kvInputFp8);
         thrust::device_vector<half> outFp8Device(
             batchSize * qSequenceLength * numQHeads * headSize, __float2half(0.0F));
-        thrust::device_vector<float> kScaleDevice(1, kScaleQuantOrig);
-        thrust::device_vector<float> vScaleDevice(1, vScaleQuantOrig);
 
         EXPECT_TRUE(trt_edgellm::DecoderXQARunner::canImplement(
             numQHeads, numKVHeads, smVersion, DataType::kHALF, DataType::kFP8));
@@ -230,8 +228,8 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
         paramsFp8.kvCache.capacity = kvSequenceLength;
         paramsFp8.output = thrust::raw_pointer_cast(outFp8Device.data());
         paramsFp8.treeAttnMask = thrust::raw_pointer_cast(packedTreeMaskDevice.data());
-        paramsFp8.kScale = thrust::raw_pointer_cast(kScaleDevice.data());
-        paramsFp8.vScale = thrust::raw_pointer_cast(vScaleDevice.data());
+        paramsFp8.kScale = kScaleQuantOrig;
+        paramsFp8.vScale = vScaleQuantOrig;
 
         // Reuse the same stream used for FP16 decoding.
         cudaStream_t stream{nullptr};
@@ -256,11 +254,11 @@ void TestXQATreeAttentionDecodingAccuracy(int32_t batchSize, int32_t numQHeads, 
             {
                 numClose++;
             }
-            if (__hisnan(outFp8Host[i]))
+            if (isnan(__half2float(outFp8Host[i])))
             {
                 NanValueDetectedFp8 = true;
             }
-            EXPECT_FALSE(__hisnan(outFp8Host[i]));
+            EXPECT_FALSE(isnan(__half2float(outFp8Host[i])));
         }
         float const fp8PassRate1E_3 = static_cast<float>(numClose) / static_cast<float>(outReferenceFp8.size());
 
@@ -310,6 +308,19 @@ TEST(XQATreeAttentionDecodingTest, accuracyKVRatio7HeadDim64)
     TestXQATreeAttentionDecodingAccuracy(1, 14, 2, 64, 512, 20);
 }
 
+TEST(XQATreeAttentionDecodingTest, accuracyKVRatio4HeadDim256)
+{
+    TestXQATreeAttentionDecodingAccuracy(1, 16, 4, 256, 512, 10);
+    TestXQATreeAttentionDecodingAccuracy(1, 16, 4, 256, 256, 32);
+    TestXQATreeAttentionDecodingAccuracy(1, 8, 2, 256, 512, 20);
+}
+
+TEST(XQATreeAttentionDecodingTest, accuracyKVRatio6HeadDim256)
+{
+    TestXQATreeAttentionDecodingAccuracy(1, 24, 4, 256, 512, 10);
+    TestXQATreeAttentionDecodingAccuracy(1, 24, 4, 256, 256, 32);
+}
+
 #if SUPPORTS_FP8
 TEST(XQATreeAttentionDecodingFP8Test, accuracyKVRatio4HeadDim128)
 {
@@ -343,6 +354,19 @@ TEST(XQATreeAttentionDecodingFP8Test, accuracyKVRatio7HeadDim64)
     TestXQATreeAttentionDecodingAccuracy(1, 14, 2, 64, 192, 60, true);
     /// KVSequence 512, QSequence 20
     TestXQATreeAttentionDecodingAccuracy(1, 14, 2, 64, 512, 20, true);
+}
+
+TEST(XQATreeAttentionDecodingFP8Test, accuracyKVRatio4HeadDim256)
+{
+    TestXQATreeAttentionDecodingAccuracy(1, 16, 4, 256, 512, 10, true);
+    TestXQATreeAttentionDecodingAccuracy(1, 16, 4, 256, 256, 32, true);
+    TestXQATreeAttentionDecodingAccuracy(1, 8, 2, 256, 512, 20, true);
+}
+
+TEST(XQATreeAttentionDecodingFP8Test, accuracyKVRatio6HeadDim256)
+{
+    TestXQATreeAttentionDecodingAccuracy(1, 24, 4, 256, 512, 10, true);
+    TestXQATreeAttentionDecodingAccuracy(1, 24, 4, 256, 256, 32, true);
 }
 #endif
 

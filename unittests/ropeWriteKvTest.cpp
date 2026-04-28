@@ -136,10 +136,8 @@ void TestRopeWriteKvPrefill(int32_t const batchSize, AttnParams const& attnParam
     rt::Tensor kvCacheTensor(rt::Coords{batchSize, 2, numKVHeads, kvCacheCapacity, headDim}, rt::DeviceType::kGPU,
         nvinfer1::DataType::kHALF);
 
-    // Empty scale tensor (ignored for FP16 KV cache).
-    rt::Tensor kvScaleQuantOrigTensor{};
-    launchApplyRopeWriteKV(cosSinCacheTensor, std::nullopt, qTensor, kTensor, vTensor, kvCacheTensor,
-        kvScaleQuantOrigTensor, stream, true);
+    launchApplyRopeWriteKV(
+        cosSinCacheTensor, std::nullopt, qTensor, kTensor, vTensor, kvCacheTensor, 1.0f, 1.0f, stream, true);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     auto const qOut = copyDeviceToHost<half>(qTensor);
@@ -240,13 +238,8 @@ void TestRopeWriteKvPrefill(int32_t const batchSize, AttnParams const& attnParam
         float const kScaleOrigQuant = 1.0F / kScaleQuantOrig;
         float const vScaleOrigQuant = 1.0F / vScaleQuantOrig;
 
-        rt::Tensor kvScaleQuantOrigTensorFp8(rt::Coords{2}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-        float const hostScales[2] = {kScaleQuantOrig, vScaleQuantOrig};
-        CUDA_CHECK(
-            cudaMemcpy(kvScaleQuantOrigTensorFp8.rawPointer(), hostScales, sizeof(hostScales), cudaMemcpyHostToDevice));
-
         launchApplyRopeWriteKV(cosSinCacheTensor, std::nullopt, qTensorForFP8, kTensorForFP8, vTensorForFP8, kvFp8,
-            kvScaleQuantOrigTensorFp8, stream, true);
+            kScaleQuantOrig, vScaleQuantOrig, stream, true);
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
         auto const kvOutFp8 = copyDeviceToHost<__nv_fp8_e4m3>(kvFp8);
@@ -342,7 +335,7 @@ void TestRopeWriteKvDecode(int32_t const batchSize, AttnParams const& attnParams
     std::vector<half> qInput;
     std::vector<half> kInput;
     std::vector<half> vInput;
-    std::vector<half> kvCache(kvCacheVolume, 0);
+    std::vector<half> kvCache(kvCacheVolume, __float2half(0.0f));
 
     // Reference output of Q, K, V all have layout [B, S, H, D].
     std::vector<half> qReference;
@@ -414,17 +407,15 @@ void TestRopeWriteKvDecode(int32_t const batchSize, AttnParams const& attnParams
     rt::Tensor customSeqLensTensor(rt::Coords{batchSize, qLen}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT32);
     copyHostToDevice(customSeqLensTensor, customSeqLens);
 
-    // Empty scale tensor (ignored for FP16 KV cache).
-    rt::Tensor kvScaleQuantOrigTensor{};
     if (!isTreeAttention)
     {
-        launchApplyRopeWriteKV(cosSinCacheTensor, seqLensTensor, qTensor, kTensor, vTensor, kvCacheTensor,
-            kvScaleQuantOrigTensor, stream, false);
+        launchApplyRopeWriteKV(
+            cosSinCacheTensor, seqLensTensor, qTensor, kTensor, vTensor, kvCacheTensor, 1.0f, 1.0f, stream, false);
     }
     else
     {
         launchApplyRopeWriteKVTreeDecoding(cosSinCacheTensor, seqLensTensor, customSeqLensTensor, qTensor, kTensor,
-            vTensor, kvCacheTensor, kvScaleQuantOrigTensor, stream);
+            vTensor, kvCacheTensor, 1.0f, 1.0f, stream);
     }
 
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -519,20 +510,15 @@ void TestRopeWriteKvDecode(int32_t const batchSize, AttnParams const& attnParams
         float const kScaleOrigQuant = 1.0F / kScaleQuantOrig;
         float const vScaleOrigQuant = 1.0F / vScaleQuantOrig;
 
-        rt::Tensor kvScaleQuantOrigTensorFp8(rt::Coords{2}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-        float const hostScales[2] = {kScaleQuantOrig, vScaleQuantOrig};
-        CUDA_CHECK(
-            cudaMemcpy(kvScaleQuantOrigTensorFp8.rawPointer(), hostScales, sizeof(hostScales), cudaMemcpyHostToDevice));
-
         if (!isTreeAttention)
         {
             launchApplyRopeWriteKV(cosSinCacheTensor, seqLensTensor, qTensorForFP8, kTensorForFP8, vTensorForFP8, kvFp8,
-                kvScaleQuantOrigTensorFp8, stream, false);
+                kScaleQuantOrig, vScaleQuantOrig, stream, false);
         }
         else
         {
             launchApplyRopeWriteKVTreeDecoding(cosSinCacheTensor, seqLensTensor, customSeqLensTensor, qTensorForFP8,
-                kTensorForFP8, vTensorForFP8, kvFp8, kvScaleQuantOrigTensorFp8, stream);
+                kTensorForFP8, vTensorForFP8, kvFp8, kScaleQuantOrig, vScaleQuantOrig, stream);
         }
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
@@ -615,12 +601,9 @@ void BenchmarkRopeWriteKv(
 
     cudaStream_t stream{nullptr};
 
-    // Empty scale tensor (ignored for FP16 KV cache).
-    rt::Tensor kvScaleQuantOrigTensor{};
-
     auto launchPrefill = [&]() {
-        launchApplyRopeWriteKV(cosSinCacheTensor, std::nullopt, qTensor, kTensor, vTensor, kvCacheTensor,
-            kvScaleQuantOrigTensor, stream, true);
+        launchApplyRopeWriteKV(
+            cosSinCacheTensor, std::nullopt, qTensor, kTensor, vTensor, kvCacheTensor, 1.0f, 1.0f, stream, true);
     };
 
     constexpr int32_t numWarmup = 10;
@@ -653,15 +636,10 @@ void BenchmarkRopeWriteKv(
     // FP8 KV cache benchmark: reuse same Q/K/V and CosSin cache, but write KV cache in FP8 with a fixed scale of 1.0.
     rt::Tensor kvCacheTensorFp8(
         rt::Coords{batchSize, 2, numKVHeads, kvCacheCapacity, headDim}, rt::DeviceType::kGPU, nvinfer1::DataType::kFP8);
-    rt::Tensor kvScaleQuantOrigTensorFp8(rt::Coords{2}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
-    // Use dequant scales = 1.0 (so quantization uses invScale = 1.0 as well).
-    float const hostScales[2] = {1.0F, 1.0F};
-    CUDA_CHECK(
-        cudaMemcpy(kvScaleQuantOrigTensorFp8.rawPointer(), hostScales, sizeof(hostScales), cudaMemcpyHostToDevice));
 
     auto launchPrefillFp8 = [&]() {
-        launchApplyRopeWriteKV(cosSinCacheTensor, std::nullopt, qTensor, kTensor, vTensor, kvCacheTensorFp8,
-            kvScaleQuantOrigTensorFp8, stream, true);
+        launchApplyRopeWriteKV(
+            cosSinCacheTensor, std::nullopt, qTensor, kTensor, vTensor, kvCacheTensorFp8, 1.0f, 1.0f, stream, true);
     };
 
     for (int32_t i = 0; i < numWarmup; i++)

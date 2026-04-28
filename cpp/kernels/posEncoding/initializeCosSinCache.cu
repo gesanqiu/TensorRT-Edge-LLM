@@ -218,14 +218,15 @@ void initializeLongRopeCosSin(float* shortCosSinCache, float* longCosSinCache, f
 
 template <int32_t RotaryDim>
 __global__ void initializeMRopeCosSinKernel(float* cosSinCache, int64_t* mropePositionIds, float rotaryBaseFrequency,
-    int64_t rotaryEmbeddingMaxPositions, bool interleaved)
+    int64_t rotaryEmbeddingMaxPositions, bool interleaved, int32_t sectionH, int32_t sectionW)
 {
-    // In this kernel, each warp compute 4 "position" of the cos/sin cache, and loop until max position.
-    // Each CTA will be assigned 4 warps so it proceeds 16 positions in an iteration.
     // mropePositionIds: [bs, 3, rotaryEmbeddingMaxPositions]
     //     Represent [T, H, W] information for each token position
     // cosSinCache: [bs, rotaryEmbeddingMaxPositions, rotaryDim]
-    //     Combine [T, H, W] information into rotaryDim. Each will take [16, 24, 24] dims.
+    //
+    // Interleaved format: [THWTHW...TT] where H covers slice(1, sectionH*3, 3)
+    //     and W covers slice(2, sectionW*3, 3), rest is T.
+    // Non-interleaved format: [TTT...HHH...WWW] chunked by section.
 
     uint32_t const bIdx = blockIdx.x;
     uint32_t const tIdx = threadIdx.x;
@@ -238,6 +239,16 @@ __global__ void initializeMRopeCosSinKernel(float* cosSinCache, int64_t* mropePo
     uint32_t const posStride = gDimX * bDimY;
     uint32_t const batchIdx = blockIdx.y;
     uint32_t batchPositionIdsOffset = batchIdx * 3 * rotaryEmbeddingMaxPositions;
+
+    // H occupies pair indices {1, 4, ..., 1+3*(sectionH-1)}, max index = sectionH*3 - 2
+    // W occupies pair indices {2, 5, ..., 2+3*(sectionW-1)}, max index = sectionW*3 - 1
+    int32_t const interleavedHLimit = sectionH * 3;
+    int32_t const interleavedWLimit = sectionW * 3;
+
+    // Non-interleaved section boundaries (in units of 8-dim iteration blocks)
+    int32_t const numTemporalPairs = RotaryDim / 2 - sectionH - sectionW;
+    int32_t const nonInterleavedTEnd = numTemporalPairs / 8;
+    int32_t const nonInterleavedHEnd = nonInterleavedTEnd + sectionH / 8;
 
     float ropeConstants[RotaryDim / 16];
 
@@ -257,32 +268,30 @@ __global__ void initializeMRopeCosSinKernel(float* cosSinCache, int64_t* mropePo
         {
             uint32_t zid = tIdx + i * 8;
 
-            // Determine which group of T, H, W to use based on interleaved flag.
-            // Non-interleaved format: [TTT...HHH...WWW] Qwen2-VL
-            //     mrope section is [16, 24, 24], dims 0~15 is T, 16~39 is H, 40~63 is W
-            //     Each iteration i processes 8 dims, i 0~1 is T, 2~4 is H, 5~7 is W
-            // Interleaved format: [THWTHWHTHW...TTTT] Qwen3-VL
-            //     mrope section is [24, 20, 20]
-            //     [THWTHWHTHW...TTTT] has 20 groups of THW and 4 additional T
             int32_t groupIdx;
             if (interleaved)
             {
-                if (zid >= 60)
+                int32_t mod3 = zid % 3;
+                if (mod3 == 1 && zid < interleavedHLimit)
                 {
-                    groupIdx = 0;
+                    groupIdx = 1;
+                }
+                else if (mod3 == 2 && zid < interleavedWLimit)
+                {
+                    groupIdx = 2;
                 }
                 else
                 {
-                    groupIdx = zid % 3;
+                    groupIdx = 0;
                 }
             }
             else
             {
-                if (i < 2)
+                if (i < nonInterleavedTEnd)
                 {
                     groupIdx = 0;
                 }
-                else if (i < 5)
+                else if (i < nonInterleavedHEnd)
                 {
                     groupIdx = 1;
                 }
@@ -305,8 +314,21 @@ __global__ void initializeMRopeCosSinKernel(float* cosSinCache, int64_t* mropePo
 }
 
 void initializeMRopeCosSin(float* cosSinCache, int64_t* mropePositionIds, float rotaryBaseFrequency, int64_t rotaryDim,
-    int64_t rotaryEmbeddingMaxPositions, int64_t batchSize, bool interleaved, cudaStream_t stream)
+    int64_t rotaryEmbeddingMaxPositions, int64_t batchSize, bool interleaved, int32_t sectionH, int32_t sectionW,
+    cudaStream_t stream)
 {
+    if (!interleaved)
+    {
+        int64_t const halfDim = rotaryDim / 2;
+        int64_t const numTemporalPairs = halfDim - sectionH - sectionW;
+        if (numTemporalPairs % 8 != 0 || sectionH % 8 != 0 || sectionW % 8 != 0)
+        {
+            throw std::runtime_error(
+                "Non-interleaved MRoPE sections must be divisible by 8, got T=" + std::to_string(numTemporalPairs)
+                + " H=" + std::to_string(sectionH) + " W=" + std::to_string(sectionW));
+        }
+    }
+
     // Each CTA get assigned 128 threads.
     dim3 block(8, 16);
 
@@ -317,6 +339,7 @@ void initializeMRopeCosSin(float* cosSinCache, int64_t* mropePositionIds, float 
     void* kernelPtr{nullptr};
     switch (rotaryDim)
     {
+    case 64: kernelPtr = (void*) initializeMRopeCosSinKernel<64>; break;
     case 128: kernelPtr = (void*) initializeMRopeCosSinKernel<128>; break;
     default:
         throw std::runtime_error("Un-implemented rotaryDim for initializeMRopeCosSin: " + std::to_string(rotaryDim));
@@ -329,18 +352,31 @@ void initializeMRopeCosSin(float* cosSinCache, int64_t* mropePositionIds, float 
 
     void* kernelArgs[] = {reinterpret_cast<void*>(&cosSinCache), reinterpret_cast<void*>(&mropePositionIds),
         static_cast<void*>(&rotaryBaseFrequency), static_cast<void*>(&rotaryEmbeddingMaxPositions),
-        static_cast<void*>(&interleaved)};
+        static_cast<void*>(&interleaved), static_cast<void*>(&sectionH), static_cast<void*>(&sectionW)};
     CUDA_CHECK(cudaLaunchKernel(kernelPtr, grid, block, kernelArgs, 0, stream));
 }
 
-void initializeTextOnlyMRopeCosSin(
-    float* cosSinCache, float rotaryBaseFrequency, int64_t rotaryDim, int64_t maxPositions, cudaStream_t stream)
+void initializeTextOnlyMRopeCosSin(float* cosSinCache, float rotaryBaseFrequency, int64_t rotaryDim,
+    int64_t maxPositions, int64_t batchSize, cudaStream_t stream)
 {
     // When all 3 MRoPE sections (T, H, W) use sequential positions pos[i] = i, the MRoPE
     // formula reduces to standard RoPE with rotaryScale=1. Reuse initializeNormalRopeCosSin
-    // to avoid constructing temporary position ID buffers.
+    // to avoid constructing temporary position ID buffers. Initialize one slice and
+    // replicate it across batch slots so later runtime reshape([activeBatch, ...]) is valid.
     initializeNormalRopeCosSin(cosSinCache, rotaryBaseFrequency, 1.0f, static_cast<int32_t>(rotaryDim),
         static_cast<int32_t>(maxPositions), stream);
+
+    if (batchSize <= 1)
+    {
+        return;
+    }
+
+    size_t const oneBatchBytes = static_cast<size_t>(maxPositions * rotaryDim * sizeof(float));
+    for (int64_t b = 1; b < batchSize; ++b)
+    {
+        CUDA_CHECK(cudaMemcpyAsync(static_cast<void*>(cosSinCache + b * maxPositions * rotaryDim),
+            static_cast<void const*>(cosSinCache), oneBatchBytes, cudaMemcpyDeviceToDevice, stream));
+    }
 }
 
 } // namespace kernel

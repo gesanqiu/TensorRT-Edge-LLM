@@ -42,9 +42,8 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from transformers import AutoProcessor, AutoTokenizer
-
-from ..llm_models.model_utils import (_is_qwen3_asr_model,
+from ..llm_models.model_utils import (_is_alpamayo_1_model,
+                                      _is_qwen3_asr_model,
                                       _is_qwen3_omni_model, is_vlm)
 
 
@@ -57,13 +56,13 @@ class Message:
 @dataclass
 class SystemMessage(Message):
     role: str = "system"
-    content: str = '<placeholder_system_prompt>'
+    content: str = '__SENTINEL_SYS_a7f3e2b1__'
 
 
 @dataclass
 class UserMessage(Message):
     role: str = "user"
-    content: str = '<placeholder_user_text>'
+    content: str = '__SENTINEL_USR_c9d4f6e8__'
 
 
 @dataclass
@@ -305,7 +304,8 @@ def validate_chat_template(chat_template_path: str) -> Dict[str, Any]:
     print("Chat template validation successful!")
 
 
-def process_chat_template(model_dir: str, output_dir: str) -> None:
+def process_chat_template(model_dir: str, model_tokenizer: Any,
+                          model_processor: Any, output_dir: str) -> None:
     """
     Process the chat template from model's tokenizer and create a JSON file
     with parsed template information.
@@ -314,28 +314,26 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
     test cases to extract the actual prefix/suffix patterns. 
 
     Args:
-        model_dir: Path to the model directory containing tokenizer files
+        model_dir: The directory containing the model
+        model_tokenizer: The tokenizer to use to process the chat template
+        model_processor: The processor to use to process the chat template
         output_dir: Path to save the chat_template.json file
     
     Returns:
         None
     """
-    print(f"Processing chat template from {model_dir}")
+    print(f"Processing chat template for {model_dir}")
 
     tokenizer = None
-    loaders = [AutoProcessor, AutoTokenizer
-               ] if is_vlm(model_dir) else [AutoTokenizer, AutoProcessor]
+    loaders = [model_processor, model_tokenizer
+               ] if is_vlm(model_dir) else [model_tokenizer, model_processor]
     for ldr in loaders:
-        try:
-            tokenizer = ldr.from_pretrained(model_dir, trust_remote_code=True)
-            if getattr(tokenizer, 'chat_template', None):
-                print(f"Successfully loaded chat template from {ldr.__name__}")
-                break
-            else:
-                print(f"{ldr.__name__} loaded but no chat template found")
-                tokenizer = None
-        except Exception as e:
-            print(f"Failed to load {ldr.__name__}: {e}")
+        if getattr(ldr, 'chat_template', None):
+            print(f"Successfully loaded chat template")
+            tokenizer = ldr
+            break
+        else:
+            print(f"No chat template found")
             tokenizer = None
 
     if tokenizer is None:
@@ -344,17 +342,56 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
 
     print("Extracting patterns from chat template...")
 
-    # Extract system role patterns (base case)
+    # Extract system and user role patterns (base case)
     system_prompt = SystemMessage()
-    system_formatted = _format_messages(tokenizer, [system_prompt])
-    system_prefix, system_suffix = _extract_prefix_suffix(
-        system_formatted, system_prompt.content)
-
-    # Extract user role patterns (compare with system base)
     user_prompt = UserMessage()
-    user_formatted = _format_messages(tokenizer, [system_prompt, user_prompt])
-    user_prefix, user_suffix = _extract_prefix_suffix(
-        user_formatted[len(system_formatted):], user_prompt.content)
+    try:
+        system_formatted = _format_messages(tokenizer, [system_prompt])
+        system_prefix, system_suffix = _extract_prefix_suffix(
+            system_formatted, system_prompt.content)
+
+        user_formatted = _format_messages(tokenizer,
+                                          [system_prompt, user_prompt])
+        user_prefix, user_suffix = _extract_prefix_suffix(
+            user_formatted[len(system_formatted):], user_prompt.content)
+
+    except ValueError as e:
+        # Some chat templates (e.g. qwen3.5) reject system-only messages and require
+        # at least one user query. In that case we infer boundaries from
+        # [system, user] and [user] probes.
+        user_only_formatted = _format_messages(tokenizer, [user_prompt])
+        user_prefix_base, user_suffix_base = _extract_prefix_suffix(
+            user_only_formatted, user_prompt.content)
+
+        user_formatted = _format_messages(tokenizer,
+                                          [system_prompt, user_prompt])
+        system_content_start = user_formatted.find(system_prompt.content)
+        user_content_start = user_formatted.find(
+            user_prompt.content,
+            system_content_start + len(system_prompt.content))
+        if system_content_start == -1 or user_content_start == -1:
+            raise ValueError(
+                "Unable to infer system and user boundaries from tokenizer chat template output."
+            ) from e
+
+        system_prefix = user_formatted[:system_content_start]
+        between = user_formatted[system_content_start +
+                                 len(system_prompt.content):user_content_start]
+        if user_prefix_base and between.endswith(user_prefix_base):
+            system_suffix = between[:-len(user_prefix_base)]
+            user_prefix = user_prefix_base
+        elif user_prefix_base and user_prefix_base in between:
+            split_pos = between.rfind(user_prefix_base)
+            system_suffix = between[:split_pos]
+            user_prefix = between[split_pos:]
+        else:
+            # Conservative fallback: preserve all boundary text as user prefix.
+            system_suffix = ""
+            user_prefix = between
+        user_suffix = user_formatted[user_content_start +
+                                     len(user_prompt.content):]
+        if not user_suffix and user_suffix_base:
+            user_suffix = user_suffix_base
 
     # Some models (e.g. Qwen3-ASR) inject extra role blocks into the
     # system-only output (an empty user turn).  This causes system_suffix
@@ -386,11 +423,15 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
     assistant_prefix, assistant_suffix = _extract_prefix_suffix(
         assistant_formatted[len(user_formatted):], assistant_prompt.content)
 
-    # Extract standard generation prompt with thinking disabled
+    # Extract the default generation prompt (model's natural behavior).
+    # Do NOT pass enable_thinking — the default prompt must match what
+    # the model produces with no flags, which is what the C++ runtime
+    # uses for non-thinking inference.  Passing enable_thinking=False
+    # on Qwen3 models injects a <think></think> block that breaks the
+    # Talker prefill token layout.
     generation_formatted = _format_messages(tokenizer,
                                             [system_prompt, user_prompt],
-                                            add_generation_prompt=True,
-                                            enable_thinking=False)
+                                            add_generation_prompt=True)
     generation_prompt = generation_formatted[len(user_formatted):]
 
     # Extract generation prompt with thinking enabled (if supported by model)
@@ -398,7 +439,8 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
     try:
         thinking_formatted = _format_messages(tokenizer,
                                               [system_prompt, user_prompt],
-                                              add_generation_prompt=True)
+                                              add_generation_prompt=True,
+                                              enable_thinking=False)
         generation_prompt_thinking = thinking_formatted[len(user_formatted):]
 
         # Only keep if different (model supports thinking mode)
@@ -464,6 +506,12 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
             "Text-only LLM detected, skipping multimodal content pattern extraction"
         )
 
+    if _is_alpamayo_1_model(model_dir):
+        print(
+            "Detected Alpamayo 1 model, adding <|cot_start|> to generation prompt"
+        )
+        generation_prompt = generation_prompt + "<|cot_start|>"
+
     # Extract default system prompt by testing without system message
     user_only_prompt = UserMessage()
     user_only_formatted = _format_messages(tokenizer, [user_only_prompt])
@@ -506,8 +554,16 @@ def process_chat_template(model_dir: str, output_dir: str) -> None:
         "default_system_prompt": default_system_prompt
     }
 
-    # Add thinking mode generation prompt if model supports it
+    # Add thinking mode generation prompt if model supports it.
+    # Sanity check: generation_prompt (non-thinking default) must not contain
+    # <think>; if it does the two prompts were extracted in the wrong order
+    # (happens with Qwen3 Jinja2 templates where enable_thinking=False
+    # *adds* the <think> block).  Swap them to fix.
     if generation_prompt_thinking is not None:
+        if '<think>' in generation_prompt and '<think>' not in generation_prompt_thinking:
+            generation_prompt, generation_prompt_thinking = (
+                generation_prompt_thinking, generation_prompt)
+            chat_template_data["generation_prompt"] = generation_prompt
         chat_template_data[
             "generation_prompt_thinking"] = generation_prompt_thinking
 

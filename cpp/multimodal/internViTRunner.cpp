@@ -118,13 +118,14 @@ bool InternViTRunner::allocateBuffer(cudaStream_t stream)
     mVitInput
         = rt::Tensor({mConfig.maxNumBlocks, mConfig.numChannels, mConfig.blockImageSizeH, mConfig.blockImageSizeW},
             rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "InternViTRunner::mVitInput");
-    setTensorAddressStatus &= mContext->setTensorAddress(binding_names::kVisualInput, mVitInput.rawPointer());
+    setTensorAddressStatus &= mVisualContext->setTensorAddress(binding_names::kVisualInput, mVitInput.rawPointer());
     LOG_INFO("InternViTRunner::allocateBuffer() mConfig.maxNumBlocks: %d, mConfig.outHiddenSize: %d",
         mConfig.maxNumBlocks, mConfig.outHiddenSize);
     // In InternVL3, each block generates 256 tokens, so output size is maxNumBlocks*256
     mOutputEmbedding = rt::Tensor({mConfig.maxNumBlocks * 256, mConfig.outHiddenSize}, rt::DeviceType::kGPU,
         nvinfer1::DataType::kHALF, "InternViTRunner::mOutputEmbedding");
-    setTensorAddressStatus &= mContext->setTensorAddress(binding_names::kVisualOutput, mOutputEmbedding.rawPointer());
+    setTensorAddressStatus
+        &= mVisualContext->setTensorAddress(binding_names::kVisualOutput, mOutputEmbedding.rawPointer());
     if (!setTensorAddressStatus)
     {
         LOG_ERROR("Failed to set tensor address to the engine");
@@ -231,21 +232,28 @@ void InternViTRunner::imagePreprocess(rt::LLMGenerationRequest const& request, s
         int64_t numImage = 0;
         for (auto const& image : req.imageBuffers)
         {
+            int64_t const blocksBeforePatch = totalNumBlocks;
             if (doResize)
             {
                 auto [resizedHeight, resizedWidth] = imageUtils::computeBestBlockGridForResize(image.height,
                     image.width, mConfig.minImageTokensPerImage, mConfig.maxImageTokensPerImage,
                     mConfig.blockImageSizeH, mConfig.blockImageSizeW);
-                rt::imageUtils::resizeImage(image, mResizedImageHost, resizedWidth, resizedHeight);
+                rt::imageUtils::resizeImage(
+                    image, mResizedImageHost, resizedWidth, resizedHeight, rt::imageUtils::InterpolationMode::kBICUBIC);
                 formatPatch(mResizedImageHost, imageTokenLengths, numImage, totalNumBlocks, false, stream);
             }
             else
             {
                 formatPatch(image, imageTokenLengths, numImage, totalNumBlocks, false, stream);
             }
-            // Add thumbnail image by default (use separate buffer to avoid race condition)
-            rt::imageUtils::resizeImage(image, mThumbnailImageHost, mConfig.blockImageSizeW, mConfig.blockImageSizeH);
-            formatPatch(mThumbnailImageHost, imageTokenLengths, numImage, totalNumBlocks, true, stream);
+            // Only add thumbnail when the image has more than 1 block (matches HuggingFace behavior)
+            int64_t const mainImageBlocks = totalNumBlocks - blocksBeforePatch;
+            if (mainImageBlocks > 1)
+            {
+                rt::imageUtils::resizeImage(image, mThumbnailImageHost, mConfig.blockImageSizeW,
+                    mConfig.blockImageSizeH, rt::imageUtils::InterpolationMode::kBICUBIC);
+                formatPatch(mThumbnailImageHost, imageTokenLengths, numImage, totalNumBlocks, true, stream);
+            }
         }
         numImages.emplace_back(numImage);
     }
@@ -331,15 +339,18 @@ void InternViTRunner::textPreprocess(rt::LLMGenerationRequest const& request,
 
 bool InternViTRunner::preprocess(rt::LLMGenerationRequest const& request,
     std::vector<std::vector<int32_t>>& batchedInputIds, tokenizer::Tokenizer const* tokenizer,
-    [[maybe_unused]] rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream) noexcept
+    [[maybe_unused]] rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream, bool imageOnly) noexcept
 {
     std::vector<int64_t> imageTokenLengths;
     std::vector<int64_t> numImages;
 
     try
     {
-        imagePreprocess(request, imageTokenLengths, numImages, true, stream);
-        textPreprocess(request, batchedInputIds, numImages, imageTokenLengths, tokenizer);
+        imagePreprocess(request, imageTokenLengths, numImages, !imageOnly, stream);
+        if (!imageOnly)
+        {
+            textPreprocess(request, batchedInputIds, numImages, imageTokenLengths, tokenizer);
+        }
     }
     catch (std::exception const& e)
     {
@@ -364,14 +375,15 @@ bool InternViTRunner::infer(cudaStream_t stream) noexcept
         TIME_STAGE(metrics::StageNames::kMULTIMODAL_PROCESSING, stream);
 
         bool setEngineIOStatus{true};
-        setEngineIOStatus &= mContext->setInputShape(binding_names::kVisualInput, mVitInput.getShape().getTRTDims());
+        setEngineIOStatus
+            &= mVisualContext->setInputShape(binding_names::kVisualInput, mVitInput.getShape().getTRTDims());
         if (!setEngineIOStatus)
         {
             LOG_ERROR("InternViTRunner::infer(): Failed to bind engine input tensors.");
             return false;
         }
 
-        bool enqueueStatus = mContext->enqueueV3(stream);
+        bool enqueueStatus = mVisualContext->enqueueV3(stream);
         if (!enqueueStatus)
         {
             LOG_ERROR("InternViTRunner::infer(): Failed to enqueue engine.");

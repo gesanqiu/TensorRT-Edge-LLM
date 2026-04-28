@@ -8,6 +8,22 @@ Complete workflow for speech recognition with audio understanding capabilities.
 
 ---
 
+## Part 0: Install ASR Dependency (x86 Host)
+
+The export pipeline loads the Qwen3-ASR model via the `qwen-asr` package. Install it before exporting:
+
+> **Warning:** Installing `qwen-asr` may break package versions in your current environment (e.g. `transformers`, `torch`). **Use a dedicated virtual environment for Qwen3-ASR export only** — do not share it with other model workflows. We need this special workflow until Qwen3-ASR gets merged into HuggingFace transformers.
+
+```bash
+cd TensorRT-Edge-LLM
+python3 -m venv venv-qwen3-asr
+source venv-qwen3-asr/bin/activate
+pip3 install .              # install TensorRT Edge-LLM export dependencies
+pip3 install qwen-asr       # install qwen3-asr and its required dependencies.
+```
+
+---
+
 ## Step 1: Export (x86 Host)
 
 ```bash

@@ -22,6 +22,7 @@
 #include "plugins/utils/pluginUtils.h"
 
 #include <cstdint>
+#include <cstring>
 #include <cuda_fp16.h>
 #include <mutex>
 
@@ -41,9 +42,10 @@ constexpr int32_t kIN_X_IDX{0};
 constexpr int32_t kIN_WEIGHT_IDX{1};
 constexpr int32_t kIN_BIAS_IDX{2};
 constexpr int32_t kIN_CONV_STATE_IDX{3};
+constexpr int32_t kIN_CONTEXT_LENGTHS_IDX{4};
 constexpr int32_t kOUT_IDX{0};
 constexpr int32_t kOUT_CONV_STATE_IDX{1};
-constexpr int32_t kNUM_INPUTS{4};
+constexpr int32_t kNUM_INPUTS{5};
 constexpr int32_t kNUM_OUTPUTS{2};
 
 std::optional<int32_t> parsePluginIntField(std::string const& fieldName, PluginFieldCollection const* fc)
@@ -74,6 +76,10 @@ std::vector<PluginField> CausalConv1dPluginCreator::mPluginAttributes;
 
 REGISTER_TENSORRT_PLUGIN(CausalConv1dPluginCreator);
 
+// ---------------------------------------------------------------------------
+// Plugin — construction / destruction
+// ---------------------------------------------------------------------------
+
 CausalConv1dPlugin::CausalConv1dPlugin(
     std::string const& name, int32_t stride, int32_t padding, int32_t dilation, int32_t groups)
     : mLayerName(name)
@@ -84,22 +90,26 @@ CausalConv1dPlugin::CausalConv1dPlugin(
 {
 }
 
-CausalConv1dPlugin::~CausalConv1dPlugin() {}
-
-IPluginCapability* CausalConv1dPlugin::getCapabilityInterface(PluginCapabilityType type) noexcept
+CausalConv1dPlugin::CausalConv1dPlugin(std::string const& name, void const* data, size_t length)
+    : mLayerName(name)
 {
-    if (type == PluginCapabilityType::kBUILD)
-    {
-        return static_cast<IPluginV3OneBuild*>(this);
-    }
-    if (type == PluginCapabilityType::kRUNTIME)
-    {
-        return static_cast<IPluginV3OneRuntime*>(this);
-    }
-    return static_cast<IPluginV3OneCore*>(this);
+    auto const* d = static_cast<char const*>(data);
+    std::memcpy(&mStride, d, sizeof(int32_t));
+    d += sizeof(int32_t);
+    std::memcpy(&mPadding, d, sizeof(int32_t));
+    d += sizeof(int32_t);
+    std::memcpy(&mDilation, d, sizeof(int32_t));
+    d += sizeof(int32_t);
+    std::memcpy(&mGroups, d, sizeof(int32_t));
 }
 
-IPluginV3* CausalConv1dPlugin::clone() noexcept
+CausalConv1dPlugin::~CausalConv1dPlugin() {}
+
+// ---------------------------------------------------------------------------
+// IPluginV2DynamicExt
+// ---------------------------------------------------------------------------
+
+IPluginV2DynamicExt* CausalConv1dPlugin::clone() const noexcept
 {
     auto* plugin = new CausalConv1dPlugin(mLayerName, mStride, mPadding, mDilation, mGroups);
     plugin->setPluginNamespace(mNamespace.c_str());
@@ -111,78 +121,68 @@ int32_t CausalConv1dPlugin::getNbOutputs() const noexcept
     return kNUM_OUTPUTS;
 }
 
-int32_t CausalConv1dPlugin::getOutputDataTypes(
-    DataType* outputTypes, int32_t nbOutputs, DataType const* inputTypes, int32_t nbInputs) const noexcept
+DataType CausalConv1dPlugin::getOutputDataType(
+    int32_t index, DataType const* inputTypes, [[maybe_unused]] int32_t nbInputs) const noexcept
 {
-    outputTypes[kOUT_IDX] = inputTypes[kIN_X_IDX];
-    outputTypes[kOUT_CONV_STATE_IDX] = inputTypes[kIN_X_IDX];
-    return 0;
+    // Both outputs (conv output and updated conv state) have the same type as x.
+    (void) index;
+    return inputTypes[kIN_X_IDX];
 }
 
-int32_t CausalConv1dPlugin::getOutputShapes(DimsExprs const* inputs, int32_t nbInputs,
-    DimsExprs const* /* shapeInputs */, int32_t /* nbShapeInputs */, DimsExprs* outputs, int32_t nbOutputs,
-    IExprBuilder& /* exprBuilder */) noexcept
+DimsExprs CausalConv1dPlugin::getOutputDimensions(
+    int32_t outputIndex, DimsExprs const* inputs, [[maybe_unused]] int32_t nbInputs, IExprBuilder&) noexcept
 {
-    // Output: same shape as x [batch, seq_len, dim].
-    outputs[kOUT_IDX].nbDims = inputs[kIN_X_IDX].nbDims;
-    for (int32_t i = 0; i < outputs[kOUT_IDX].nbDims; ++i)
+    if (outputIndex == kOUT_IDX)
     {
-        outputs[kOUT_IDX].d[i] = inputs[kIN_X_IDX].d[i];
+        // Output: same shape as x [batch, seq_len, dim].
+        return inputs[kIN_X_IDX];
     }
     // Conv state output: same shape as conv_state input [batch, dim, kernel].
-    outputs[kOUT_CONV_STATE_IDX].nbDims = inputs[kIN_CONV_STATE_IDX].nbDims;
-    for (int32_t i = 0; i < outputs[kOUT_CONV_STATE_IDX].nbDims; ++i)
-    {
-        outputs[kOUT_CONV_STATE_IDX].d[i] = inputs[kIN_CONV_STATE_IDX].d[i];
-    }
-    return 0;
+    return inputs[kIN_CONV_STATE_IDX];
 }
 
 bool CausalConv1dPlugin::supportsFormatCombination(
-    int32_t pos, DynamicPluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept
+    int32_t pos, PluginTensorDesc const* inOut, int32_t nbInputs, int32_t nbOutputs) noexcept
 {
     if (nbInputs != kNUM_INPUTS || nbOutputs != kNUM_OUTPUTS)
-    {
         return false;
-    }
-    bool const isLinear = inOut[pos].desc.format == TensorFormat::kLINEAR;
-    bool const isSupportedType = inOut[pos].desc.type == DataType::kHALF;
-    if (!isLinear || !isSupportedType)
-    {
+    auto const& desc = inOut[pos];
+    if (desc.format != TensorFormat::kLINEAR)
         return false;
-    }
-    if (pos > 0)
+    switch (pos)
     {
-        return inOut[pos].desc.type == inOut[kIN_X_IDX].desc.type;
+    case kIN_X_IDX:
+    case kIN_WEIGHT_IDX:
+    case kIN_BIAS_IDX:
+    case kIN_CONV_STATE_IDX: return desc.type == DataType::kHALF;
+    case kIN_CONTEXT_LENGTHS_IDX: return desc.type == DataType::kINT32;
+    default: return desc.type == inOut[kIN_X_IDX].type;
     }
-    return true;
 }
 
-int32_t CausalConv1dPlugin::configurePlugin(
-    DynamicPluginTensorDesc const* in, int32_t nbInputs, DynamicPluginTensorDesc const* out, int32_t nbOutputs) noexcept
+void CausalConv1dPlugin::configurePlugin(DynamicPluginTensorDesc const* in, int32_t nbInputs,
+    [[maybe_unused]] DynamicPluginTensorDesc const* out, [[maybe_unused]] int32_t nbOutputs) noexcept
 {
-    if (nbInputs != kNUM_INPUTS || nbOutputs != kNUM_OUTPUTS)
+    if (nbInputs != kNUM_INPUTS)
     {
-        return -1;
+        LOG_ERROR("causal_conv1d: expected %d inputs, got %d", kNUM_INPUTS, nbInputs);
     }
     if (in[kIN_X_IDX].desc.type != DataType::kHALF)
     {
         LOG_ERROR(
             "causal_conv1d: only FP16 input is supported; got type %d", static_cast<int32_t>(in[kIN_X_IDX].desc.type));
-        return -1;
     }
-    return 0;
 }
 
-size_t CausalConv1dPlugin::getWorkspaceSize(DynamicPluginTensorDesc const* /* inputs */, int32_t /* nbInputs */,
-    DynamicPluginTensorDesc const* /* outputs */, int32_t /* nbOutputs */) const noexcept
+size_t CausalConv1dPlugin::getWorkspaceSize([[maybe_unused]] PluginTensorDesc const* inputs,
+    [[maybe_unused]] int32_t nbInputs, [[maybe_unused]] PluginTensorDesc const* outputs,
+    [[maybe_unused]] int32_t nbOutputs) const noexcept
 {
     return 0;
 }
 
-int32_t CausalConv1dPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
-    nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace,
-    cudaStream_t stream) noexcept
+int32_t CausalConv1dPlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDesc const* outputDesc,
+    void const* const* inputs, void* const* outputs, [[maybe_unused]] void* workspace, cudaStream_t stream) noexcept
 {
     auto const& xDesc = inputDesc[kIN_X_IDX];
     auto const& wDesc = inputDesc[kIN_WEIGHT_IDX];
@@ -215,7 +215,6 @@ int32_t CausalConv1dPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         // PREFILL path
         int32_t const outSeqLen = static_cast<int32_t>(outDesc.dims.d[1]);
 
-        // Non-owning tensor views; const_cast is safe (read-only in kernel).
         auto xTensor = rt::Tensor{
             const_cast<void*>(inputs[kIN_X_IDX]), rt::Coords{batch, seqLen, dim}, rt::DeviceType::kGPU, xDesc.type};
         auto weightTensor = rt::Tensor{const_cast<void*>(inputs[kIN_WEIGHT_IDX]),
@@ -225,13 +224,19 @@ int32_t CausalConv1dPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         auto outTensor
             = rt::Tensor{outputs[kOUT_IDX], rt::Coords{batch, outSeqLen, dim}, rt::DeviceType::kGPU, xDesc.type};
 
+        auto contextLengthsTensor = rt::Tensor{const_cast<void*>(inputs[kIN_CONTEXT_LENGTHS_IDX]), rt::Coords{batch},
+            rt::DeviceType::kGPU, nvinfer1::DataType::kINT32};
+        trt_edgellm::rt::OptionalInputTensor contextLengthsOpt = std::optional(std::cref(contextLengthsTensor));
+
         trt_edgellm::rt::OptionalInputTensor biasOpt = std::optional(std::cref(biasTensor));
-        mamba_ssm::invokeCausalConv1d(xTensor, weightTensor, biasOpt, outTensor, mStride, mPadding, mDilation, stream);
+        mamba_ssm::invokeCausalConv1d(
+            xTensor, weightTensor, biasOpt, outTensor, mStride, mPadding, mDilation, contextLengthsOpt, stream);
+
         auto captureXTensor = rt::Tensor{
             const_cast<void*>(inputs[kIN_X_IDX]), rt::Coords{batch, seqLen, dim}, rt::DeviceType::kGPU, xDesc.type};
         auto captureStateTensor
             = rt::Tensor{convStateOut, rt::Coords{batch, dim, width}, rt::DeviceType::kGPU, xDesc.type};
-        mamba_ssm::invokeCaptureConvState(captureXTensor, captureStateTensor, stream);
+        mamba_ssm::invokeCaptureConvState(captureXTensor, captureStateTensor, contextLengthsOpt, stream);
     }
     else
     {
@@ -246,8 +251,6 @@ int32_t CausalConv1dPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
             = rt::Tensor{convStateOut, rt::Coords{batch, dim, width}, rt::DeviceType::kGPU, xDesc.type};
         auto decodeNewColTensor = rt::Tensor{
             const_cast<void*>(inputs[kIN_X_IDX]), rt::Coords{batch, 1, dim}, rt::DeviceType::kGPU, xDesc.type};
-        mamba_ssm::invokeConvStateShiftInsert(decodeStateTensor, decodeNewColTensor, stream);
-
         auto decodeWeightTensor = rt::Tensor{const_cast<void*>(inputs[kIN_WEIGHT_IDX]),
             rt::Coords{wDesc.dims.d[0], wDesc.dims.d[1], wDesc.dims.d[2]}, rt::DeviceType::kGPU, xDesc.type};
         auto decodeBiasTensor
@@ -256,36 +259,38 @@ int32_t CausalConv1dPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
             = rt::Tensor{outputs[kOUT_IDX], rt::Coords{batch, 1, dim}, rt::DeviceType::kGPU, xDesc.type};
         trt_edgellm::rt::OptionalInputTensor decodeBiasOpt = std::optional(std::cref(decodeBiasTensor));
         mamba_ssm::invokeCausalConv1dDecode(
-            decodeStateTensor, decodeWeightTensor, decodeBiasOpt, decodeOutTensor, stream);
+            decodeStateTensor, decodeNewColTensor, decodeWeightTensor, decodeBiasOpt, decodeOutTensor, stream);
     }
 
     return 0;
 }
 
-int32_t CausalConv1dPlugin::onShapeChange(PluginTensorDesc const* /* in */, int32_t /* nbInputs */,
-    PluginTensorDesc const* /* out */, int32_t /* nbOutputs */) noexcept
+// ---------------------------------------------------------------------------
+// Serialization
+// ---------------------------------------------------------------------------
+
+size_t CausalConv1dPlugin::getSerializationSize() const noexcept
 {
-    return 0;
+    return 4 * sizeof(int32_t); // stride, padding, dilation, groups
 }
 
-IPluginV3* CausalConv1dPlugin::attachToContext(IPluginResourceContext* /* context */) noexcept
+void CausalConv1dPlugin::serialize(void* buffer) const noexcept
 {
-    return clone();
+    auto* d = static_cast<char*>(buffer);
+    std::memcpy(d, &mStride, sizeof(int32_t));
+    d += sizeof(int32_t);
+    std::memcpy(d, &mPadding, sizeof(int32_t));
+    d += sizeof(int32_t);
+    std::memcpy(d, &mDilation, sizeof(int32_t));
+    d += sizeof(int32_t);
+    std::memcpy(d, &mGroups, sizeof(int32_t));
 }
 
-PluginFieldCollection const* CausalConv1dPlugin::getFieldsToSerialize() noexcept
-{
-    mDataToSerialize.clear();
-    mDataToSerialize.emplace_back("stride", &mStride, PluginFieldType::kINT32, 1);
-    mDataToSerialize.emplace_back("padding", &mPadding, PluginFieldType::kINT32, 1);
-    mDataToSerialize.emplace_back("dilation", &mDilation, PluginFieldType::kINT32, 1);
-    mDataToSerialize.emplace_back("groups", &mGroups, PluginFieldType::kINT32, 1);
-    mFCToSerialize.nbFields = static_cast<int32_t>(mDataToSerialize.size());
-    mFCToSerialize.fields = mDataToSerialize.data();
-    return &mFCToSerialize;
-}
+// ---------------------------------------------------------------------------
+// Metadata
+// ---------------------------------------------------------------------------
 
-char const* CausalConv1dPlugin::getPluginName() const noexcept
+char const* CausalConv1dPlugin::getPluginType() const noexcept
 {
     return kCAUSAL_CONV_PLUGIN_NAME;
 }
@@ -304,6 +309,22 @@ char const* CausalConv1dPlugin::getPluginVersion() const noexcept
 {
     return kCAUSAL_CONV_PLUGIN_VERSION;
 }
+
+int32_t CausalConv1dPlugin::initialize() noexcept
+{
+    return 0;
+}
+
+void CausalConv1dPlugin::terminate() noexcept {}
+
+void CausalConv1dPlugin::destroy() noexcept
+{
+    delete this;
+}
+
+// ---------------------------------------------------------------------------
+// Creator
+// ---------------------------------------------------------------------------
 
 CausalConv1dPluginCreator::CausalConv1dPluginCreator()
 {
@@ -343,8 +364,7 @@ char const* CausalConv1dPluginCreator::getPluginVersion() const noexcept
     return kCAUSAL_CONV_PLUGIN_VERSION;
 }
 
-IPluginV3* CausalConv1dPluginCreator::createPlugin(
-    char const* name, PluginFieldCollection const* fc, TensorRTPhase /* phase */) noexcept
+IPluginV2* CausalConv1dPluginCreator::createPlugin(char const* name, PluginFieldCollection const* fc) noexcept
 {
     try
     {
@@ -359,6 +379,22 @@ IPluginV3* CausalConv1dPluginCreator::createPlugin(
     catch (std::exception const& e)
     {
         LOG_ERROR("Failed to create CausalConv1dPlugin: %s", e.what());
+    }
+    return nullptr;
+}
+
+IPluginV2* CausalConv1dPluginCreator::deserializePlugin(
+    char const* name, void const* serialData, size_t serialLength) noexcept
+{
+    try
+    {
+        auto* plugin = new CausalConv1dPlugin(name, serialData, serialLength);
+        plugin->setPluginNamespace(mNamespace.c_str());
+        return plugin;
+    }
+    catch (std::exception const& e)
+    {
+        LOG_ERROR("Failed to deserialize CausalConv1dPlugin: %s", e.what());
     }
     return nullptr;
 }

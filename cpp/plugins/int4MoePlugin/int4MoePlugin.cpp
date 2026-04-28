@@ -229,16 +229,17 @@ int32_t Int4MoePlugin::getNbOutputs() const noexcept
     return 1;
 }
 
-int32_t Int4MoePlugin::getOutputDataTypes(
-    DataType* outputTypes, int32_t nbOutputs, DataType const* inputTypes, int32_t nbInputs) const noexcept
+int32_t Int4MoePlugin::getOutputDataTypes(DataType* outputTypes, int32_t nbOutputs,
+    [[maybe_unused]] DataType const* inputTypes, [[maybe_unused]] int32_t nbInputs) const noexcept
 {
     assert(nbOutputs == 1);
     outputTypes[0] = DataType::kHALF;
     return 0;
 }
 
-int32_t Int4MoePlugin::getOutputShapes(DimsExprs const* inputs, int32_t nbInputs, DimsExprs const* shapeInputs,
-    int32_t nbShapeInputs, DimsExprs* outputs, int32_t nbOutputs, IExprBuilder& exprBuilder) noexcept
+int32_t Int4MoePlugin::getOutputShapes(DimsExprs const* inputs, int32_t nbInputs,
+    [[maybe_unused]] DimsExprs const* shapeInputs, [[maybe_unused]] int32_t nbShapeInputs, DimsExprs* outputs,
+    int32_t nbOutputs, [[maybe_unused]] IExprBuilder& exprBuilder) noexcept
 {
     assert(nbInputs == 6);
     assert(nbOutputs == 1);
@@ -364,14 +365,15 @@ bool Int4MoePlugin::supportsFormatCombination(
     }
 }
 
-int32_t Int4MoePlugin::configurePlugin(
-    DynamicPluginTensorDesc const* in, int32_t nbInputs, DynamicPluginTensorDesc const* out, int32_t nbOutputs) noexcept
+int32_t Int4MoePlugin::configurePlugin([[maybe_unused]] DynamicPluginTensorDesc const* in,
+    [[maybe_unused]] int32_t nbInputs, [[maybe_unused]] DynamicPluginTensorDesc const* out,
+    [[maybe_unused]] int32_t nbOutputs) noexcept
 {
     return 0;
 }
 
 size_t Int4MoePlugin::getWorkspaceSize(DynamicPluginTensorDesc const* inputs, int32_t nbInputs,
-    DynamicPluginTensorDesc const* outputs, int32_t nbOutputs) const noexcept
+    [[maybe_unused]] DynamicPluginTensorDesc const* outputs, [[maybe_unused]] int32_t nbOutputs) const noexcept
 {
     assert(nbInputs == 6);
     auto const& hiddenStatesMaxDims = inputs[1].max;
@@ -570,13 +572,13 @@ int32_t Int4MoePlugin::enqueue(PluginTensorDesc const* inputDesc, PluginTensorDe
     }
 }
 
-int32_t Int4MoePlugin::onShapeChange(
-    PluginTensorDesc const* in, int32_t nbInputs, PluginTensorDesc const* out, int32_t nbOutputs) noexcept
+int32_t Int4MoePlugin::onShapeChange([[maybe_unused]] PluginTensorDesc const* in, [[maybe_unused]] int32_t nbInputs,
+    [[maybe_unused]] PluginTensorDesc const* out, [[maybe_unused]] int32_t nbOutputs) noexcept
 {
     return 0;
 }
 
-IPluginV3* Int4MoePlugin::attachToContext(IPluginResourceContext* context) noexcept
+IPluginV3* Int4MoePlugin::attachToContext([[maybe_unused]] IPluginResourceContext* context) noexcept
 {
     return clone();
 }
@@ -647,7 +649,7 @@ char const* Int4MoePluginCreator::getPluginVersion() const noexcept
 }
 
 IPluginV3* Int4MoePluginCreator::createPlugin(
-    char const* name, PluginFieldCollection const* fc, TensorRTPhase phase) noexcept
+    char const* name, PluginFieldCollection const* fc, [[maybe_unused]] TensorRTPhase phase) noexcept
 {
     try
     {

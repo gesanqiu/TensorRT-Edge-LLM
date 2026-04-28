@@ -74,7 +74,6 @@ constexpr int32_t kOUT_KV_CACHE_IDX{1};
 // these definitions shall be consistent.
 constexpr int32_t kNUM_REQUIRED_INPUTS{7};
 constexpr int32_t kNUM_TREE_ATTN_OPTIONAL_INPUTS{2};
-constexpr int32_t kNUM_FP8_KVCACHE_OPTIONAL_INPUTS{1};
 constexpr int32_t kNUM_REQUIRED_OUTPUTS{2};
 
 // Support Tree Attention decoding schema up to 128 tokens in the draft tree per batch.
@@ -145,6 +144,40 @@ AttentionExecutionMode deduceModeTreeAttention(
     return AttentionExecutionMode::kINVALID;
 }
 
+bool loadFMHAKernels(bool& useCuteDslFMHA, int32_t headSize, int32_t smVersion, nvinfer1::DataType dataType)
+{
+    bool canImplementFMHA = false;
+#ifdef CUTE_DSL_FMHA_ENABLED
+    if (useCuteDslFMHA)
+    {
+        if (CuteDslFMHARunner::canImplement(headSize, smVersion) && CuteDslFMHARunner::loadLLMKernelModule())
+        {
+            canImplementFMHA = true;
+            LOG_DEBUG("CuTe DSL FMHA kernel loaded for SM%d", smVersion);
+        }
+        else
+        {
+            LOG_DEBUG("CuTe DSL FMHA not available (headSize=%d, SM%d), falling back to FMHA_v2", headSize, smVersion);
+            useCuteDslFMHA = false;
+        }
+    }
+    if (!useCuteDslFMHA)
+#endif
+    {
+        canImplementFMHA = ContextFMHARunner::canImplement(
+            headSize, smVersion, dataType, AttentionInputLayout::SEPARATE_Q_K_V, ContextAttentionMaskType::CAUSAL);
+        if (canImplementFMHA)
+        {
+            if (!ContextFMHARunner::loadContextFMHAKernels(smVersion, dataType))
+            {
+                LOG_ERROR("Failed to load FMHA_v2 cubins for SM%d", smVersion);
+                canImplementFMHA = false;
+            }
+        }
+    }
+    return canImplementFMHA;
+}
+
 } // namespace
 
 // Static class fields initialization
@@ -154,52 +187,31 @@ std::vector<PluginField> AttentionPluginCreator::mPluginAttributes;
 REGISTER_TENSORRT_PLUGIN(AttentionPluginCreator);
 
 AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int32_t numKVHeads, int32_t headSize,
-    int32_t enableTreeAttention, int32_t enableFp8KVCache, int32_t slidingWindowSize)
+    int32_t enableTreeAttention, int32_t enableFp8KVCache, int32_t slidingWindowSize,
+    std::vector<float> const& qkvScales)
     : mLayerName(name)
     , mNumQHeads(numQHeads)
     , mNumKVHeads(numKVHeads)
     , mHeadSize(headSize)
     , mEnableTreeAttention(enableTreeAttention)
     , mEnableFp8KVCache(enableFp8KVCache)
+    , mQkvScales(enableFp8KVCache ? qkvScales : std::vector<float>{1.f, 1.f, 1.f})
     , mSlidingWindowSize(slidingWindowSize)
 {
+    if (mEnableFp8KVCache && mQkvScales.size() != 3)
+    {
+        throw std::runtime_error("FP8 KV cache enabled but qkv_scales has "
+            + std::to_string(mQkvScales.size()) + " elements (expected 3). "
+            "Re-export the model to include QKV scales [q, k, v].");
+    }
+
     mSMVersion = getSMVersion();
     applyThorSMRenumberWAR(mSMVersion);
 
     LOG_DEBUG("AttentionPlugin FMHA path: %s, sliding_window: %s", mUseCuteDslFMHA ? "CuTe DSL FMHA" : "FMHA_v2",
         mSlidingWindowSize > 0 ? std::to_string(mSlidingWindowSize).c_str() : "disabled");
 
-    // Check FMHA implementation support and load the corresponding kernel module.
-    bool canImplementFMHA = false;
-#ifdef CUTE_DSL_FMHA_ENABLED
-    if (mUseCuteDslFMHA && CuteDslFMHARunner::canImplement(mHeadSize, mSMVersion))
-    {
-        if (CuteDslFMHARunner::loadLLMKernelModule())
-        {
-            canImplementFMHA = true;
-            LOG_DEBUG("CuTe DSL FMHA kernel loaded for SM%d", mSMVersion);
-        }
-        else
-        {
-            LOG_WARNING("CuTe DSL FMHA kernel failed to load, falling back to FMHA_v2");
-            mUseCuteDslFMHA = false;
-        }
-    }
-    if (!canImplementFMHA)
-#endif
-    {
-        // Fallback to FMHA_v2 cubins.
-        canImplementFMHA = ContextFMHARunner::canImplement(
-            mHeadSize, mSMVersion, mDataType, AttentionInputLayout::SEPARATE_Q_K_V, ContextAttentionMaskType::CAUSAL);
-        if (canImplementFMHA)
-        {
-            if (!ContextFMHARunner::loadContextFMHAKernels(mSMVersion, mDataType))
-            {
-                LOG_ERROR("Failed to load FMHA_v2 cubins for SM%d", mSMVersion);
-                canImplementFMHA = false;
-            }
-        }
-    }
+    bool const canImplementFMHA = loadFMHAKernels(mUseCuteDslFMHA, mHeadSize, mSMVersion, mDataType);
 
     // XQA decode kernels are always needed regardless of FMHA path.
     bool const useSpecDecode = static_cast<bool>(mEnableTreeAttention);
@@ -232,29 +244,37 @@ AttentionPlugin::AttentionPlugin(std::string const& name, std::byte const* data,
     deserializeValue(&data, &length, &mEnableFp8KVCache);
     deserializeValue(&data, &length, &mSlidingWindowSize);
 
+    // QKV scales are the last serialized field: [int32 count][float × count].
+    // FP8 disabled → keep default {1,1,1}. FP8 enabled → must have exactly 3 scales.
+    // NOTE: This format is not backward-compatible with engines built before QKV scale
+    // support was added. FP8 engines must be rebuilt (they need recalibrated Q scale anyway).
+    if (mEnableFp8KVCache)
+    {
+        bool const hasHeader = length >= sizeof(int32_t);
+        int32_t qkvScaleCount = 0;
+        if (hasHeader)
+        {
+            deserializeValue(&data, &length, &qkvScaleCount);
+        }
+        if (!hasHeader || qkvScaleCount != 3 || length < 3 * sizeof(float))
+        {
+            throw std::runtime_error(
+                "FP8 KV cache enabled but qkv_scales missing or incomplete "
+                "in serialized data (expected 3). Re-export the model with QKV scales [q, k, v].");
+        }
+        for (int32_t i = 0; i < 3; ++i)
+        {
+            deserializeValue(&data, &length, &mQkvScales[i]);
+        }
+        check::check(length == 0, "Unexpected trailing bytes in serialized AttentionPlugin data");
+    }
+
     mSMVersion = getSMVersion();
     applyThorSMRenumberWAR(mSMVersion);
 
     LOG_DEBUG("AttentionPlugin FMHA path: %s", mUseCuteDslFMHA ? "CuTe DSL FMHA" : "FMHA_v2");
 
-    // Load FMHA kernel module based on implementation support.
-#ifdef CUTE_DSL_FMHA_ENABLED
-    if (mUseCuteDslFMHA && CuteDslFMHARunner::canImplement(mHeadSize, mSMVersion))
-    {
-        if (!CuteDslFMHARunner::loadLLMKernelModule())
-        {
-            LOG_WARNING("CuTe DSL FMHA kernel failed to load, falling back to FMHA_v2");
-            mUseCuteDslFMHA = false;
-        }
-    }
-    if (!mUseCuteDslFMHA)
-#endif
-    {
-        if (!ContextFMHARunner::loadContextFMHAKernels(mSMVersion, mDataType))
-        {
-            LOG_ERROR("Failed to load FMHA_v2 cubins for SM%d", mSMVersion);
-        }
-    }
+    loadFMHAKernels(mUseCuteDslFMHA, mHeadSize, mSMVersion, mDataType);
 
     // XQA decode kernels are always needed regardless of FMHA path.
     bool const useSpecDecode = static_cast<bool>(mEnableTreeAttention);
@@ -266,8 +286,8 @@ AttentionPlugin::~AttentionPlugin() {}
 
 IPluginV2DynamicExt* AttentionPlugin::clone() const noexcept
 {
-    AttentionPlugin* plugin = new AttentionPlugin(
-        mLayerName, mNumQHeads, mNumKVHeads, mHeadSize, mEnableTreeAttention, mEnableFp8KVCache, mSlidingWindowSize);
+    AttentionPlugin* plugin = new AttentionPlugin(mLayerName, mNumQHeads, mNumKVHeads, mHeadSize, mEnableTreeAttention,
+        mEnableFp8KVCache, mSlidingWindowSize, mQkvScales);
     plugin->setPluginNamespace(mNamespace.c_str());
     return plugin;
 }
@@ -314,8 +334,6 @@ bool AttentionPlugin::supportsFormatCombination(
     //            0 length indicates there is no existing KVCache for inference.
     //      Optional tree attention mask: [B, S, S] (a tensor of scalars) with type int32_t.
     //      Optional tree attention position ids: [B, S] (a tensor of scalars) with type int32_t.
-    //      Optional packed FP8 KV-cache dequant scales (K/V quant->orig): [2] (a tensor of scalars) with type float.
-    //            Layout: [k_scale_quant_orig, v_scale_quant_orig].
 
     // Support context/generation phase outputs:
     //      attention result (linear FP16) with shape [B, S, Hq, D]
@@ -410,17 +428,6 @@ bool AttentionPlugin::supportsFormatCombination(
         return status;
     };
 
-    auto checkKVScale = [](nvinfer1::PluginTensorDesc const& tensorDesc) {
-        bool status{true};
-        status &= tensorDesc.type == DataType::kFLOAT;
-        status &= tensorDesc.format == TensorFormat::kLINEAR;
-        // Packed FP8 KV cache scales: [k_scale_quant_orig, v_scale_quant_orig]
-        status &= tensorDesc.dims.nbDims == 1;
-        status &= tensorDesc.dims.d[0] == 2;
-        return status;
-    };
-
-    // Output tensor checks
     auto checkAttentionOutput = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
         bool status{true};
         status &= tensorDesc.type == DataType::kHALF;
@@ -435,8 +442,7 @@ bool AttentionPlugin::supportsFormatCombination(
         return status;
     };
 
-    int32_t const expectedNbInputs = kNUM_REQUIRED_INPUTS + (mEnableTreeAttention ? kNUM_TREE_ATTN_OPTIONAL_INPUTS : 0)
-        + (mEnableFp8KVCache ? kNUM_FP8_KVCACHE_OPTIONAL_INPUTS : 0);
+    int32_t const expectedNbInputs = kNUM_REQUIRED_INPUTS + (mEnableTreeAttention ? kNUM_TREE_ATTN_OPTIONAL_INPUTS : 0);
     bool const checkNumIOs = nbInputs == expectedNbInputs && nbOutputs == kNUM_REQUIRED_OUTPUTS;
     if (!checkNumIOs)
     {
@@ -480,14 +486,6 @@ bool AttentionPlugin::supportsFormatCombination(
                 }
                 currentOptionalInputIdx++;
             }
-            if (mEnableFp8KVCache)
-            {
-                if (pos == currentOptionalInputIdx)
-                {
-                    result = checkKVScale(inOut[pos]);
-                }
-                currentOptionalInputIdx++;
-            }
         }
     }
     else
@@ -508,7 +506,8 @@ bool AttentionPlugin::supportsFormatCombination(
 DataType AttentionPlugin::getOutputDataType([[maybe_unused]] int32_t index,
     [[maybe_unused]] nvinfer1::DataType const* inputTypes, [[maybe_unused]] int32_t nbInputs) const noexcept
 {
-    // Output[0] (attention) follows Q input dtype (HALF). Output[1] (KV cache) follows KV input dtype (HALF or FP8)
+    // Output[0] (attention): always FP16 (follows Q input dtype).
+    // Output[1] (KV cache) follows KV input dtype (HALF or FP8).
     if (index == kOUT_ATTENTION_IDX)
     {
         return inputTypes[kIN_Q_IDX];
@@ -549,7 +548,20 @@ void AttentionPlugin::configurePlugin([[maybe_unused]] nvinfer1::DynamicPluginTe
     return; // No need to configure anything since we will only use the runtime tensor shapes.
 }
 
-// TODO: extend the workspace calculation to a more generalized form.
+// Workspace layout (cumulative, worst-case across all execution paths):
+//
+//   Slot  | Shape                            | Type  | Used by
+//   ------+----------------------------------+-------+------------------------------------------
+//   0     | [B+1]                            | INT32 | cuQSeqLens          (prefill)
+//   1     | [B+1]                            | INT32 | cuKVSeqLens         (prefill)
+//   2     | [B]                              | INT32 | kvCacheEndIdxs      (prefill)
+//   3     | [B+1]                            | INT32 | paddedCuKVSeqLens   (prefill, CuTe DSL)
+//   4     | [B, 2, Hkv, Smax, D]             | HALF  | transposedKV        (FMHA_v2 chunked prefill)
+//   5*    | [B, S, Hq, D]                    | FP8   | fp8Q                (CuTe DSL + FP8 prefill only)
+//
+//   * Slot 5 is conditionally allocated (CuTe DSL + FP8 KV cache only).
+//
+// Total allocation is the sum of all conditional slots (safe upper bound).
 size_t AttentionPlugin::getWorkspaceSize([[maybe_unused]] nvinfer1::PluginTensorDesc const* inputs,
     [[maybe_unused]] int32_t nbInputs, [[maybe_unused]] nvinfer1::PluginTensorDesc const* outputs,
     [[maybe_unused]] int32_t nbOutputs) const noexcept
@@ -578,9 +590,21 @@ size_t AttentionPlugin::getWorkspaceSize([[maybe_unused]] nvinfer1::PluginTensor
     workspaceSize = accumulateWorkspaceSize(workspaceSize, rt::Coords{maxBatchSize + 1}, DataType::kINT32);
     // KVCache ends that denote the end index of each KVCache lane after adding current contents.
     workspaceSize = accumulateWorkspaceSize(workspaceSize, rt::Coords{maxBatchSize}, DataType::kINT32);
-    // KV Tensor to store concated KV that include pre-cached KV and current KV.
+    // Padded cumulative KV sequence lengths for CuTe DSL FMHA.
+    workspaceSize = accumulateWorkspaceSize(workspaceSize, rt::Coords{maxBatchSize + 1}, DataType::kINT32);
+    // KV workspace for split K and V tensors (split into K and V halves by pointer arithmetic in enqueue).
     workspaceSize = accumulateWorkspaceSize(
         workspaceSize, rt::Coords{maxBatchSize, 2, mNumKVHeads, maxKVCacheCapacity, mHeadSize}, DataType::kHALF);
+
+    // FP8 Q output: RoPE kernel writes FP8 Q to this workspace buffer (CuTe DSL FMHA path).
+#ifdef CUTE_DSL_FMHA_ENABLED
+    if (mUseCuteDslFMHA && mEnableFp8KVCache)
+    {
+        int64_t const maxSeqLen = qInputDesc.dims.d[1];
+        workspaceSize = accumulateWorkspaceSize(
+            workspaceSize, rt::Coords{maxBatchSize, maxSeqLen, mNumQHeads, mHeadSize}, DataType::kFP8);
+    }
+#endif
 
     // Request another alignment size to align the workspace pointer.
     workspaceSize += kDEVICE_ALIGNMENT;
@@ -656,6 +680,9 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
             rt::Coords{attentionPosIdInputDesc.dims}, rt::DeviceType::kGPU, attentionPosIdInputDesc.type);
     }
 
+    float const kScale = mQkvScales[1];
+    float const vScale = mQkvScales[2];
+
     // Determine the attention execution mode based on the input tensors.
     AttentionExecutionMode executionMode{};
     if (!mEnableTreeAttention)
@@ -674,25 +701,7 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         return 1;
     }
 
-    // Optional packed FP8 KV cache scales: [k_scale_quant_orig, v_scale_quant_orig]
-    // When FP8 KV cache is disabled, this tensor stays empty and downstream kernels ignore it.
-    rt::Tensor kvScaleQuantOrigTensor{};
-    if (mEnableFp8KVCache)
-    {
-        int32_t const kvScaleQuantOrigInputIdx
-            = kIN_KV_CACHE_START_IDX + 1 + (mEnableTreeAttention ? kNUM_TREE_ATTN_OPTIONAL_INPUTS : 0);
-        PluginTensorDesc const& kvScaleQuantOrigDesc = inputDesc[kvScaleQuantOrigInputIdx];
-        kvScaleQuantOrigTensor = rt::Tensor(const_cast<void*>(inputs[kvScaleQuantOrigInputIdx]),
-            rt::Coords{kvScaleQuantOrigDesc.dims}, rt::DeviceType::kGPU, kvScaleQuantOrigDesc.type);
-        // Runtime validation (in addition to supportsFormatCombination)
-        check::check(
-            kvScaleQuantOrigTensor.getDataType() == nvinfer1::DataType::kFLOAT, "kvScaleQuantOrig must be FP32.");
-        check::check(kvScaleQuantOrigTensor.getShape().getNumDims() == 1 && kvScaleQuantOrigTensor.getShape()[0] == 2,
-            "kvScaleQuantOrig shall have shape [2] with layout [kScaleQuantOrig, vScaleQuantOrig].");
-    }
-
-    auto const nbInputs = kNUM_REQUIRED_INPUTS + (mEnableTreeAttention ? kNUM_TREE_ATTN_OPTIONAL_INPUTS : 0)
-        + (mEnableFp8KVCache ? kNUM_FP8_KVCACHE_OPTIONAL_INPUTS : 0);
+    auto const nbInputs = kNUM_REQUIRED_INPUTS + (mEnableTreeAttention ? kNUM_TREE_ATTN_OPTIONAL_INPUTS : 0);
     auto const nbOutputs = kNUM_REQUIRED_OUTPUTS;
     size_t space = getWorkspaceSize(inputDesc, nbInputs, outputDesc, nbOutputs);
     // Align the workspace pointer so that each tensor assigned from the workspace will align to the device alignment
@@ -716,36 +725,55 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         rt::Tensor kvCacheEndIdxsTensor
             = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize}, DataType::kINT32);
 
+        // Padded cu_kv_seqlens for CuTe DSL FMHA bottom_right_align (see utilKernels.h for details).
+        rt::Tensor paddedCuKVSeqLensTensor
+            = assignTensorFromWorkspace(alignedWorkspacePtr, {runtimeBatchSize + 1}, DataType::kINT32);
         kernel::calCuQCuKVSeqLensAndKVEndIdxs(contextLengthTensor, kvCacheStartIdxTensor, cuQSeqLensTensor,
-            cuKVSeqLensTensor, kvCacheEndIdxsTensor, runtimeSeqLen, stream);
+            cuKVSeqLensTensor, kvCacheEndIdxsTensor, paddedCuKVSeqLensTensor, runtimeSeqLen, stream);
 
 #ifdef CUTE_DSL_FMHA_ENABLED
-        // Enable CuteDSL FMHA for single batch prefill usecase when FP8 KVCache is disabled.
-        // TODO: Enable multi-batch prefill and FP8 KVCache after we improve the kernel implementation.
-        bool const enableCuteDslFMHA = mUseCuteDslFMHA && !mEnableFp8KVCache && runtimeBatchSize == 1;
-        if (enableCuteDslFMHA)
+        if (mUseCuteDslFMHA)
         {
-            kernel::launchApplyRopeWriteKVSplitQKV(ropeCosSinTensor, kvCacheEndIdxsTensor, qInputTensor, kInputTensor,
-                vInputTensor, kvCacheTensor, kvScaleQuantOrigTensor, stream);
+            float const qScale = mQkvScales[0];
+            int32_t const slidingWindow = mSlidingWindowSize > 0 ? mSlidingWindowSize : INT_MAX;
 
-            // Run CuTe DSL FMHA kernel with combined KV tensor
-            // Expected layouts: Q [b, s_q, h_q, d], KV [b, 2, hkv, cap, d], O [b, s_q, h_q, d]
             CuteDslFMHARunner runner(
                 mNumQHeads, mNumKVHeads, mHeadSize, runtimeBatchSize, runtimeSeqLen, kvCacheCapacity);
-            runner.run(qInputTensor.dataPointer<half>(),   // qPtr [b, s_q, h_q, d]
-                kvCacheTensor.dataPointer<half>(),         // kvPtr [b, 2, h_k, cap, d]
-                attentionOutputTensor.dataPointer<half>(), // oPtr [b, s_q, h_q, d]
-                cuKVSeqLensTensor.dataPointer<int32_t>(),  // cu_kv_seqlens [b+1]
-                stream, mSlidingWindowSize > 0 ? mSlidingWindowSize : INT_MAX);
+
+            if (mEnableFp8KVCache)
+            {
+                // FP8 Q workspace: RoPE kernel quantizes roped Q to FP8 using calibrated qScale.
+                rt::Tensor fp8QTensor = assignTensorFromWorkspace(
+                    alignedWorkspacePtr, {runtimeBatchSize, runtimeSeqLen, mNumQHeads, mHeadSize}, DataType::kFP8);
+
+                // Single kernel: RoPE Q → FP8 output, RoPE K + write FP8 K/V to cache.
+                kernel::launchApplyRopeWriteKVSplitQKV(ropeCosSinTensor, kvCacheEndIdxsTensor, qInputTensor,
+                    kInputTensor, vInputTensor, kvCacheTensor, kScale, vScale, stream, fp8QTensor.rawPointer(), qScale);
+
+                runner.run(fp8QTensor.rawPointer(),                 // Q  [b, s_q, h_q, d] FP8
+                    kvCacheTensor.rawPointer(),                     // KV [b, 2, h_k, cap, d] FP8
+                    attentionOutputTensor.dataPointer<half>(),      // O  [b, s_q, h_q, d] FP16
+                    paddedCuKVSeqLensTensor.dataPointer<int32_t>(), // cu_kv_seqlens [b+1]
+                    stream, slidingWindow, /*fp8Input=*/true, qScale, kScale, vScale);
+            }
+            else
+            {
+                // FP16 path: RoPE Q in-place, write FP16 K/V to cache.
+                kernel::launchApplyRopeWriteKVSplitQKV(ropeCosSinTensor, kvCacheEndIdxsTensor, qInputTensor,
+                    kInputTensor, vInputTensor, kvCacheTensor, kScale, vScale, stream);
+
+                runner.run(qInputTensor.dataPointer<half>(),        // Q  [b, s_q, h_q, d]
+                    kvCacheTensor.dataPointer<half>(),              // KV [b, 2, h_k, cap, d]
+                    attentionOutputTensor.dataPointer<half>(),      // O  [b, s_q, h_q, d]
+                    paddedCuKVSeqLensTensor.dataPointer<int32_t>(), // cu_kv_seqlens [b+1]
+                    stream, slidingWindow);
+            }
         }
         else
 #endif
         {
-            AttentionInputLayout attentionInputLayout = executionMode == AttentionExecutionMode::kCHUNKED_PREFILL
-                ? AttentionInputLayout::CONTIGUOUS_Q_KV
-                : AttentionInputLayout::SEPARATE_Q_K_V;
             auto fmhaRunner = ContextFMHARunner(mDataType, runtimeBatchSize, runtimeSeqLen, mNumQHeads, mNumKVHeads,
-                mHeadSize, mSMVersion, attentionInputLayout);
+                mHeadSize, mSMVersion, AttentionInputLayout::SEPARATE_Q_K_V);
 
             // Prepare FMHA_v2 params to launch FMHA kernel
             FusedMultiheadAttentionParamsV2 params{};
@@ -754,26 +782,37 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
 
             if (executionMode == AttentionExecutionMode::kCHUNKED_PREFILL)
             {
-                // FMHA kernel with CONTIGUOUS_Q_KV input layout currently only supports FP16 KV cache.
-                // kvCache: [b, 2, hkv, s, d] -> [b, s, 2, hkv, d]
+                // kvCache: [b, 2, hkv, s, d] -> split K [b, s, hkv, d] + V [b, s, hkv, d]
                 kernel::launchApplyRopeWriteKV(ropeCosSinTensor, kvCacheEndIdxsTensor, qInputTensor, kInputTensor,
-                    vInputTensor, kvCacheTensor, kvScaleQuantOrigTensor, stream, false);
+                    vInputTensor, kvCacheTensor, kScale, vScale, stream, false);
 
-                rt::Tensor transposedKVTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
-                    {runtimeBatchSize, kvCacheCapacity, 2, mNumKVHeads, mHeadSize}, DataType::kHALF);
-                kernel::cvtKVLayoutBHSDToBSHD(kvCacheTensor, transposedKVTensor, kvScaleQuantOrigTensor, stream);
+                // Allocate a single workspace and split into K and V halves by pointer arithmetic.
+                rt::Tensor kvWorkspaceTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
+                    {runtimeBatchSize, 2, mNumKVHeads, kvCacheCapacity, mHeadSize}, DataType::kHALF);
+                size_t const halfSize
+                    = static_cast<size_t>(runtimeBatchSize) * kvCacheCapacity * mNumKVHeads * mHeadSize;
+                half* kvWorkspacePtr = kvWorkspaceTensor.dataPointer<half>();
+                rt::Tensor kWorkspaceTensor(kvWorkspacePtr,
+                    rt::Coords{runtimeBatchSize, kvCacheCapacity, mNumKVHeads, mHeadSize}, rt::DeviceType::kGPU,
+                    DataType::kHALF);
+                rt::Tensor vWorkspaceTensor(kvWorkspacePtr + halfSize,
+                    rt::Coords{runtimeBatchSize, kvCacheCapacity, mNumKVHeads, mHeadSize}, rt::DeviceType::kGPU,
+                    DataType::kHALF);
+                kernel::cvtKVLayoutBHSDToSplitKV(
+                    kvCacheTensor, kWorkspaceTensor, vWorkspaceTensor, rt::Tensor{}, stream);
 
                 // Set device ptr for FMHA kernel.
                 params.s_kv = kvCacheCapacity;
                 params.q_ptr = qInputTensor.dataPointer<half>();
-                params.kv_ptr = transposedKVTensor.dataPointer<half>();
+                params.k_ptr = kWorkspaceTensor.dataPointer<half>();
+                params.v_ptr = vWorkspaceTensor.dataPointer<half>();
                 params.cu_kv_seqlens = cuKVSeqLensTensor.dataPointer<int32_t>();
                 params.o_ptr = attentionOutputTensor.dataPointer<half>();
             }
             else
             { // SEPARATE_Q_K_V
                 kernel::launchApplyRopeWriteKV(ropeCosSinTensor, std::nullopt, qInputTensor, kInputTensor, vInputTensor,
-                    kvCacheTensor, kvScaleQuantOrigTensor, stream, true);
+                    kvCacheTensor, kScale, vScale, stream, true);
 
                 params.s_kv = runtimeSeqLen;
                 params.q_ptr = qInputTensor.dataPointer<half>();
@@ -794,13 +833,13 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         {
             // Execute tree attention decoding.
             kernel::launchApplyRopeWriteKVTreeDecoding(ropeCosSinTensor, contextLengthTensor, attentionPosIdTensor,
-                qInputTensor, kInputTensor, vInputTensor, kvCacheTensor, kvScaleQuantOrigTensor, stream);
+                qInputTensor, kInputTensor, vInputTensor, kvCacheTensor, kScale, vScale, stream);
         }
         else
         {
             // Execute vanilla decoding.
             kernel::launchApplyRopeWriteKV(ropeCosSinTensor, contextLengthTensor, qInputTensor, kInputTensor,
-                vInputTensor, kvCacheTensor, kvScaleQuantOrigTensor, stream, false);
+                vInputTensor, kvCacheTensor, kScale, vScale, stream, false);
         }
 
         auto xqaRunner = DecoderXQARunner(mDataType, selectKvCacheDataType(mEnableFp8KVCache), runtimeBatchSize,
@@ -808,9 +847,8 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         XQALaunchParams params = xqaRunner.initXQAParams();
         if (mEnableFp8KVCache)
         {
-            float const* const kvScales = kvScaleQuantOrigTensor.dataPointer<float>();
-            params.kScale = (kvScales + 0);
-            params.vScale = (kvScales + 1);
+            params.kScale = kScale;
+            params.vScale = vScale;
         }
         params.output = attentionOutputTensor.dataPointer<half>();
         params.qInputPtr = qInputTensor.dataPointer<half>();
@@ -836,7 +874,8 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
 size_t AttentionPlugin::getSerializationSize() const noexcept
 {
     return sizeof(mNumQHeads) + sizeof(mNumKVHeads) + sizeof(mHeadSize) + sizeof(mEnableTreeAttention)
-        + sizeof(mEnableFp8KVCache) + sizeof(int32_t) /* slidingWindowSize */;
+        + sizeof(mEnableFp8KVCache) + sizeof(int32_t) /* slidingWindowSize */
+        + sizeof(int32_t) /* qkv scale count */ + mQkvScales.size() * sizeof(float);
 }
 
 void AttentionPlugin::serialize(void* buffer) const noexcept
@@ -848,6 +887,12 @@ void AttentionPlugin::serialize(void* buffer) const noexcept
     serializeValue(&byteBuffer, mEnableTreeAttention);
     serializeValue(&byteBuffer, mEnableFp8KVCache);
     serializeValue(&byteBuffer, mSlidingWindowSize);
+    int32_t const qkvScaleCount = static_cast<int32_t>(mQkvScales.size());
+    serializeValue(&byteBuffer, qkvScaleCount);
+    for (auto const& s : mQkvScales)
+    {
+        serializeValue(&byteBuffer, s);
+    }
 }
 
 int32_t AttentionPlugin::initialize() noexcept
@@ -876,6 +921,8 @@ AttentionPluginCreator::AttentionPluginCreator()
     mPluginAttributes.emplace_back(PluginField("enable_fp8_kv_cache", nullptr, PluginFieldType::kINT32, 0));
     // Sliding window size (-1 = no sliding window, >0 = window size)
     mPluginAttributes.emplace_back(PluginField("sliding_window_size", nullptr, PluginFieldType::kINT32, 0));
+    // Optional QKV dequant scales [q, k, v] for FP8 attention
+    mPluginAttributes.emplace_back(PluginField("qkv_scales", nullptr, PluginFieldType::kFLOAT32, 0));
     // Enforce Core parameters are specified.
     mFieldCollection.nbFields = mPluginAttributes.size();
     mFieldCollection.fields = mPluginAttributes.data();
@@ -929,8 +976,28 @@ nvinfer1::IPluginV2* AttentionPluginCreator::createPlugin(
             return nullptr;
         }
 
+        std::vector<float> qkvScales;
+        for (int32_t i = 0; i < fc->nbFields; ++i)
+        {
+            if (std::string("qkv_scales") == fc->fields[i].name)
+            {
+                auto const* data = static_cast<float const*>(fc->fields[i].data);
+                qkvScales.assign(data, data + fc->fields[i].length);
+                break;
+            }
+        }
+
+        if (enableFp8KVCacheValue && qkvScales.size() != 3)
+        {
+            LOG_ERROR(
+                "FP8 KV cache enabled but qkv_scales has %zu elements (expected 3). "
+                "Re-export the model to include QKV scales [q, k, v].",
+                qkvScales.size());
+            return nullptr;
+        }
+
         AttentionPlugin* plugin = new AttentionPlugin(std::string(name), numQHeads.value(), numKVHeads.value(),
-            headSize.value(), enableTreeAttention.value(), enableFp8KVCacheValue, slidingWindowSize);
+            headSize.value(), enableTreeAttention.value(), enableFp8KVCacheValue, slidingWindowSize, qkvScales);
 
         return plugin;
     }

@@ -42,28 +42,36 @@ namespace kernel
 //! \param[out] kvCacheEndIdxs    int32_t tensor with shape [B].  Each element equals
 //!                                kvCacheStartIndices[i] + runtimeSeqLen (Here we use padding to ease later kernel
 //!                                launch).
+//! \param[out] paddedCuKVSeqLens (optional) int32_t tensor with shape [B+1]. Exclusive prefix-sum of kvCacheEndIdxs
+//!                                (= kvCacheStartIdx + runtimeSeqLen per batch). Pass std::nullopt to skip.
+//!                                Background: CuTe DSL FMHA kernel uses bottom_right_align with offset = s_k - s_q.
+//!                                Q is padded to runtimeSeqLen for all batches, so we must use padded KV lengths
+//!                                (s_k = kvCacheEndIdx per batch) to keep offset non-negative. Using actual s_k
+//!                                (< runtimeSeqLen for shorter batches) would produce a negative offset that masks
+//!                                out valid KV positions, breaking attention.
 //! \param[in]  runtimeSeqLen     Runtime sequence length (equals to the maximum of inputSeqLen).
 //! \param[in]  stream            CUDA stream used to launch the kernel.
 //! \note kvCacheStartIndices is optional. If it is not provided, kvStartIndices will be assumed to be 0.
 //! \throws std::runtime_error if tensor shapes are invalid
 void calCuQCuKVSeqLensAndKVEndIdxs(rt::Tensor const& inputSeqLen, rt::Tensor const& kvCacheStartIndices,
-    rt::Tensor& cuQSeqLens, rt::Tensor& cuKVSeqLens, rt::Tensor& kvCacheEndIdxs, int32_t const runtimeSeqLen,
-    cudaStream_t stream);
+    rt::Tensor& cuQSeqLens, rt::Tensor& cuKVSeqLens, rt::Tensor& kvCacheEndIdxs,
+    rt::OptionalOutputTensor paddedCuKVSeqLens, int32_t const runtimeSeqLen, cudaStream_t stream);
 
-//! \brief Converts KV cache layout from BHSD layout to BSHD layout for attention computation.
+//! \brief Converts KV cache layout from [B, 2, H, S, D] into separate K and V tensors of shape [B, S, H, D].
 //!
-//! Converts an input tensor in [B, 2, H, S, D] into [B, S, 2, H, D].
+//! Splits the interleaved KV source into two independent FP16 output tensors, applying FP8 dequantization when
+//! the source is FP8. Used in the chunked-prefill path so that the SEPARATE_Q_K_V FMHA kernels receive
+//! separate K and V pointers.
 //!
-//! \tparam T Element type (half/fp8).
-//!
-//! \param[in] src    Source tensor with shape [B, 2, H, S, D].
-//! \param[out] dst   Destination tensor with shape [B, S, 2, H, D].
-//! \param[in] kvScaleQuantOrig Optional packed dequant scale tensor for FP8 KV cache (shape [2], float).
-//!            Layout: [kScaleQuantOrig, vScaleQuantOrig].
-//! \param[in] stream CUDA stream to launch the kernel on
-//! \throws std::runtime_error if tensor shapes or data types are invalid
-void cvtKVLayoutBHSDToBSHD(
-    rt::Tensor const& src, rt::Tensor& dst, rt::Tensor const& kvScaleQuantOrig, cudaStream_t stream);
+//! \param[in]  src             Source tensor with shape [B, 2, H, S, D].
+//! \param[out] kDst            Destination K tensor with shape [B, S, H, D] (FP16).
+//! \param[out] vDst            Destination V tensor with shape [B, S, H, D] (FP16).
+//! \param[in]  kvScaleQuantOrig Optional packed dequant scale tensor for FP8 KV cache (shape [2], float).
+//!             Layout: [kScaleQuantOrig, vScaleQuantOrig]. Pass an empty tensor for FP16 src.
+//! \param[in]  stream          CUDA stream to launch the kernel on.
+//! \throws std::runtime_error if tensor shapes or data types are invalid.
+void cvtKVLayoutBHSDToSplitKV(
+    rt::Tensor const& src, rt::Tensor& kDst, rt::Tensor& vDst, rt::Tensor const& kvScaleQuantOrig, cudaStream_t stream);
 
 } // namespace kernel
 } // namespace trt_edgellm

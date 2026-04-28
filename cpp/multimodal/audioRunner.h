@@ -42,6 +42,8 @@ struct AudioConfig
     int32_t audioBosTokenId{151669}; //!< <|audio_start|> token ID
     int32_t audioEosTokenId{151670}; //!< <|audio_end|> token ID
     float mropeTheta{0.0F};          //!< Multi-dimensional RoPE theta (0 = no MRope)
+    int32_t mropeSectionH{20};       //!< MRoPE section: frequency pairs for height (default Qwen3-Omni)
+    int32_t mropeSectionW{20};       //!< MRoPE section: frequency pairs for width (default Qwen3-Omni)
 };
 
 //! \brief Runner for Qwen3-Omni audio encoder
@@ -66,7 +68,8 @@ public:
     //! \param[in] stream CUDA stream for execution
     //! \return True if preprocessing succeeded, false otherwise
     bool preprocess(rt::LLMGenerationRequest const& request, std::vector<std::vector<int32_t>>& batchedInputIds,
-        tokenizer::Tokenizer const* tokenizer, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream) override;
+        tokenizer::Tokenizer const* tokenizer, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream,
+        bool imageOnly = false) override;
 
     //! \brief Run inference on the audio encoder
     //! \param[in] stream CUDA stream for execution

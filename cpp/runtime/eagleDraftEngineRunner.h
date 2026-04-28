@@ -19,7 +19,7 @@
 
 #include "common/hashUtils.h"
 #include "common/tensor.h"
-#include "runtime/linearKVCache.h"
+#include "runtime/hybridCacheManager.h"
 #include "runtime/llmRuntimeUtils.h"
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -76,15 +76,27 @@ public:
      */
     ~EagleDraftEngineRunner() noexcept;
 
+    /*! \brief Get the required context memory size for this engine
+     *  \return Required context memory size in bytes
+     */
+    int64_t getRequiredContextMemorySize() const;
+
+    /*! \brief Set shared context memory for the execution context
+     *  \param sharedContextMemory Tensor containing the shared device memory (must be on GPU)
+     *  \return True on success, false if the tensor is too small
+     *  \note The tensor size must be >= getRequiredContextMemorySize(). Must be called before execution.
+     */
+    bool setContextMemory(rt::Tensor& sharedContextMemory);
+
     /*! \brief Get internal RoPE cosine/sine cache tensor for the eagle draft engine
      *  \return Reference to the RoPE cosine/sine cache tensor
      */
     rt::Tensor& getRopeCosSinCacheTensor() noexcept;
     
-    /*! \brief Get internal linear KV cache for the eagle draft engine
-     *  \return Reference to the linear KV cache
+    /*! \brief Get the hybrid cache manager for the eagle draft engine
+     *  \return Reference to the hybrid cache manager
      */
-    rt::LinearKVCache& getLinearKVCache() noexcept;
+    rt::HybridCacheManager& getCacheManager() noexcept;
 
     /*! \brief Get the draft engine configuration
      *  \return The draft engine configuration structure
@@ -217,15 +229,14 @@ public:
 private:
     EagleDraftEngineRunnerConfig mConfig{};  //!< Configuration for the Eagle Draft Engine Runner
 
-    std::unique_ptr<nvinfer1::IRuntime> mRuntime;  //!< TensorRT runtime instance
-    std::unique_ptr<nvinfer1::ICudaEngine> mEngine;  //!< TensorRT engine instance
-    rt::Tensor mExecContextMemory{};                                          //!< Device memory for the execution contexts
-    std::unique_ptr<nvinfer1::IExecutionContext> mTRTExecutionContext;    //!< TensorRT unified execution context for context and generation phases
+    std::unique_ptr<nvinfer1::IRuntime> mRuntime;               //!< TensorRT runtime instance
+    std::unique_ptr<nvinfer1::ICudaEngine> mEngine;              //!< TensorRT engine instance
+    std::unique_ptr<nvinfer1::IExecutionContext> mTRTExecutionContext; //!< TensorRT unified execution context for context and generation phases
 
     hash_utils::HashMap<DraftProposalKey, std::pair<cudaGraph_t, cudaGraphExec_t>> mDraftProposalCudaGraphs{};  //!< Map of CUDA graphs for draft proposal step indexed by configuration key
     hash_utils::HashMap<AcceptDecodeTokenKey, std::pair<cudaGraph_t, cudaGraphExec_t>> mAcceptDecodeTokenCudaGraphs{};  //!< Map of CUDA graphs for accept decode token step indexed by configuration key
 
-    rt::LinearKVCache mLinearKVCache{};  //!< Linear KV cache for storing key-value pairs
+    rt::HybridCacheManager mCacheManager{};  //!< Hybrid cache manager for storing key-value pairs
 
     rt::Tensor mPosEncCosSinCache{};  //!< (GPU, Float32) to store the CosSinCache for rotary positional encoding
     rt::Tensor mSelectTokenIndices{};  //!< (GPU, Int64) to store the select token indices that will be outputted from the model

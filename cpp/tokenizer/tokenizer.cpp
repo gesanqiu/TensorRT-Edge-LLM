@@ -17,6 +17,7 @@
 
 #include "tokenizer.h"
 #include "common/inputLimits.h"
+#include "common/utf8.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "tokenizerUtils.h"
 #include <fstream>
@@ -609,14 +610,65 @@ std::string Tokenizer::decode(std::vector<Rank> const& tokens, bool skipSpecialT
         return "";
     }
 
-    std::string output;
-    if (!mTokenEncoder->decode(tokens, output, skipSpecialTokens))
+    std::string raw;
+    if (!mTokenEncoder->decode(tokens, raw, skipSpecialTokens))
     {
         LOG_ERROR("Failed to decode tokens");
         return "";
     }
 
+    // Route through the UTF-8 sanitizer to guarantee well-formed output. This
+    // is a single-shot decode, so any trailing incomplete bytes must surface
+    // as U+FFFD rather than be held for a later call.
+    std::string pending;
+    std::string output = utf8::sanitizeUtf8Streaming(raw, pending);
+    output.append(utf8::sanitizeUtf8Flush(pending));
     return output;
+}
+
+std::string Tokenizer::idToPiece(Rank token, bool skipSpecialTokens) const
+{
+    if (!mInitialized || !mTokenEncoder)
+    {
+        return "";
+    }
+    // Special tokens: return empty when skipping, the textual content otherwise.
+    if (mSpecialTokensDecoder.find(token) != mSpecialTokensDecoder.end())
+    {
+        if (skipSpecialTokens)
+        {
+            return "";
+        }
+        return mSpecialTokensDecoder.at(token);
+    }
+    return mTokenEncoder->getRankToken(token);
+}
+
+std::string emitDelta(
+    rt::SlotStreamState& s, Tokenizer const& tok, std::vector<int32_t> const& allTokenIds, bool skipSpecial)
+{
+    // Fast path: no new tokens and no bytes held — nothing to do.
+    if (allTokenIds.size() == s.sentTokenCount && s.pendingBytes.empty())
+    {
+        return "";
+    }
+
+    // Concatenate the piece bytes for every newly-arrived token. Raw bytes may
+    // span multi-token UTF-8 codepoints or contain adversarial isolated bytes;
+    // sanitizeUtf8Streaming fixes both.
+    std::string raw;
+    for (size_t i = s.sentTokenCount; i < allTokenIds.size(); ++i)
+    {
+        raw.append(tok.idToPiece(allTokenIds[i], skipSpecial));
+    }
+    s.sentTokenCount = allTokenIds.size();
+
+    return utf8::sanitizeUtf8Streaming(raw, s.pendingBytes);
+}
+
+std::string emitDeltaFlush(rt::SlotStreamState& s)
+{
+    return utf8::sanitizeUtf8Flush(s.pendingBytes);
 }
 
 bool Tokenizer::isInitialized() const noexcept

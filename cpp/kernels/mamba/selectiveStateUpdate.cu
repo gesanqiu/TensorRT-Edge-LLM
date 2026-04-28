@@ -69,6 +69,7 @@ struct SelectiveStateUpdateParams
     int64_t C_stride_seq{};
     int64_t out_stride_seq{};
     int32_t seq_len{1};
+    int32_t const* context_lengths{nullptr}; // Per-batch actual token count (prefill only)
 
     void* __restrict__ state{nullptr};
     void* __restrict__ x{nullptr};
@@ -313,7 +314,7 @@ __global__ void selective_state_update_prefill_kernel_simple(SelectiveStateUpdat
 
     auto const A_value = toFloat(A[head]);
     auto const d_value = D ? toFloat(D[head]) : 0.f;
-    auto const seqLen = params.seq_len;
+    auto const effectiveSeqLen = params.context_lengths ? params.context_lengths[batch] : params.seq_len;
 
     constexpr auto rowsPerWarp = (DIM + numWarps - 1) / numWarps;
 
@@ -334,7 +335,7 @@ __global__ void selective_state_update_prefill_kernel_simple(SelectiveStateUpdat
         }
 
         // Scan over the token sequence, state stays fp32 in registers.
-        for (int32_t t = 0; t < seqLen; ++t)
+        for (int32_t t = 0; t < effectiveSeqLen; ++t)
         {
             // dt[batch, t, head]
             float dt_val = toFloat(dt[batch * params.dt_stride_batch + t * params.dt_stride_seq + head]);
@@ -378,6 +379,17 @@ __global__ void selective_state_update_prefill_kernel_simple(SelectiveStateUpdat
                 convertAndStore(&output[batch * params.out_stride_batch + t * params.out_stride_seq
                                     + head * params.out_stride_head + _d],
                     out_val);
+            }
+        }
+
+        // Zero output at padded positions.
+        for (int32_t t = effectiveSeqLen; t < params.seq_len; ++t)
+        {
+            if (lane == 0)
+            {
+                convertAndStore(&output[batch * params.out_stride_batch + t * params.out_stride_seq
+                                    + head * params.out_stride_head + _d],
+                    0.f);
             }
         }
 
@@ -532,10 +544,11 @@ void invokeSelectiveStateUpdatePrefill(trt_edgellm::rt::Tensor const& x, trt_edg
     trt_edgellm::rt::Tensor const& B, trt_edgellm::rt::Tensor const& C, trt_edgellm::rt::Tensor const& dt,
     trt_edgellm::rt::OptionalInputTensor dt_bias, trt_edgellm::rt::OptionalInputTensor D,
     trt_edgellm::rt::OptionalInputTensor z, trt_edgellm::rt::Tensor& state, trt_edgellm::rt::Tensor& output,
-    bool dt_softplus, cudaStream_t stream)
+    bool dt_softplus, trt_edgellm::rt::OptionalInputTensor contextLengths, cudaStream_t stream)
 {
     SelectiveStateUpdateParams params{};
     fillCommonParamsFromTensors(x, A, B, C, dt, dt_bias, D, z, state, output, dt_softplus, params);
+    params.context_lengths = contextLengths.has_value() ? contextLengths->get().dataPointer<int32_t>() : nullptr;
 
     params.seq_len = static_cast<int32_t>(x.getShape()[1]);
     params.x_stride_batch = x.getStride(0);

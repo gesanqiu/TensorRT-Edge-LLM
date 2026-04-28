@@ -1,0 +1,120 @@
+# Performance Benchmarks
+
+> **Platform:** NVIDIA Jetson AGX Thor Developer Kit (Blackwell, SM110)
+> **SDK Version:** TensorRT Edge-LLM 0.4.0
+
+## Definitions
+
+| Term | Description |
+|------|-------------|
+| **Prefill time** | Average wall-clock time (ms) to process the input prompt |
+| **Prefill throughput** | Prompt tokens processed per second during prefill (tok/s) |
+| **Generation throughput** | Tokens generated per second during decoding (tok/s) |
+| **Batch size** | Number of concurrent sequences (BS=1 = single-user latency, BS=8 = multi-user throughput) |
+| **Acceptance rate** | Average tokens accepted per EAGLE verify step (higher is better) |
+| **Speedup** | EAGLE generation throughput / vanilla generation throughput (same model, precision, batch size) |
+| **ViT time** | Total visual encoder processing time per inference run (ms) |
+| **ViT throughput** | Image tokens processed per second by the visual encoder (tok/s) |
+
+### Precision Key
+
+| Precision | Description | Platform Requirement |
+|-----------|-------------|---------------------|
+| FP16 | Half-precision float | All platforms |
+| FP8 | 8-bit float | SM89+ (Ada Lovelace and newer) |
+| INT4 AWQ | 4-bit integer (AWQ quantization) | All platforms |
+| NVFP4 | NVIDIA 4-bit float | SM100+ (Blackwell and newer) |
+
+---
+
+## LLM — Vanilla Decoding
+
+| Model | Precision | Batch | Prefill (ms) | Prefill Tokens | Prefill (tok/s) | Generation (tok/s) |
+|-------|-----------|:-----:|-------------:|:--------------:|----------------:|-------------------:|
+| Llama-3.1-8B-Instruct | INT4 AWQ | 1 | 215.5 | 383 | 1,777 | 50.8 |
+| Llama-3.1-8B-Instruct | INT4 AWQ | 8 | 2737.4 | 3064 | 1,119 | 135.3 |
+| Llama-3.1-8B-Instruct | NVFP4 | 1 | 31.0 | 383 | 12,355 | 54.9 |
+| Llama-3.1-8B-Instruct | NVFP4 | 8 | 387.6 | 3064 | 7,905 | 308.7 |
+| Qwen3-0.6B | INT4 AWQ | 1 | 21.0 | 366 | 17,429 | 270.2 |
+| Qwen3-0.6B | INT4 AWQ | 8 | 241.8 | 2927 | 12,104 | 828.0 |
+| Qwen3-0.6B | NVFP4 | 1 | 8.8 | 366 | 41,591 | 318.6 |
+| Qwen3-0.6B | NVFP4 | 8 | 95.4 | 2927 | 30,681 | 1562.4 |
+| Qwen3-4B-Instruct-2507 | INT4 AWQ | 1 | 116.2 | 364 | 3,133 | 76.4 |
+| Qwen3-4B-Instruct-2507 | INT4 AWQ | 8 | 1502.3 | 2911 | 1,938 | 240.3 |
+| Qwen3-4B-Instruct-2507 | NVFP4 | 1 | 22.9 | 364 | 15,895 | 90.2 |
+| Qwen3-4B-Instruct-2507 | NVFP4 | 8 | 301.9 | 2911 | 9,642 | 507.4 |
+| Qwen3-8B | INT4 AWQ | 1 | 212.0 | 366 | 1,726 | 47.7 |
+| Qwen3-8B | INT4 AWQ | 8 | 2719.1 | 2927 | 1,076 | 162.3 |
+| Qwen3-8B | NVFP4 | 1 | 32.8 | 366 | 11,159 | 53.7 |
+| Qwen3-8B | NVFP4 | 8 | 425.8 | 2927 | 6,874 | 372.2 |
+
+---
+
+## Vision Language Model — Vanilla Decoding
+
+| Model | LLM Prec | ViT Prec | Prefill (ms) | Prefill Tokens | Prefill (tok/s) | ViT Time (ms) | ViT Tok/Run | ViT (tok/s) | Generation (tok/s) |
+|-------|----------|----------|-------------:|:--------------:|----------------:|---------------:|:-----------:|------------:|-------------------:|
+| Qwen2.5-VL-7B-Instruct | INT4 AWQ | FP16 | 195.1 | 376 | 1,927 | 51.1 | 344 | 6,732 | 53.1 |
+| Qwen2.5-VL-7B-Instruct | INT4 AWQ | FP8 | 195.1 | 376 | 1,927 | 42.7 | 344 | 8,056 | 53.1 |
+| Qwen2.5-VL-7B-Instruct | NVFP4 | FP16 | 25.7 | 376 | 14,631 | 51.0 | 344 | 6,745 | 57.7 |
+| Qwen2.5-VL-7B-Instruct | NVFP4 | FP8 | 25.7 | 376 | 14,631 | 42.6 | 344 | 8,075 | 57.6 |
+| Qwen3-VL-2B-Instruct | INT4 AWQ | FP16 | 39.4 | 283 | 7,183 | 19.0 | 262 | 13,789 | 144.4 |
+| Qwen3-VL-2B-Instruct | INT4 AWQ | FP8 | 39.4 | 283 | 7,183 | 15.4 | 262 | 17,013 | 144.7 |
+| Qwen3-VL-2B-Instruct | NVFP4 | FP16 | 10.1 | 283 | 28,020 | 19.0 | 262 | 13,789 | 180.8 |
+| Qwen3-VL-2B-Instruct | NVFP4 | FP8 | 10.1 | 283 | 28,020 | 15.5 | 262 | 16,903 | 181.0 |
+
+> **Note:** ViT time = per-token ViT latency x image tokens per run. FP8 ViT reduces visual encoder time by ~17% compared to FP16 with negligible impact on generation throughput.
+
+---
+
+## LLM — EAGLE Speculative Decoding
+
+### Draft Models
+
+| Base Model | Draft Model | Source |
+|------------|-------------|--------|
+| Llama-3.1-8B-Instruct | EAGLE3-LLaMA3.1-Instruct-8B | [yuhuili/EAGLE3-LLaMA3.1-Instruct-8B](https://huggingface.co/yuhuili/EAGLE3-LLaMA3.1-Instruct-8B) |
+| Qwen3-8B | qwen3_8b_eagle3 | [Tengyunw/qwen3_8b_eagle3](https://huggingface.co/Tengyunw/qwen3_8b_eagle3) |
+
+> **Note:** Both base and draft models are quantized to the same precision (INT4 AWQ or NVFP4) as listed in the table below.
+
+| Model | Base Prec | Draft Prec | Batch | Prefill (ms) | Prefill Tokens | Generation (tok/s) | Accept Rate | Speedup |
+|-------|-----------|------------|:-----:|-------------:|:--------------:|-------------------:|:-----------:|--------:|
+| Llama-3.1-8B-Instruct | INT4 AWQ | INT4 AWQ | 1 | 215.2 | 382 | 81.0 | 5.25 | 1.59x |
+| Llama-3.1-8B-Instruct | INT4 AWQ | INT4 AWQ | 8 | 2735.5 | 3056 | 118.0 | 5.21 | 0.87x |
+| Llama-3.1-8B-Instruct | NVFP4 | NVFP4 | 1 | 30.8 | 382 | 189.2 | 5.21 | 3.45x |
+| Llama-3.1-8B-Instruct | NVFP4 | NVFP4 | 8 | 413.1 | 3056 | 484.7 | 5.15 | 1.57x |
+| Qwen3-8B | INT4 AWQ | INT4 AWQ | 1 | 212.2 | 366 | 66.1 | 4.36 | 1.39x |
+| Qwen3-8B | INT4 AWQ | INT4 AWQ | 8 | 2719.1 | 2927 | 99.1 | 4.31 | 0.61x |
+| Qwen3-8B | NVFP4 | NVFP4 | 1 | 33.1 | 366 | 151.7 | 4.26 | 2.82x |
+| Qwen3-8B | NVFP4 | NVFP4 | 8 | 429.1 | 2927 | 457.7 | 4.25 | 1.23x |
+
+> **Note:** EAGLE speculative decoding provides the greatest speedup at BS=1 (latency-bound). At BS=8, base model compute is already well-utilized, limiting speculative acceleration. See [Speculative Decoding](../examples/speculative-decoding.md) for setup instructions.
+
+---
+
+## Vision Language Model — EAGLE Speculative Decoding
+
+### Draft Models
+
+| Base Model | Draft Model | Source |
+|------------|-------------|--------|
+| Qwen2.5-VL-7B-Instruct | qwen2.5-vl-7b-eagle3-sgl | [Rayzl/qwen2.5-vl-7b-eagle3-sgl](https://huggingface.co/Rayzl/qwen2.5-vl-7b-eagle3-sgl) |
+
+> **Note:** Both base and draft models are quantized to the same precision as listed in the table below.
+
+| Model | Base Prec | Draft Prec | ViT Prec | Prefill (ms) | Prefill Tokens | Generation (tok/s) | Accept Rate | Speedup |
+|-------|-----------|------------|----------|-------------:|:--------------:|-------------------:|:-----------:|--------:|
+| Qwen2.5-VL-7B-Instruct | INT4 AWQ | INT4 AWQ | FP16 | 195.1 | 376 | 57.3 | 3.66 | 1.08x |
+| Qwen2.5-VL-7B-Instruct | NVFP4 | NVFP4 | FP16 | 25.8 | 376 | 149.6 | 3.82 | 2.59x |
+| Qwen2.5-VL-7B-Instruct | NVFP4 | NVFP4 | FP8 | 32.8 | 376 | 117.3 | 3.76 | 2.04x |
+
+---
+
+## Key Observations
+
+- **NVFP4 delivers highest throughput**: NVFP4 achieves 1.1–2.3x higher generation throughput than INT4 AWQ, with substantially faster prefill (e.g., 31 ms vs 216 ms for Llama-3.1-8B at BS=1).
+- **EAGLE at BS=1 provides meaningful speedup**: 1.4–3.5x for LLMs, best for Llama-3.1-8B NVFP4 (3.45x). The draft model acceptance rate is high for Llama (~5.2 tokens/step) and moderate for Qwen3-8B (~4.3 tokens/step).
+- **EAGLE at BS=8 has limited benefit**: At high batch sizes, base model compute is already well-utilized. Speedup drops to <1x for INT4 AWQ and 1.2–1.6x for NVFP4.
+- **Qwen3-0.6B achieves the highest throughput**: 1562 tok/s at BS=8 with NVFP4 — a lightweight model well-suited for latency-sensitive edge applications.
+- All benchmarks use default TensorRT Edge-LLM inference settings. Production performance may vary with system-level tuning (power mode, memory configuration, thermal management).

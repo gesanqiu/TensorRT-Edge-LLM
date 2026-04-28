@@ -17,7 +17,7 @@
 
 #pragma once
 
-#include "cutedsl_fmha_all.h"
+#include "cutedsl_all.h"
 
 #include <climits>
 #include <cstdint>
@@ -65,15 +65,24 @@ public:
     /**
      * @brief LLM FMHA: batched Q + combined KV cache with causal masking.
      *
+     * Output is always FP16. Selects kernel variant based on fp8Input:
+     *   - fp8Input=false → FP16 kernels (all scales ignored)
+     *   - fp8Input=true  → FP8-input / FP16-output kernels
+     *
      * @param qPtr Query [B, S_q, H_q, D]
      * @param kvPtr Combined KV cache [B, 2, H_kv, Cap, D]
-     * @param oPtr Output [B, S_q, H_q, D]
+     * @param oPtr Output [B, S_q, H_q, D] (always FP16)
      * @param cuKVSeqLens Cumulative KV sequence lengths [B+1]
      * @param stream CUDA stream
      * @param slidingWindowSize Sliding window size (INT_MAX = disabled)
+     * @param fp8Input Whether Q/KV are FP8 E4M3
+     * @param qScale Q dequant scale (quant→orig), ignored when fp8Input=false
+     * @param kScale K dequant scale (quant→orig), ignored when fp8Input=false
+     * @param vScale V dequant scale (quant→orig), ignored when fp8Input=false
      */
     void run(void const* qPtr, void const* kvPtr, void* oPtr, int32_t const* cuKVSeqLens, cudaStream_t stream,
-        int32_t slidingWindowSize = INT_MAX);
+        int32_t slidingWindowSize = INT_MAX, bool fp8Input = false, float qScale = 1.0f, float kScale = 1.0f,
+        float vScale = 1.0f);
 
     /**
      * @brief ViT FMHA: packed varlen separate Q/K/V, bidirectional.
@@ -99,11 +108,18 @@ private:
     int32_t mNumHeadsK{};
     int32_t mHeadDim{};
 
-    // LLM kernel modules
+    // LLM kernel modules (FP16)
     static fmha_d64_Kernel_Module_t sLLM_d64;
     static fmha_d128_Kernel_Module_t sLLM_d128;
     static fmha_d64_sw_Kernel_Module_t sLLM_d64_sw;
     static fmha_d128_sw_Kernel_Module_t sLLM_d128_sw;
+
+    // LLM kernel modules (FP8 input, FP16 output)
+    static fmha_d64_fp8_Kernel_Module_t sLLM_d64_fp8;
+    static fmha_d128_fp8_Kernel_Module_t sLLM_d128_fp8;
+    static fmha_d64_sw_fp8_Kernel_Module_t sLLM_d64_sw_fp8;
+    static fmha_d128_sw_fp8_Kernel_Module_t sLLM_d128_sw_fp8;
+
     static bool sLLMLoaded;
     static std::mutex sLLMMutex;
 

@@ -21,6 +21,7 @@ checking model types, and setting up quantization.
 
 import gc
 import importlib.util
+import json
 import os
 import sys
 import types
@@ -33,7 +34,9 @@ from modelopt.torch.quantization.utils import is_quantized_linear
 from safetensors.torch import safe_open
 from transformers import (AutoConfig, AutoModelForCausalLM,
                           AutoModelForImageTextToText, AutoProcessor,
-                          AutoTokenizer, PreTrainedModel)
+                          AutoTokenizer, PretrainedConfig, PreTrainedModel,
+                          Qwen2VLImageProcessorFast, Qwen3VLProcessor,
+                          Qwen3VLVideoProcessor)
 
 from .models.eagle3_draft import Eagle3DraftModel
 
@@ -46,6 +49,182 @@ def is_nvfp4_linear(module: nn.Module) -> bool:
         return module.input_quantizer.block_sizes is not None and module.input_quantizer.block_sizes.get(
             "scale_bits", None) == (4, 3)
     return False
+
+
+def _is_nvfp4_model(model_dir: str) -> bool:
+    """Check if model is NVFP4 quantized by reading hf_quant_config.json."""
+    import json
+    quant_config_path = os.path.join(model_dir, "hf_quant_config.json")
+    if not os.path.exists(quant_config_path):
+        return False
+
+    try:
+        with open(quant_config_path, 'r') as f:
+            config = json.load(f)
+            quant_algo = config.get("quantization", {}).get("quant_algo", "")
+            return quant_algo == "NVFP4"
+    except Exception:
+        return False
+
+
+def _load_nvfp4_nemotron_h(model_dir: str, torch_dtype: torch.dtype,
+                           device: torch.device) -> AutoModelForCausalLM:
+    """Load an NVFP4-quantized NemotronH model for ONNX export.
+
+    The HF NVFP4 checkpoint stores weights in packed FP4 format:
+      - ``*.weight``:        packed uint8 (2 FP4 nibbles per byte), shape ``[out, in/2]``
+      - ``*.weight_scale``:  per-block FP8 scale, shape ``[out, in/group_size]``
+      - ``*.weight_scale_2``: per-tensor float32 scale (scalar)
+      - ``*.input_scale``:   activation per-tensor float32 scale (scalar)
+
+    Strategy:
+    1. Instantiate the model architecture from AutoConfig (no weights loaded).
+    2. Apply ModelOpt NVFP4 weight-only quantization structure via mtq.quantize
+       (input quantizers disabled so forward_loop=None works).
+    3. Load all safetensors shards, build a corrected state dict:
+       - Iterate loaded_tensors directly (robust, no isinstance check needed).
+       - Any *.weight tensor with element_size < 2 is packed FP4: dequantize it.
+       - Scale keys (weight_scale, weight_scale_2, input_scale) are skipped.
+    4. Apply the corrected state dict via model.load_state_dict(strict=False).
+    5. Walk model.named_modules(); for any module with a weight_quantizer,
+       reconstruct _amax from weight_scale_2 stored in loaded_tensors.
+    """
+    import copy
+    import json
+
+    try:
+        import modelopt.torch.quantization as mtq
+        from modelopt.torch.quantization.qtensor.nvfp4_tensor import \
+            NVFP4QTensor
+    except ImportError as exc:
+        raise ImportError(
+            "nvidia-modelopt is required to load NVFP4 checkpoints. "
+            "Install it with: pip install nvidia-modelopt") from exc
+
+    # ------------------------------------------------------------------
+    # 1. Read NVFP4 quant config
+    # ------------------------------------------------------------------
+    with open(os.path.join(model_dir, "hf_quant_config.json")) as f:
+        hf_quant_cfg = json.load(f)
+    exclude_modules: list = hf_quant_cfg.get("quantization",
+                                             {}).get("exclude_modules", [])
+    group_size: int = hf_quant_cfg.get("quantization",
+                                       {}).get("group_size", 16)
+
+    # ------------------------------------------------------------------
+    # 2. Instantiate architecture from config — no checkpoint weights.
+    # ------------------------------------------------------------------
+    auto_config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_config(auto_config,
+                                             trust_remote_code=True)
+    model = model.to(torch_dtype)
+
+    # ------------------------------------------------------------------
+    # 3. Apply NVFP4 weight-only quantization structure (no calibration).
+    # ------------------------------------------------------------------
+    nvfp4_cfg = copy.deepcopy(mtq.NVFP4_DEFAULT_CFG)
+    nvfp4_cfg["quant_cfg"]["*input_quantizer"] = {"enable": False}
+    for excl in exclude_modules:
+        nvfp4_cfg["quant_cfg"][excl] = {"enable": False}
+    mtq.quantize(model, nvfp4_cfg, forward_loop=None)
+
+    # ------------------------------------------------------------------
+    # 4. Load all safetensors shards
+    # ------------------------------------------------------------------
+    index_path = os.path.join(model_dir, "model.safetensors.index.json")
+    with open(index_path) as f:
+        weight_map: dict = json.load(f)["weight_map"]
+
+    loaded_tensors: dict[str, torch.Tensor] = {}
+    for shard_file in set(weight_map.values()):
+        with safe_open(os.path.join(model_dir, shard_file),
+                       framework="pt",
+                       device="cpu") as f:
+            for key in f.keys():
+                loaded_tensors[key] = f.get_tensor(key)
+
+    # ------------------------------------------------------------------
+    # 5. Build corrected state dict.
+    #
+    # Iterate loaded_tensors directly — avoids any isinstance / class
+    # identity issues with ModelOpt's QuantLinear HF plugin subclasses.
+    # For every *.weight tensor with element_size < 2 (packed uint8 FP4),
+    # find its companion scales and dequantize back to float.
+    # ------------------------------------------------------------------
+    # Identify all scale keys so we can skip them in the final state dict
+    # (the model has no parameters named weight_scale / input_scale).
+    scale_suffixes = (".weight_scale", ".weight_scale_2", ".input_scale")
+    scale_keys: set[str] = {
+        k
+        for k in loaded_tensors if any(k.endswith(s) for s in scale_suffixes)
+    }
+
+    processed: dict[str, torch.Tensor] = {}
+
+    for key, tensor in loaded_tensors.items():
+        if key in scale_keys:
+            continue  # handled separately below
+
+        if key.endswith(".weight") and tensor.element_size() < 2:
+            # Packed uint8 FP4 weight — dequantize back to float.
+            base = key[:-len(".weight")]  # strip trailing ".weight"
+            w_scale = loaded_tensors.get(base + ".weight_scale")
+            w_scale2 = loaded_tensors.get(base + ".weight_scale_2")
+
+            if w_scale is not None and w_scale2 is not None:
+                original_shape = list(tensor.shape)
+                original_shape[-1] *= 2
+                nvfp4_q = NVFP4QTensor(original_shape, torch_dtype, tensor)
+                processed[key] = nvfp4_q.dequantize(
+                    dtype=torch_dtype,
+                    scale=w_scale,
+                    double_scale=w_scale2.float(),
+                    block_sizes={-1: group_size},
+                )
+            else:
+                # Missing scales — insert zero tensor with the correct shape.
+                print(
+                    f"[NVFP4 load] Warning: no scales for {key}, zeroing weight"
+                )
+                original_shape = list(tensor.shape)
+                original_shape[-1] *= 2
+                processed[key] = torch.zeros(original_shape, dtype=torch_dtype)
+        else:
+            # Regular (non-packed) tensor — cast to model dtype if float.
+            processed[key] = tensor.to(
+                torch_dtype) if tensor.is_floating_point() else tensor
+
+    # ------------------------------------------------------------------
+    # 6. Load the corrected state dict.
+    # ------------------------------------------------------------------
+    missing_keys, unexpected_keys = model.load_state_dict(processed,
+                                                          strict=False)
+
+    real_missing = [
+        k for k in missing_keys if "quantizer" not in k and "_amax" not in k
+    ]
+    if real_missing:
+        print(f"[NVFP4 load] Missing keys (first 5): {real_missing[:5]}")
+
+    # ------------------------------------------------------------------
+    # 7. Restore weight_quantizer._amax from weight_scale_2 tensors.
+    #
+    #   weight_scale_2 = _amax / (FP4_maxbound * FP8_maxbound)
+    #   FP4_maxbound = 6.0, FP8_maxbound = 448.0
+    # ------------------------------------------------------------------
+    for name, module in model.named_modules():
+        wq = getattr(module, "weight_quantizer", None)
+        if wq is None:
+            continue
+        scale2_key = f"{name}.weight_scale_2"
+        if scale2_key in loaded_tensors:
+            # Use register_buffer so _amax moves with model.to(device).
+            # Plain attribute assignment (wq._amax = tensor) is not tracked
+            # by nn.Module and stays on CPU even after model.to(cuda).
+            computed_amax = loaded_tensors[scale2_key].float() * (6.0 * 448.0)
+            wq.register_buffer("_amax", computed_amax)
+
+    return model.to(device)
 
 
 def is_mxfp8_linear(module: nn.Module) -> bool:
@@ -82,11 +261,15 @@ def is_vlm(model_dir: str) -> bool:
         True if the model is a VLM, False otherwise
     """
     try:
-        cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
-        cfg_dict = cfg.to_dict()
+        try:
+            cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+            cfg_dict = cfg.to_dict()
+        except Exception:
+            cfg_dict, _ = PretrainedConfig.get_config_dict(model_dir)
         has_vision = "vision_config" in cfg_dict
         has_phi4_vision = "image_embd_layer" in cfg_dict.get("embd_layer", {})
-        return has_vision or has_phi4_vision
+        has_vlm_backend = "vlm_backend" in cfg_dict
+        return has_vision or has_phi4_vision or has_vlm_backend
     except Exception:
         return False
 
@@ -98,18 +281,71 @@ def is_gptq_model(model: PreTrainedModel) -> bool:
     return quant_config and quant_config.get("quant_method") == "gptq"
 
 
-def _is_gptq_moe_model(model_dir: str) -> bool:
-    """Check if a model directory contains a GPTQ MoE model (before loading)."""
+def _is_gptq_quantized_module(module: nn.Module) -> bool:
+    """Heuristically detect GPTQ quantized modules that must not be recast."""
+    module_path = module.__class__.__module__
+    class_name = module.__class__.__name__.lower()
+    if module_path.startswith("gptqmodel."):
+        return True
+    if "quantlinear" in class_name:
+        return True
+    return hasattr(module, "qweight") and (hasattr(module, "qzeros")
+                                           or hasattr(module, "scales"))
+
+
+def _cast_non_gptq_float_tensors_to_dtype(
+        model: nn.Module, target_dtype: torch.dtype) -> Tuple[int, int, int]:
+    """
+    Cast floating tensors to target_dtype while preserving GPTQ quantized modules.
+
+    Returns:
+        Tuple of (casted_param_count, casted_buffer_count, skipped_quantized_module_count).
+    """
+    casted_params = 0
+    casted_buffers = 0
+    skipped_quantized_modules = 0
+    with torch.no_grad():
+        for module in model.modules():
+            if _is_gptq_quantized_module(module):
+                skipped_quantized_modules += 1
+                continue
+            for _, param in module.named_parameters(recurse=False):
+                if param.is_floating_point() and param.dtype != target_dtype:
+                    param.data = param.data.to(dtype=target_dtype)
+                    casted_params += 1
+            for buffer_name, buffer in module.named_buffers(recurse=False):
+                if buffer.is_floating_point() and buffer.dtype != target_dtype:
+                    setattr(module, buffer_name, buffer.to(dtype=target_dtype))
+                    casted_buffers += 1
+    return casted_params, casted_buffers, skipped_quantized_modules
+
+
+def _check_gptq_in_config(model_dir: str) -> bool:
+    """Check if config.json contains GPTQ quantization_config."""
     try:
         cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
         cfg_dict = cfg.to_dict()
         quant_config = cfg_dict.get("quantization_config", None)
-        is_gptq = quant_config and quant_config.get("quant_method") == "gptq"
-        model_type = getattr(cfg, "model_type", "")
-        is_moe = "moe" in model_type.lower()
-        return is_gptq and is_moe
+        return bool(quant_config
+                    and quant_config.get("quant_method") == "gptq")
     except Exception:
         return False
+
+
+def _is_gptq_moe_model(model_dir: str) -> bool:
+    """Check if a model directory contains a GPTQ MoE model (before loading)."""
+    return _check_model_type(model_dir,
+                             "moe") and _check_gptq_in_config(model_dir)
+
+
+def _is_gptq_omni_model(model_dir: str) -> bool:
+    """Check if a model directory contains a GPTQ Qwen3-Omni model (before loading).
+    
+    Qwen3-Omni has a nested multi-submodel architecture (thinker/talker) that is
+    not supported by optimum's standard block pattern matching. We use GPTQModel.load()
+    with layers_node_user to handle the non-standard layer paths.
+    """
+    return _is_qwen3_omni_model(model_dir) and _check_gptq_in_config(model_dir)
 
 
 def _resolve_model_path(model_dir: str) -> Path:
@@ -179,6 +415,55 @@ def _fix_gptq_moe_gate_weights(model: PreTrainedModel, model_dir: str) -> None:
     )
 
 
+def _fix_nemotron_h_mamba_weights(model: PreTrainedModel,
+                                  model_dir: str) -> None:
+    """
+    Fix Mamba weights for NemotronH models after from_pretrained.
+
+    In transformers >= 5.x, _init_weights runs AFTER checkpoint weights are
+    loaded (via post-init hooks).  The NemotronH _init_weights destructively
+    overwrites Mamba dt_bias (with random inv-softplus values) and out_proj
+    weights (with kaiming-uniform + residual rescaling), corrupting the trained
+    values.
+
+    This function reloads those parameters directly from the safetensors
+    checkpoint, restoring the trained values.
+    """
+    model_path = _resolve_model_path(model_dir)
+    safetensor_files = sorted(model_path.glob("*.safetensors"))
+    if not safetensor_files:
+        print(f"Warning: No safetensor files found at {model_path}")
+        return
+
+    # Read all affected tensors from checkpoint, grouped by shard file
+    raw_weights = {}
+    for shard_path in safetensor_files:
+        with safe_open(shard_path, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                if ".mixer.dt_bias" in key or ".mixer.out_proj.weight" in key:
+                    raw_weights[key] = f.get_tensor(key)
+
+    if not raw_weights:
+        return
+
+    # Reload corrupted parameters from checkpoint
+    params_fixed = 0
+    for param_name, param in model.named_parameters():
+        if param_name not in raw_weights:
+            continue
+
+        raw_tensor = raw_weights[param_name].to(dtype=param.dtype,
+                                                device=param.device)
+        if not torch.equal(param.data, raw_tensor):
+            with torch.no_grad():
+                param.data.copy_(raw_tensor)
+            params_fixed += 1
+
+    if params_fixed > 0:
+        print(f"Reloaded {params_fixed} NemotronH Mamba parameters "
+              f"(dt_bias, out_proj.weight) from checkpoint")
+
+
 def _check_model_type(model_dir: str, model_identifier: str) -> bool:
     """
     Check if a model matches a given identifier by checking model_type and architectures.
@@ -213,20 +498,62 @@ def _is_nemotron_h_model(model_dir: str) -> bool:
     return _check_model_type(model_dir, "nemotron_h")
 
 
+def _is_qwen3_5_model(model_dir: str) -> bool:
+    """Check if the model is a Qwen3.5 model."""
+    return _check_model_type(model_dir, "qwen3_5")
+
+
+def is_hybrid_model(model_dir: str) -> bool:
+    """Check if the model is a hybrid model (Nemotron-H or Qwen3.5)."""
+    return _is_nemotron_h_model(model_dir) or _is_qwen3_5_model(model_dir)
+
+
+HYBRID_MODEL_TYPES = {"nemotron_h", "qwen3_5_text", "qwen3_5"}
+
+
+def is_hybrid_model_type(model_type: str) -> bool:
+    """Check if model_type belongs to a hybrid model. No disk I/O."""
+    return model_type in HYBRID_MODEL_TYPES
+
+
 def _is_qwen3_omni_model(model_dir: str) -> bool:
     """Check if the model is a Qwen3 Omni model by checking config.json for model_type."""
     cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
     return getattr(cfg, "model_type", None) == "qwen3_omni"
 
 
+def _read_model_type(model_dir: str) -> str:
+    """Read model_type directly from config.json, bypassing AutoConfig.
+
+    This is needed for model types not yet registered with transformers
+    (e.g. qwen3_asr, qwen3_tts) where AutoConfig.from_pretrained would fail.
+    """
+    config_path = os.path.join(model_dir, "config.json")
+    if os.path.isfile(config_path):
+        try:
+            with open(config_path) as f:
+                return json.load(f).get("model_type", "")
+        except Exception:
+            pass
+    return ""
+
+
 def _is_qwen3_tts_model(model_dir: str) -> bool:
     """Qwen3-TTS is not integrated into transformers yet."""
-    return "Qwen3-TTS" in model_dir
+    return _read_model_type(
+        model_dir) == "qwen3_tts" or "Qwen3-TTS" in model_dir
 
 
 def _is_qwen3_asr_model(model_dir: str) -> bool:
     """Qwen3-ASR is not integrated into transformers yet."""
-    return "Qwen3-ASR" in model_dir
+    return _read_model_type(
+        model_dir) == "qwen3_asr" or "Qwen3-ASR" in model_dir
+
+
+def _is_alpamayo_1_model(model_dir: str) -> bool:
+    """Check if the model is an Alpamayo 1 model."""
+    cfg, _ = PretrainedConfig.get_config_dict(model_dir)
+    return cfg.get("model_type", None) == "alpamayo_r1"
 
 
 # Models that require explicit chat template because auto-extraction fails
@@ -292,6 +619,19 @@ def _load_phi4mm_war(model_dir: str):
     sys.modules[module_name] = module
     sys.modules["modeling_phi4mm"] = module
     assert spec is not None and spec.loader is not None
+
+    # WAR: Phi-4MM's modeling file imports SlidingWindowCache which was removed
+    # in transformers 5.x. Inject a shim so the import succeeds; the class is
+    # never instantiated during quantization.
+    import transformers.cache_utils as _cache_utils
+    if not hasattr(_cache_utils, "SlidingWindowCache"):
+        from transformers.cache_utils import StaticCache
+
+        class _SlidingWindowCacheShim(StaticCache):
+            """Minimal stand-in for SlidingWindowCache (removed in transformers 5.x)."""
+
+        _cache_utils.SlidingWindowCache = _SlidingWindowCacheShim
+
     spec.loader.exec_module(module)
 
     lora_dir = os.path.join(model_dir, "vision-lora")
@@ -376,18 +716,37 @@ def load_hf_model(
         raise ValueError(f"Unsupported dtype: {dtype}")
     device = torch.device(device)
 
-    tokenizer = AutoTokenizer.from_pretrained(model_dir,
-                                              trust_remote_code=True)
+    # Alpamayo loads tokenizer internally; AutoTokenizer.from_pretrained does not work for alpamayo_r1.
+    if not _is_alpamayo_1_model(model_dir):
+        tokenizer = AutoTokenizer.from_pretrained(model_dir,
+                                                  trust_remote_code=True)
 
+    if _is_alpamayo_1_model(model_dir):
+        from ..action_models import alpamayo_r1 as _alpamayo_r1_pkg
+        sys.modules["alpamayo_r1"] = _alpamayo_r1_pkg
+        from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
+
+        model = AlpamayoR1.from_pretrained(
+            model_dir,
+            torch_dtype=torch_dtype,
+            trust_remote_code=True,
+        ).to(device)
+        tokenizer = model.tokenizer
     # NemotronH: apply mamba_ssm stub before import to avoid ABI-broken CUDA extension errors.
     # The model runs on the pure-PyTorch slow path for ONNX export.
-    if _is_nemotron_h_model(model_dir):
+    elif _is_nemotron_h_model(model_dir):
         from .models.nemotron_h_patch import apply as _apply_nemotron_h_patch
         _apply_nemotron_h_patch()
-        model = AutoModelForCausalLM.from_pretrained(
-            model_dir, torch_dtype=torch_dtype,
-            trust_remote_code=True).to(device)
-
+        if _is_nvfp4_model(model_dir):
+            # NVFP4 checkpoints store weights in packed FP4 format; shapes do
+            # not match a standard BF16/FP16 model, so from_pretrained fails.
+            # Use the custom loader that dequantizes on the fly.
+            model = _load_nvfp4_nemotron_h(model_dir, torch_dtype, device)
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_dir, torch_dtype=torch_dtype,
+                trust_remote_code=True).to(device)
+            _fix_nemotron_h_mamba_weights(model, model_dir)
     # Due to a known loading issue with Phi4MM on recent transformers, special handling is required.
     # See: https://huggingface.co/microsoft/Phi-4-multimodal-instruct/discussions/75.
     elif _is_phi4mm_model(model_dir):
@@ -405,6 +764,11 @@ def load_hf_model(
         model = Qwen3ASRModel.from_pretrained(
             model_dir, torch_dtype=torch_dtype,
             trust_remote_code=True).model.to(device)
+        # Qwen3ASRForConditionalGeneration has no forward(); add one that
+        # delegates to the thinker so the quantization calibration loop can
+        # call model(input_ids).
+        type(model).forward = lambda self, *args, **kwargs: self.thinker(
+            *args, **kwargs)
     elif _is_qwen3_tts_model(model_dir):
         from qwen_tts.core.models import (Qwen3TTSConfig,
                                           Qwen3TTSForConditionalGeneration)
@@ -419,6 +783,23 @@ def load_hf_model(
             model_dir,
             torch_dtype=torch_dtype)
         model = model.to(device)
+    elif _is_gptq_omni_model(model_dir):
+        # GPTQ Omni: optimum cannot handle nested thinker/talker block structure,
+        # so we load via GPTQModel.load() with explicit layers_node_user paths.
+        # This is analogous to _is_gptq_moe_model requiring special gate weight handling.
+        # backend=TORCH ensures TorchQuantLinear layers (not Marlin) are used,
+        # which replace_quant_linear_with_plugin() can detect and convert.
+        from gptqmodel import GPTQModel
+        from gptqmodel.utils.backend import BACKEND
+        print(f"Loading GPTQ quantized Qwen3-Omni model from {model_dir}")
+        layers_node = ["thinker.model.layers", "talker.model.layers"]
+        gptq_wrapper = GPTQModel.load(model_dir,
+                                      layers_node_user=layers_node,
+                                      backend=BACKEND.TORCH,
+                                      dtype=torch_dtype)
+        model = gptq_wrapper.model
+        del gptq_wrapper
+        model = model.to(device)
     elif _is_qwen3_omni_model(model_dir):
         from transformers import Qwen3OmniForConditionalGeneration
         model = Qwen3OmniForConditionalGeneration.from_pretrained(
@@ -432,18 +813,30 @@ def load_hf_model(
             model_dir, torch_dtype=torch_dtype,
             trust_remote_code=True).to(device)
         _fix_gptq_moe_gate_weights(model, model_dir)
+    elif is_vlm(model_dir):
+        # Try multimodal loader first; AutoModelForCausalLM would silently
+        # drop the visual tower for models that register both classes.
+        try:
+            model = AutoModelForImageTextToText.from_pretrained(
+                model_dir, torch_dtype=torch_dtype,
+                trust_remote_code=True).to(device)
+        except Exception as e_vlm:
+            print(f"AutoModelForImageTextToText failed: {e_vlm}")
+            try:
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_dir, torch_dtype=torch_dtype,
+                    trust_remote_code=True).to(device)
+            except Exception as e:
+                raise ValueError(
+                    f"Could not load model from {model_dir}. Error: {e}")
     else:
-        # Try loading as AutoModelForCausalLM first
         try:
             model = AutoModelForCausalLM.from_pretrained(
                 model_dir, torch_dtype=torch_dtype,
                 trust_remote_code=True).to(device)
         except Exception as e_causal:
             print(f"AutoModelForCausalLM failed: {e_causal}")
-            # If that fails, try AutoModelForImageTextToText
             try:
-                # TODO: Need a WAR to quantize only the language model.
-                # In VLMs, the model has both model.language_model and model.vision_model.
                 model = AutoModelForImageTextToText.from_pretrained(
                     model_dir, torch_dtype=torch_dtype,
                     trust_remote_code=True).to(device)
@@ -452,6 +845,12 @@ def load_hf_model(
                     f"Could not load model from {model_dir}. Error: {e}")
     if not is_gptq_model(model):
         model.to(torch_dtype)
+    else:
+        casted_params, casted_buffers, skipped_quantized_modules = _cast_non_gptq_float_tensors_to_dtype(
+            model, torch_dtype)
+        print(
+            f"GPTQ load dtype normalization: cast {casted_params} params and {casted_buffers} buffers to {torch_dtype}; "
+            f"skipped {skipped_quantized_modules} GPTQ quantized modules.")
 
     # Set tokenizer padding token if needed
     if tokenizer.pad_token != "<unk>":
@@ -461,19 +860,41 @@ def load_hf_model(
 
     # Try to load processor if available
     processor = None
-    try:
-        processor = AutoProcessor.from_pretrained(
-            model_dir,
-            trust_remote_code=True,
-            # The fields are required because during quantization it may OOM due to large images in the dataset.
-            min_pixels=128 * 28 * 28,
-            max_pixels=2048 * 32 * 32)
-        print(
-            f"Warning: Loaded processor from {model_dir}. The processor will skip image processing for images smaller than 128x28x28 or bigger than 2048x32x32 due to excessive memory usage during image quntization."
+    if _is_alpamayo_1_model(model_dir):
+        preprocessor_config = {
+            "size": {
+                "longest_edge": 16777216,
+                "shortest_edge": 65536
+            },
+            "patch_size": 16,
+            "temporal_patch_size": 2,
+            "merge_size": 2,
+            "image_mean": [0.5, 0.5, 0.5],
+            "image_std": [0.5, 0.5, 0.5],
+            "min_pixels": 128 * 28 * 28,
+            "max_pixels": 2048 * 32 * 32,
+        }
+        video_processor = Qwen3VLVideoProcessor(**preprocessor_config)
+        image_processor = Qwen2VLImageProcessorFast(**preprocessor_config)
+        processor = Qwen3VLProcessor(
+            image_processor=image_processor,
+            tokenizer=tokenizer,
+            video_processor=video_processor,
         )
-    except Exception:
-        # Processor not available for this model
-        pass
+    else:
+        try:
+            processor = AutoProcessor.from_pretrained(
+                model_dir,
+                trust_remote_code=True,
+                # The fields are required because during quantization it may OOM due to large images in the dataset.
+                min_pixels=128 * 28 * 28,
+                max_pixels=2048 * 32 * 32)
+            print(
+                f"Warning: Loaded processor from {model_dir}. The processor will skip image processing for images smaller than 128x28x28 or bigger than 2048x32x32 due to excessive memory usage during image quantization."
+            )
+        except Exception:
+            # Processor not available for this model
+            pass
 
     return model, tokenizer, processor
 
@@ -515,8 +936,19 @@ def load_llm_model(
     model, tokenizer, processor = load_hf_model(model_dir, dtype, device)
     set_dynamic_quant(model, dtype)
 
+    # Create EdgeLLMModelForCausalLM wrapper
+    if _is_alpamayo_1_model(model_dir):
+        # For Alpamayo 1, extract the VLM backbone (Qwen3-VL)
+        hf_model = model.vlm
+        if not trt_native_ops:
+            edge_model = {}
+            edge_model["model"] = EdgeLLMModelForCausalLM(
+                hf_model, is_eagle_base, reduced_vocab_size, vocab_map)
+        else:
+            edge_model = EdgeLLMModelTRTNative(hf_model, is_eagle_base,
+                                               reduced_vocab_size, vocab_map)
     # Create EdgeLLMModel wrappers based on model type
-    if _is_qwen3_tts_model(model_dir):
+    elif _is_qwen3_tts_model(model_dir):
         # Qwen3-TTS: Talker + CodePredictor only (no Thinker)
         from .models.qwen3_omni_talker import (Qwen3OmniCodePredictorPatch,
                                                Qwen3OmniTalkerPatch)
@@ -531,6 +963,21 @@ def load_llm_model(
     elif _is_qwen3_omni_model(model_dir) or _is_qwen3_asr_model(model_dir):
         # Qwen3-Omni / ASR: Thinker + optional Talker + CodePredictor
         hf_model = model.thinker
+
+        # For GPTQ models: propagate quantization_config from top-level Omni config
+        # down to submodel configs so is_gptq_model() can detect quantized layers.
+        # Same pattern as prepare_language_model_and_config() L728.
+        top_quant_config = getattr(model.config, "quantization_config", None)
+        if top_quant_config is not None:
+            configs_to_patch = [hf_model.config]
+            thinker_text_cfg = getattr(hf_model.config, "text_config", None)
+            if thinker_text_cfg is not None:
+                configs_to_patch.append(thinker_text_cfg)
+            if hasattr(model, 'talker'):
+                configs_to_patch.append(model.talker.config)
+                configs_to_patch.append(model.talker.model.config)
+            for cfg in configs_to_patch:
+                cfg.quantization_config = top_quant_config
 
         if not trt_native_ops:
             edge_model = {}
@@ -550,18 +997,14 @@ def load_llm_model(
             edge_model = EdgeLLMModelTRTNative(hf_model, is_eagle_base,
                                                reduced_vocab_size, vocab_map)
 
+    elif is_hybrid_model(model_dir):
+        edge_model = EdgeLLMHybridModelForCausalLM(model, reduced_vocab_size,
+                                                   vocab_map)
     else:
         # Standard LLM / EAGLE
         hf_model = model
 
-        is_hybrid = hasattr(hf_model.config, 'layers_block_type')
-
-        if is_hybrid and not trt_native_ops:
-            print("Detected hybrid (Mamba+Attention) architecture")
-            edge_model = EdgeLLMHybridModelForCausalLM(hf_model,
-                                                       reduced_vocab_size,
-                                                       vocab_map)
-        elif not trt_native_ops:
+        if not trt_native_ops:
             edge_model = {}
             edge_model["model"] = EdgeLLMModelForCausalLM(
                 hf_model, is_eagle_base, reduced_vocab_size, vocab_map)
@@ -714,7 +1157,12 @@ def prepare_language_model_and_config(hf_model: nn.Module):
     if hasattr(hf_model, 'language_model'):
         language_model = hf_model.language_model
         config = hf_model.config.text_config
-    elif getattr(hf_model.config, 'model_type', '') == 'qwen3_omni_thinker':
+    elif hasattr(hf_model, 'model') and hasattr(hf_model.model,
+                                                'language_model'):
+        language_model = hf_model.model.language_model
+        config = hf_model.config.text_config
+    elif hasattr(hf_model.config, 'text_config') and hasattr(
+            hf_model.config, 'audio_config'):
         language_model = hf_model.model
         config = hf_model.config.text_config
     elif hasattr(hf_model, 'backbone'):
@@ -796,7 +1244,7 @@ def _load_eagle3_draft_weights(draft_model_dir: str,
 def _process_eagle3_draft_state_dict(state_dict: dict) -> dict:
     """
     Process EAGLE3 draft model state dict with specific key mapping.
-    
+
     This function handles EAGLE3 specific transformations:
     - Keeps 'd2t' key as-is
     - Renames 'midlayer' to 'layers.0'
@@ -806,10 +1254,10 @@ def _process_eagle3_draft_state_dict(state_dict: dict) -> dict:
     - Remaps self_attn.{q,k,qk}_norm to self_attn.qk_norm.{q,k,qk}_norm
       to match the EdgeLLMQKNorm wrapper
     - Keeps all other keys unchanged
-    
+
     Args:
         state_dict: Raw state dictionary from loaded weights
-        
+
     Returns:
         Processed state dictionary with renamed keys
     """

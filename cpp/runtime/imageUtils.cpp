@@ -107,7 +107,8 @@ ImageData loadImageFromMemory(unsigned char const* data, size_t size)
     return ImageData(std::move(imgTensor));
 }
 
-void resizeImage(ImageData const& image, ImageData& resizedImage, int64_t newWidth, int64_t newHeight)
+void resizeImage(
+    ImageData const& image, ImageData& resizedImage, int64_t newWidth, int64_t newHeight, InterpolationMode mode)
 {
     // Reshape pre-allocated buffer to target dimensions
     bool success = resizedImage.buffer->reshape({newHeight, newWidth, image.channels});
@@ -122,8 +123,16 @@ void resizeImage(ImageData const& image, ImageData& resizedImage, int64_t newWid
     // Resize the image into the pre-allocated buffer
     constexpr int32_t kINPUT_STRIDE_BYTES{0};
     constexpr int32_t kOUTPUT_STRIDE_BYTES{0};
-    stbir_resize_uint8_linear(image.data(), image.width, image.height, kINPUT_STRIDE_BYTES, resizedImage.data(),
-        newWidth, newHeight, kOUTPUT_STRIDE_BYTES, STBIR_RGB);
+    if (mode == InterpolationMode::kBICUBIC)
+    {
+        stbir_resize(image.data(), image.width, image.height, kINPUT_STRIDE_BYTES, resizedImage.data(), newWidth,
+            newHeight, kOUTPUT_STRIDE_BYTES, STBIR_RGB, STBIR_TYPE_UINT8, STBIR_EDGE_CLAMP, STBIR_FILTER_CATMULLROM);
+    }
+    else
+    {
+        stbir_resize_uint8_linear(image.data(), image.width, image.height, kINPUT_STRIDE_BYTES, resizedImage.data(),
+            newWidth, newHeight, kOUTPUT_STRIDE_BYTES, STBIR_RGB);
+    }
 }
 
 } // namespace imageUtils

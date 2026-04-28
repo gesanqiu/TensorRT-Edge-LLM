@@ -18,6 +18,7 @@
 #pragma once
 
 #include "common/tensor.h"
+#include "kernels/speculative/batchEvictKernels.h" // KVLayerInfo
 
 namespace trt_edgellm
 {
@@ -46,36 +47,53 @@ void incrementLengthTensor(rt::Tensor& lengthTensor, int32_t increment, cudaStre
 //! \throws std::runtime_error if tensor has wrong location, shape or data type
 void incrementLengthTensor(rt::Tensor& lengthTensor, rt::Tensor const& newIncrementTensor, cudaStream_t stream);
 
-//! \brief Instantiate the KVCache from a pre-computed KVCache tensor
+//! \brief Single-layer variant: instantiate KV cache for one layer from a saved tensor.
 //!
-//! Helper function to instantiate the KVCache from a pre-computed KVCache tensor.
-//! Used to support KVCache reuse across multiple inference requests to speedup prefill step.
-//!
-//! \param[in,out] dstKVCacheBuffer The KVCache buffer to be instantiated.
-//!                                  Layout: [numDecoderLayers, maxBatchSize, 2, numKVHeads, maxSequenceLength, headDim]
-//! \param[in] srcKVCacheTensor The pre-computed KVCache tensor.
-//!                              Layout: [numDecoderLayers, 2, numKVHeads, sequenceLength, headDim]
-//! \param[in] batchIdx The batch index of the KVCache to be instantiated
-//! \param[in] stream The CUDA stream to be used
-//! \throws std::runtime_error batchIdx or sequenceLength is out of range, or tensor data type is wrong
-void instantiateKVCacheFromTensor(
-    rt::Tensor& dstKVCacheBuffer, rt::Tensor const& srcKVCacheTensor, int32_t batchIdx, cudaStream_t stream);
+//! \param[in,out] dstKVCacheLayer  [maxBatchSize, 2, numKVHeads, maxSequenceLength, headDim]
+//! \param[in] srcKVCacheTensor     [2, numKVHeads, sequenceLength, headDim]
+//! \param[in] batchIdx Target batch index in the destination buffer
+//! \param[in] stream CUDA stream
+void instantiateKVCacheLayerFromTensor(
+    rt::Tensor& dstKVCacheLayer, rt::Tensor const& srcKVCacheTensor, int32_t batchIdx, cudaStream_t stream);
 
-//! \brief Save the KVCache into a tensor
+//! \brief Single-layer variant: save KV cache for one layer into a tensor.
 //!
-//! Helper function to save the KVCache into a tensor. Used to support KVCache reuse across multiple
-//! inference requests to speedup prefill step. SequenceLength of dstKVCacheTensor must be saved from
-//! the srcKVCacheBuffer.
-//!
-//! \param[out] dstKVCacheTensor The KVCache tensor to be saved.
-//!                               Layout: [numDecoderLayers, 2, numKVHeads, sequenceLength, headDim]
-//! \param[in] srcKVCacheBuffer The KVCache buffer to be saved.
-//!                              Layout: [numDecoderLayers, maxBatchSize, 2, numKVHeads, maxSequenceLength, headDim]
-//! \param[in] batchIdx The batch index of the KVCache to be saved
-//! \param[in] stream The CUDA stream to be used
-//! \throws std::runtime_error batchIdx or sequenceLength is out of range, or tensor data type is wrong
-void saveKVCacheIntoTensor(
-    rt::Tensor& dstKVCacheTensor, rt::Tensor const& srcKVCacheBuffer, int32_t batchIdx, cudaStream_t stream);
+//! \param[out] dstKVCacheTensor    [2, numKVHeads, sequenceLength, headDim]
+//! \param[in] srcKVCacheLayer      [maxBatchSize, 2, numKVHeads, maxSequenceLength, headDim]
+//! \param[in] batchIdx Source batch index in the buffer
+//! \param[in] stream CUDA stream
+void saveKVCacheLayerIntoTensor(
+    rt::Tensor& dstKVCacheTensor, rt::Tensor const& srcKVCacheLayer, int32_t batchIdx, cudaStream_t stream);
+
+/// @brief Batched save: copy multiple layers' KV cache into per-layer tensors in a single launch.
+/// All layers must share the same headDim. dstLayerInfos[i].data points to a [2, numKVHeads_i, seqLen, headDim] tensor.
+/// @param srcLayerInfos  [numLayers] GPU array — source cache buffers
+/// @param dstLayerInfos  [numLayers] GPU array — destination saved tensors
+/// @param numLayers      Number of layers in this batch
+/// @param headDim        Head dimension (same for all layers)
+/// @param maxKVHeads     Maximum numKVHeads across all layers (for grid sizing)
+/// @param maxBatchSize   Max batch size of the source cache
+/// @param batchIdx       Batch index to save from
+/// @param sequenceLength Number of tokens to copy
+/// @param stream         CUDA stream
+void saveKVCacheBatched(KVLayerInfo const* srcLayerInfos, KVLayerInfo const* dstLayerInfos, int32_t numLayers,
+    int32_t headDim, int32_t maxKVHeads, int32_t maxBatchSize, int32_t batchIdx, int32_t sequenceLength,
+    cudaStream_t stream);
+
+/// @brief Batched restore: load multiple layers' KV cache from per-layer tensors in a single launch.
+/// All layers must share the same headDim. srcLayerInfos[i].data points to a [2, numKVHeads_i, seqLen, headDim] tensor.
+/// @param dstLayerInfos  [numLayers] GPU array — destination cache buffers
+/// @param srcLayerInfos  [numLayers] GPU array — source saved tensors
+/// @param numLayers      Number of layers in this batch
+/// @param headDim        Head dimension (same for all layers)
+/// @param maxKVHeads     Maximum numKVHeads across all layers (for grid sizing)
+/// @param maxBatchSize   Max batch size of the destination cache
+/// @param batchIdx       Batch index to restore into
+/// @param sequenceLength Number of tokens to copy
+/// @param stream         CUDA stream
+void instantiateKVCacheBatched(KVLayerInfo const* dstLayerInfos, KVLayerInfo const* srcLayerInfos, int32_t numLayers,
+    int32_t headDim, int32_t maxKVHeads, int32_t maxBatchSize, int32_t batchIdx, int32_t sequenceLength,
+    cudaStream_t stream);
 
 } // namespace kernel
 } // namespace trt_edgellm

@@ -77,15 +77,24 @@ ImageData loadImageFromFile(std::string const& path);
  */
 ImageData loadImageFromMemory(unsigned char const* data, size_t size);
 
+//! @brief Interpolation filter for :func:`resizeImage`.
+enum class InterpolationMode
+{
+    kLINEAR,  //!< Bilinear
+    kBICUBIC, //!< Catmull-Rom cubic
+};
+
 /*!
  * @brief Resize image into pre-allocated buffer
  * @param image Source image
  * @param resizedImage Output buffer (will be reshaped to target dimensions)
  * @param newWidth Target width
  * @param newHeight Target height
+ * @param mode Interpolation filter
  * @throws std::runtime_error if image buffer cannot be reshaped
  */
-void resizeImage(ImageData const& image, ImageData& resizedImage, int64_t newWidth, int64_t newHeight);
+void resizeImage(
+    ImageData const& image, ImageData& resizedImage, int64_t newWidth, int64_t newHeight, InterpolationMode mode);
 
 } // namespace imageUtils
 } // namespace rt

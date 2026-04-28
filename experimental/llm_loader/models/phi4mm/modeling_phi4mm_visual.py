@@ -1,0 +1,431 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""
+From-scratch Phi-4 Multimodal vision encoder implementation.
+
+Architecture (matches checkpoint from transformers ≤4.46.1 key names):
+    Phi4MMVisionModel  (CLIP-style ViT)
+        Phi4MMVisionEmbeddings  (patch_embedding Conv2d + position_embedding)
+        Phi4MMVisionEncoder     (27 × Phi4MMVisionEncoderLayer)
+            layer_norm1 / self_attn (q/k/v_proj, out_proj) / layer_norm2 / mlp (fc1, fc2)
+        post_layernorm          (LayerNorm, not applied to the extracted feature)
+    image_token_compression     (AvgPool2d kernel=2 stride=2)
+    img_projection              (Sequential: Linear(1152→3072), GELU, Linear(3072→3072))
+
+Checkpoint weight key prefix:
+    ``model.embed_tokens_extend.image_embed.*``
+
+Sidecar tensors (separate safetensors file):
+    ``glb_GN`` [1, 1, 1152] — global image separator token
+    ``sub_GN`` [1, 1, 1, 1152] — sub-image separator token
+
+Forward I/O (ONNX):
+    Input:  pixel_values  [N, 3, 448, 448]  float16
+    Output: image_embeds  [N * 256, 3072]   float16
+
+The ``feature_layer = -2`` convention means the second-to-last layer hidden
+state (layer index 25 out of 27) is extracted before ``post_layernorm``.
+"""
+
+from __future__ import annotations
+
+import math
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# ---------------------------------------------------------------------------
+# Embeddings
+# ---------------------------------------------------------------------------
+
+
+class Phi4MMVisionEmbeddings(nn.Module):
+    """Patch + positional embeddings.
+
+    Checkpoint keys (under prefix):
+        ``img_processor.embeddings.patch_embedding.*``
+        ``img_processor.embeddings.position_embedding.*``
+    """
+
+    def __init__(self, hidden_size: int, num_patches: int, num_channels: int,
+                 patch_size: int) -> None:
+        super().__init__()
+        self.num_patches = num_patches
+        self.patch_embedding = nn.Conv2d(
+            in_channels=num_channels,
+            out_channels=hidden_size,
+            kernel_size=patch_size,
+            stride=patch_size,
+            padding=0,  # "valid"
+            bias=True,
+        )
+        self.position_embedding = nn.Embedding(num_patches, hidden_size)
+
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        # pixel_values: [N, 3, 448, 448]
+        x = self.patch_embedding(pixel_values)  # [N, H, h, w]
+        N = x.shape[0]
+        x = x.flatten(2).transpose(1, 2)  # [N, num_patches, H]
+        # Fixed position ids (no interpolation needed for 448×448 → 32×32)
+        pos_ids = torch.arange(self.num_patches,
+                               device=x.device,
+                               dtype=torch.long).unsqueeze(0).expand(N, -1)
+        x = x + self.position_embedding(pos_ids)
+        return x
+
+
+# ---------------------------------------------------------------------------
+# Attention
+# ---------------------------------------------------------------------------
+
+
+class Phi4MMVisionAttention(nn.Module):
+    """Standard multi-head self-attention (bidirectional, no RoPE).
+
+    Checkpoint keys (under prefix + ``img_processor.encoder.layers.N.self_attn``):
+        q_proj.weight / q_proj.bias
+        k_proj.weight / k_proj.bias
+        v_proj.weight / v_proj.bias
+        out_proj.weight / out_proj.bias
+    """
+
+    def __init__(self, hidden_size: int, num_heads: int) -> None:
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.scale = self.head_dim**-0.5
+        self.hidden_size = hidden_size
+        self.q_proj = nn.Linear(hidden_size, hidden_size)
+        self.k_proj = nn.Linear(hidden_size, hidden_size)
+        self.v_proj = nn.Linear(hidden_size, hidden_size)
+        self.out_proj = nn.Linear(hidden_size, hidden_size)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        N, S, _ = hidden_states.shape
+        q = self.q_proj(hidden_states).view(N, S, self.num_heads,
+                                            self.head_dim).transpose(1, 2)
+        k = self.k_proj(hidden_states).view(N, S, self.num_heads,
+                                            self.head_dim).transpose(1, 2)
+        v = self.v_proj(hidden_states).view(N, S, self.num_heads,
+                                            self.head_dim).transpose(1, 2)
+        # Manual SDPA decomposition — dynamo export emits F.sdpa as a
+        # multi-output ONNX Attention op that TRT cannot parse.
+        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        attn_weights = F.softmax(scores, dim=-1,
+                                 dtype=torch.float32).to(q.dtype)
+        out = torch.matmul(attn_weights, v)
+        out = out.transpose(1, 2).reshape(N, S, self.hidden_size)
+        return self.out_proj(out)
+
+
+# ---------------------------------------------------------------------------
+# MLP
+# ---------------------------------------------------------------------------
+
+
+class Phi4MMVisionMLP(nn.Module):
+    """Two-layer FFN with GELU activation.
+
+    Checkpoint keys (under prefix + ``img_processor.encoder.layers.N.mlp``):
+        fc1.weight / fc1.bias
+        fc2.weight / fc2.bias
+    """
+
+    def __init__(self, hidden_size: int, intermediate_size: int) -> None:
+        super().__init__()
+        self.fc1 = nn.Linear(hidden_size, intermediate_size)
+        self.fc2 = nn.Linear(intermediate_size, hidden_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc2(F.gelu(self.fc1(x), approximate="tanh"))
+
+
+# ---------------------------------------------------------------------------
+# Encoder Layer
+# ---------------------------------------------------------------------------
+
+
+class Phi4MMVisionEncoderLayer(nn.Module):
+    """Single ViT encoder block (pre-norm).
+
+    Checkpoint keys (under prefix + ``img_processor.encoder.layers.N``):
+        layer_norm1.*, self_attn.*, layer_norm2.*, mlp.*
+    """
+
+    def __init__(self, hidden_size: int, num_heads: int,
+                 intermediate_size: int, layer_norm_eps: float) -> None:
+        super().__init__()
+        self.layer_norm1 = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
+        self.self_attn = Phi4MMVisionAttention(hidden_size, num_heads)
+        self.layer_norm2 = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
+        self.mlp = Phi4MMVisionMLP(hidden_size, intermediate_size)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = hidden_states + self.self_attn(
+            self.layer_norm1(hidden_states))
+        hidden_states = hidden_states + self.mlp(
+            self.layer_norm2(hidden_states))
+        return hidden_states
+
+
+# ---------------------------------------------------------------------------
+# Encoder
+# ---------------------------------------------------------------------------
+
+
+class Phi4MMVisionEncoder(nn.Module):
+    """Stack of Phi4MMVisionEncoderLayer blocks.
+
+    Checkpoint keys: ``img_processor.encoder.layers.N.*``
+    """
+
+    def __init__(self, num_layers: int, hidden_size: int, num_heads: int,
+                 intermediate_size: int, layer_norm_eps: float) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList([
+            Phi4MMVisionEncoderLayer(hidden_size, num_heads, intermediate_size,
+                                     layer_norm_eps) for _ in range(num_layers)
+        ])
+
+    def forward(self, hidden_states: torch.Tensor,
+                feature_layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns (feature_hidden_states, last_hidden_states)."""
+        feature: torch.Tensor | None = None
+        for i, layer in enumerate(self.layers):
+            hidden_states = layer(hidden_states)
+            if i == feature_layer_idx:
+                feature = hidden_states
+        assert feature is not None
+        return feature, hidden_states
+
+
+# ---------------------------------------------------------------------------
+# Vision Model (CLIP-style ViT)
+# ---------------------------------------------------------------------------
+
+
+class Phi4MMVisionModel(nn.Module):
+    """Full Phi-4 CLIP-style ViT.
+
+    Checkpoint keys: ``img_processor.*``
+    """
+
+    def __init__(self, hidden_size: int, num_layers: int, num_heads: int,
+                 intermediate_size: int, num_patches: int, num_channels: int,
+                 patch_size: int, layer_norm_eps: float,
+                 feature_layer: int) -> None:
+        super().__init__()
+        self.embeddings = Phi4MMVisionEmbeddings(hidden_size, num_patches,
+                                                 num_channels, patch_size)
+        self.encoder = Phi4MMVisionEncoder(num_layers, hidden_size, num_heads,
+                                           intermediate_size, layer_norm_eps)
+        self.post_layernorm = nn.LayerNorm(hidden_size, eps=layer_norm_eps)
+        # Absolute index of the feature layer inside the encoder
+        # feature_layer = -2 ⟹ second-to-last out of num_layers outputs
+        self._feature_idx = num_layers + feature_layer
+
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """Returns the feature hidden state (before post_layernorm)."""
+        x = self.embeddings(pixel_values)
+        feature, _ = self.encoder(x, self._feature_idx)
+        return feature
+
+
+# ---------------------------------------------------------------------------
+# Top-level visual model with projection
+# ---------------------------------------------------------------------------
+
+
+class Phi4MMVisualModel(nn.Module):
+    """Complete Phi-4 Multimodal visual encoder (ViT + compression + projection).
+
+    Forward I/O:
+        Input:  pixel_values   [N, 3, 448, 448]  float16
+        Output: image_embeds   [N * 256, 3072]    float16
+
+    Checkpoint keys (all under ``model.embed_tokens_extend.image_embed.``):
+        img_processor.*
+        image_token_compression.*   (AvgPool2d — no learned weights)
+        img_projection.0.*          (Linear 1152→3072)
+        img_projection.2.*          (Linear 3072→3072)
+        glb_GN                      [1, 1, 1152]
+        sub_GN                      [1, 1, 1, 1152]
+    """
+
+    def __init__(self, config: dict) -> None:
+        super().__init__()
+        hidden_size: int = config["hidden_size"]
+        num_layers: int = config["num_hidden_layers"]
+        num_heads: int = config["num_attention_heads"]
+        intermediate_size: int = config["intermediate_size"]
+        image_size: int = config["image_size"]
+        patch_size: int = config["patch_size"]
+        num_channels: int = config.get("num_channels", 3)
+        layer_norm_eps: float = config.get("layer_norm_eps", 1e-5)
+        feature_layer: int = config["feature_layer"]
+
+        # LLM projection hidden size — look for the LLM dim in parent config
+        proj_hidden_size: int = config["proj_hidden_size"]
+
+        num_patches_per_side = image_size // patch_size
+        num_patches = num_patches_per_side**2
+        self._num_img_tokens = (num_patches_per_side // 2)**2
+        self._hidden_size = hidden_size
+        self._proj_hidden_size = proj_hidden_size
+
+        self.img_processor = Phi4MMVisionModel(
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            intermediate_size=intermediate_size,
+            num_patches=num_patches,
+            num_channels=num_channels,
+            patch_size=patch_size,
+            layer_norm_eps=layer_norm_eps,
+            feature_layer=feature_layer,
+        )
+        self.image_token_compression = nn.AvgPool2d(kernel_size=2, stride=2)
+        self.img_projection = nn.Sequential(
+            nn.Linear(hidden_size, proj_hidden_size),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(proj_hidden_size, proj_hidden_size),
+        )
+        # GN separator tokens (buffers — not registered as parameters so
+        # load_state_dict can set them from the checkpoint)
+        self.glb_GN = nn.Parameter(torch.zeros(1, 1, hidden_size))
+        self.sub_GN = nn.Parameter(torch.zeros(1, 1, 1, hidden_size))
+
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """Extract visual features and project to LLM hidden size.
+
+        Args:
+            pixel_values: [N, 3, image_size, image_size]
+
+        Returns:
+            [N * num_img_tokens, proj_hidden_size]
+        """
+        N = pixel_values.shape[0]
+
+        # ViT feature extraction — output of feature_layer
+        features = self.img_processor(
+            pixel_values)  # [N, num_patches, hidden_size]
+
+        # Reshape → NCHW → AvgPool2d → NHWC → flatten tokens
+        S = features.shape[1]
+        side = int(math.isqrt(S))
+        features = features.view(N, side, side,
+                                 self._hidden_size)  # [N, side, side, H]
+        features = features.permute(0, 3, 1, 2)  # NCHW
+        features = self.image_token_compression(features)
+        features = features.permute(0, 2, 3, 1)  # NHWC
+        features = features.view(N, self._num_img_tokens,
+                                 self._hidden_size)  # [N, num_img_tokens, H]
+
+        # Project to LLM hidden size
+        out = self.img_projection(
+            features)  # [N, num_img_tokens, proj_hidden_size]
+        return out.view(N * self._num_img_tokens, self._proj_hidden_size)
+
+    def get_onnx_export_args(self, config: dict, device: str):
+        """Return (args, input_names, output_names, dynamic_shapes) for ONNX export."""
+        image_size = config["image_size"]
+        # Use batch=2 to keep the batch dimension symbolic during tracing.
+        pixel_values = torch.zeros(2,
+                                   3,
+                                   image_size,
+                                   image_size,
+                                   dtype=torch.float16,
+                                   device=device)
+        args = (pixel_values, )
+        input_names = ["input"]
+        output_names = ["output"]
+        N = torch.export.Dim("num_images", min=1)
+        dynamic_shapes = {"pixel_values": {0: N}}
+        return args, input_names, output_names, dynamic_shapes
+
+    def save_onnx_sidecar(self, output_dir: str) -> str:
+        """Save Phi-4mm GN projection sidecar tensors.
+
+        Args:
+            output_dir: Directory where the sidecar ``.safetensors`` file is written.
+
+        Returns:
+            Path to the saved sidecar file.
+        """
+        import os
+
+        from safetensors.torch import save_file
+        glb = self.glb_GN.view(1, -1).to(torch.float16)
+        sub = self.sub_GN.view(1, -1).to(torch.float16)
+        with torch.no_grad():
+            glb_proj = self.img_projection(glb).squeeze(0).to(
+                torch.float16).cpu().contiguous()
+            sub_proj = self.img_projection(sub).squeeze(0).to(
+                torch.float16).cpu().contiguous()
+        sidecar_path = os.path.join(output_dir, "phi4mm_gn_proj.safetensors")
+        save_file({"glb_GN": glb_proj, "sub_GN": sub_proj}, sidecar_path)
+        return sidecar_path
+
+
+# ---------------------------------------------------------------------------
+# Weight loading
+# ---------------------------------------------------------------------------
+
+
+def _load_phi4mm_weights(
+    model: Phi4MMVisualModel,
+    weights: dict,
+    prefix: str = "model.embed_tokens_extend.image_embed.",
+) -> None:
+    """Load safetensors weights into *model* stripping *prefix*."""
+    stripped: dict = {}
+    for k, v in weights.items():
+        if k.startswith(prefix):
+            stripped[k[len(prefix):]] = v
+    missing, unexpected = model.load_state_dict(stripped, strict=False)
+    if missing:
+        import logging
+        logging.getLogger(__name__).warning(
+            "Phi4MMVisualModel: missing keys after load: %s",
+            missing[:10],
+        )
+
+
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
+
+
+def build_phi4mm_visual(
+    config: dict,
+    weights: dict,
+    dtype: torch.dtype = torch.float16,
+) -> Phi4MMVisualModel:
+    """Build and return a :class:`Phi4MMVisualModel` with loaded weights.
+
+    Args:
+        config:  Model config dict (reads architecture values with sensible defaults).
+        weights: Flat ``{key: tensor}`` dict from safetensors.
+        dtype:   Weight dtype (default ``float16``).
+    """
+    model = Phi4MMVisualModel(config)
+    _load_phi4mm_weights(model, weights)
+    model = model.to(dtype=dtype)
+    model.eval()
+    return model
+
+
+__all__ = ["Phi4MMVisualModel", "build_phi4mm_visual"]

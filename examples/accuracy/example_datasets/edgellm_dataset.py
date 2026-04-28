@@ -130,6 +130,18 @@ class EdgeLLMDataset:
         """
         raise NotImplementedError("save_image is not implemented")
 
+    def save_audio(self, data: Dict[str, Any]) -> Optional[str]:
+        """
+        Save audio from dataset entry and return its path.
+
+        Args:
+            data: Single dataset entry containing audio data
+
+        Returns:
+            Path to saved audio payload, or None if not available
+        """
+        raise NotImplementedError("save_audio is not implemented")
+
     def extract_answer(self, data: Dict[str, Any]) -> Optional[str]:
         """
         Extract the reference answer from dataset entry.
@@ -201,6 +213,11 @@ class EdgeLLMDataset:
                 except NotImplementedError:
                     image_paths = None
 
+                try:
+                    audio_path = self.save_audio(data_entry)
+                except NotImplementedError:
+                    audio_path = None
+
                 # Create request entry with messages array
                 request = {}
 
@@ -216,11 +233,13 @@ class EdgeLLMDataset:
                     })
 
                 # Add user message with content
-                if image_paths:
-                    # Multimodal: content is array with images and text
+                if image_paths or audio_path:
+                    # Multimodal: content is array with images/audio and text
                     content = []
-                    for img_path in image_paths:
+                    for img_path in image_paths or []:
                         content.append({"type": "image", "image": img_path})
+                    if audio_path:
+                        content.append({"type": "audio", "audio": audio_path})
                     content.append({"type": "text", "text": user_prompt})
                 else:
                     # Text-only: content is string

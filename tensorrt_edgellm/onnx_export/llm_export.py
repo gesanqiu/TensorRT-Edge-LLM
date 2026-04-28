@@ -59,6 +59,8 @@ from ..llm_models.layers.attention_plugin import \
     register_attention_plugin_onnx_symbolic_functions
 from ..llm_models.layers.attention_trt import \
     register_trt_native_attention_onnx_symbolic_functions
+from ..llm_models.layers.gated_delta_net_plugin import \
+    register_gated_delta_net_onnx_symbolic_functions
 from ..llm_models.layers.gather_nd import \
     register_gather_nd_onnx_symbolic_functions
 from ..llm_models.layers.int4_gemm_plugin import (
@@ -67,13 +69,20 @@ from ..llm_models.layers.int4_gemm_plugin import (
 from ..llm_models.layers.int4_moe_plugin import (
     is_moe_model, register_int4_moe_plugin_onnx_symbolic_functions,
     replace_moe_blocks_with_plugin)
+from ..llm_models.layers.nvfp4_moe_plugin import (
+    NemotronHMoEW4A4Plugin, register_nvfp4_moe_plugin_onnx_symbolic_functions,
+    replace_moe_blocks_with_nvfp4_plugin)
+
+try:
+    from transformers.models.nemotron_h.modeling_nemotron_h import NemotronHMoE
+except (ImportError, AttributeError):
+    NemotronHMoE = None
 from ..llm_models.layers.mamba_plugin import \
     register_mamba_plugin_onnx_symbolic_functions
-from ..llm_models.model_utils import (is_gptq_model,
+from ..llm_models.model_utils import (is_gptq_model, is_hybrid_model_type,
                                       is_incompatible_chat_template_model,
                                       load_eagle3_draft_model, load_llm_model,
                                       load_reduced_vocab_map)
-from ..llm_models.models.llm_model import EdgeLLMHybridModelForCausalLM
 from ..llm_models.models.llm_model_trtnative import (Eagle3DraftModelTRTNative,
                                                      EdgeLLMModelTRTNative)
 from ..llm_models.models.qwen3_omni_talker import (
@@ -96,10 +105,21 @@ def save_d2t_for_eagle3_draft(draft_model: nn.Module, output_dir: str) -> None:
     print(f"Saved d2t.safetensors to {output_dir}")
 
 
-def save_embedding_table(base_model: nn.Module, output_dir: str) -> None:
+def save_embedding_table(base_model: nn.Module,
+                         output_dir: str,
+                         fp8_embedding: bool = False) -> None:
     """Save embedding.safetensors for LLM models (both EAGLE base and regular models).
-    
+
     Note: Draft models do not need embeddings as they use the base model's embeddings.
+
+    Args:
+        base_model: Model containing embed_tokens layer
+        output_dir: Directory to save embedding.safetensors
+        fp8_embedding: If True, quantize to FP8; if False, save as FP16
+
+    Output file format:
+        - FP16 mode: {"embedding": FP16 tensor}
+        - FP8 mode: {"embedding": FP8 tensor, "embedding_scale": FP32 tensor}
     """
     from safetensors.torch import save_file
 
@@ -109,8 +129,21 @@ def save_embedding_table(base_model: nn.Module, output_dir: str) -> None:
 
     # Save as safetensors with key 'embedding'
     embedding_path = os.path.join(output_dir, "embedding.safetensors")
-    save_file({"embedding": embedding_weight}, embedding_path)
-    print(f"Saved embedding.safetensors to {output_dir}")
+
+    if fp8_embedding:
+        from tensorrt_edgellm.quantization.embedding_quantization import \
+            quantize_embedding_to_fp8
+
+        embedding_fp8, scales = quantize_embedding_to_fp8(embedding_weight)
+        save_file({
+            "embedding": embedding_fp8,
+            "embedding_scale": scales
+        }, embedding_path)
+        print(f"Saved FP8 embedding.safetensors to {output_dir}")
+    else:
+        embedding_fp16 = embedding_weight.half()
+        save_file({"embedding": embedding_fp16}, embedding_path)
+        print(f"Saved FP16 embedding.safetensors to {output_dir}")
 
 
 # ============================================================================
@@ -118,17 +151,26 @@ def save_embedding_table(base_model: nn.Module, output_dir: str) -> None:
 # ============================================================================
 
 
-def get_model_save_weights_hook(model_name: str):
+def get_model_save_weights_hook(model_name: str, fp8_embedding: bool = False):
     """
     Get weight saving function for each model type.
     
     Every model type has an explicit hook. Talker and CodePredictor have
     additional weights beyond the standard embedding table.
+
+    Args:
+        model_name: Name of the model type
+        fp8_embedding: If True, quantize embedding to FP8
     """
     if model_name == "talker":
+        if fp8_embedding:
+            print("Warning: fp8_embedding is not supported for talker model, "
+                  "will use FP16 embedding instead")
 
         def save_talker_weights(model, output_dir):
-            save_embedding_table(model.transformer, output_dir)
+            save_embedding_table(model.transformer,
+                                 output_dir,
+                                 fp8_embedding=False)
             from ..llm_models.models.qwen3_omni_talker import \
                 save_qwen3_omni_talker_projections
             save_qwen3_omni_talker_projections(model, output_dir)
@@ -136,6 +178,10 @@ def get_model_save_weights_hook(model_name: str):
         return save_talker_weights
 
     if model_name == "code_predictor":
+        if fp8_embedding:
+            print(
+                "Warning: fp8_embedding is not supported for code_predictor model, "
+                "will use FP16 embedding instead")
 
         def save_code_predictor_weights(model, output_dir):
             from ..llm_models.models.qwen3_omni_talker import (
@@ -163,20 +209,17 @@ def get_model_save_weights_hook(model_name: str):
 
     # Standard LLM / Thinker / EAGLE: only need embedding table
     def save_default_weights(model, output_dir):
-        save_embedding_table(model, output_dir)
+        save_embedding_table(model, output_dir, fp8_embedding=fp8_embedding)
 
     return save_default_weights
 
 
-def get_model_config_export_hook(model_name: str,
-                                 model_dir: str = None,
-                                 is_eagle_base: bool = False,
-                                 trt_native_ops: bool = False):
-    """
-    Get config export function for each model type.
-    
-    Every model type has an explicit hook that returns a config dict.
-    """
+def export_model_config(model_name: str,
+                        model_config: Any,
+                        model_dir: str = None,
+                        is_eagle_base: bool = False,
+                        trt_native_ops: bool = False) -> Dict[str, Any]:
+    """Export config for a model, with explicit handling for special submodels."""
     if model_name == "talker":
         if not model_dir:
             raise ValueError("model_dir is required for talker config export")
@@ -186,69 +229,53 @@ def get_model_config_export_hook(model_name: str,
         from .config_export import (export_talker_config,
                                     export_tts_talker_config)
 
-        def export_talker_config_hook(model_config):
-            full_config = AutoConfig.from_pretrained(model_dir,
-                                                     trust_remote_code=True)
-            # Omni talker config has thinker_hidden_size; TTS does not
-            has_thinker = hasattr(full_config, 'talker_config') and \
-                          hasattr(full_config.talker_config, 'thinker_hidden_size')
-            if has_thinker:
-                return export_talker_config(full_config)
-            else:
-                return export_tts_talker_config(full_config)
-
-        return export_talker_config_hook
+        full_config = AutoConfig.from_pretrained(model_dir,
+                                                 trust_remote_code=True)
+        # Omni talker config has thinker_hidden_size; TTS does not.
+        has_thinker = hasattr(full_config, 'talker_config') and hasattr(
+            full_config.talker_config, 'thinker_hidden_size')
+        if has_thinker:
+            return export_talker_config(full_config)
+        return export_tts_talker_config(full_config)
 
     if model_name == "code_predictor":
-
-        def export_code_predictor_config_hook(model_config):
-            config = export_llm_config(model_config, 'llm', trt_native_ops)
-            config["use_embeddings_input"] = True
-            return config
-
-        return export_code_predictor_config_hook
+        config = export_llm_config(model_config, 'llm', trt_native_ops)
+        config["use_embeddings_input"] = True
+        return config
 
     if model_name == "thinker":
+        config = export_llm_config(model_config, 'llm', trt_native_ops)
+        if model_dir:
+            from transformers import AutoConfig
+            try:
+                full_config = AutoConfig.from_pretrained(
+                    model_dir, trust_remote_code=True)
+            except (OSError, ValueError, EnvironmentError):
+                full_config = None
 
-        def export_thinker_config_hook(model_config):
-            config = export_llm_config(model_config, 'llm', trt_native_ops)
-            if model_dir:
-                from transformers import AutoConfig
-                try:
-                    full_config = AutoConfig.from_pretrained(
-                        model_dir, trust_remote_code=True)
-                except Exception:
-                    full_config = None
+            search_configs = [
+                getattr(full_config, 'thinker_config', None)
+                if full_config else None,
+                getattr(full_config, 'text_config', None)
+                if full_config else None,
+                full_config,
+                model_config,
+            ]
+            for field in [
+                    "audio_token_id", "image_token_id", "video_token_id"
+            ]:
+                for cfg in search_configs:
+                    if cfg is None:
+                        continue
+                    val = getattr(cfg, field, None)
+                    if val is not None:
+                        config[field] = val
+                        break
+        return config
 
-                search_configs = [
-                    getattr(full_config, 'thinker_config', None)
-                    if full_config else None,
-                    getattr(full_config, 'text_config', None)
-                    if full_config else None,
-                    full_config,
-                    model_config,
-                ]
-                for field in [
-                        "audio_token_id", "image_token_id", "video_token_id"
-                ]:
-                    for cfg in search_configs:
-                        if cfg is None:
-                            continue
-                        val = getattr(cfg, field, None)
-                        if val is not None:
-                            config[field] = val
-                            break
-            return config
-
-        return export_thinker_config_hook
-
-    # Standard LLM / EAGLE base
+    # Standard LLM / hybrid / EAGLE base:
     model_type = 'eagle3_base' if is_eagle_base else 'llm'
-
-    def export_default_config_hook(model_config):
-        return export_llm_config(model_config, model_type, trt_native_ops)
-
-    return export_default_config_hook
+    return export_llm_config(model_config, model_type, trt_native_ops)
 
 
 def is_qwen3_omni_submodel(model_name: str) -> bool:
@@ -431,9 +458,8 @@ def replace_torch_quant_linear_with_int4_plugin(model: nn.Module) -> nn.Module:
     return model
 
 
-def create_hybrid_dummy_inputs(
-        model: EdgeLLMHybridModelForCausalLM) -> Dict[str, Any]:
-    """Create dummy inputs for hybrid Mamba+Attention ONNX export."""
+def create_hybrid_dummy_inputs(model: nn.Module) -> Dict[str, Any]:
+    """Create dummy inputs for hybrid Linear Attention + Full Attention ONNX export."""
     batch_size = 1
     seq_len = 2
     past_len = 2
@@ -457,11 +483,7 @@ def create_hybrid_dummy_inputs(
     device = next(model.parameters()).device
 
     num_attn_layers = model.model.num_attention_layers
-    num_mamba_layers = model.model.num_mamba_layers
-
-    mamba_num_heads = config.mamba_num_heads
-    mamba_head_dim = config.mamba_head_dim
-    ssm_state_size = config.ssm_state_size
+    num_linear_attn_layers = model.model.num_linear_attn_layers
 
     past_key_values = []
     for _ in range(num_attn_layers):
@@ -474,11 +496,35 @@ def create_hybrid_dummy_inputs(
                         dtype=torch.float16,
                         device=device))
 
-    # Conv states (only for mamba layers)
-    conv_dim = config.mamba_num_heads * config.mamba_head_dim + 2 * config.n_groups * ssm_state_size
-    conv_kernel = config.conv_kernel
+    if config.model_type == "nemotron_h":
+        conv_dim = (config.mamba_num_heads * config.mamba_head_dim +
+                    2 * config.n_groups * config.ssm_state_size)
+        conv_kernel = config.conv_kernel
+        recurrent_shape = (
+            int(config.mamba_num_heads),
+            int(config.mamba_head_dim),
+            int(config.ssm_state_size),
+        )
+        recurrent_dtype = torch.float16
+    elif config.model_type == "qwen3_5_text":
+        conv_dim = (
+            2 * config.linear_num_key_heads * config.linear_key_head_dim +
+            config.linear_num_value_heads * config.linear_value_head_dim)
+        conv_kernel = int(config.linear_conv_kernel_dim)
+        recurrent_shape = (
+            int(config.linear_num_value_heads),
+            int(config.linear_key_head_dim),
+            int(config.linear_value_head_dim),
+        )
+        recurrent_dtype = torch.float32
+    else:
+        raise ValueError(
+            f"Unsupported hybrid model_type for dummy inputs: {config.model_type}"
+        )
+
+    # Conv states (for recurrent layers: mamba in Nemotron-H, linear-attn in Qwen3.5)
     conv_states = []
-    for _ in range(num_mamba_layers):
+    for _ in range(num_linear_attn_layers):
         conv_states.append(
             torch.zeros(batch_size,
                         conv_dim,
@@ -486,15 +532,13 @@ def create_hybrid_dummy_inputs(
                         dtype=torch.float16,
                         device=device))
 
-    # SSM states (only for mamba layers)
-    ssm_states = []
-    for _ in range(num_mamba_layers):
-        ssm_states.append(
+    # Recurrent states (shape depends on architecture)
+    recurrent_states = []
+    for _ in range(num_linear_attn_layers):
+        recurrent_states.append(
             torch.zeros(batch_size,
-                        mamba_num_heads,
-                        mamba_head_dim,
-                        ssm_state_size,
-                        dtype=torch.float16,
+                        *recurrent_shape,
+                        dtype=recurrent_dtype,
                         device=device))
 
     inputs_embeds = torch.randn(batch_size,
@@ -510,8 +554,8 @@ def create_hybrid_dummy_inputs(
         tuple(past_key_values),
         'conv_states':
         tuple(conv_states),
-        'ssm_states':
-        tuple(ssm_states),
+        'recurrent_states':
+        tuple(recurrent_states),
         'rope_rotary_cos_sin':
         torch.randn(batch_size,
                     max_position_embeddings,
@@ -533,22 +577,21 @@ def create_hybrid_dummy_inputs(
     }
 
 
-def export_hybrid_model_to_onnx(model: EdgeLLMHybridModelForCausalLM,
-                                output_dir: str) -> None:
-    """Export a hybrid Mamba+Attention model to ONNX."""
+def export_hybrid_model_to_onnx(model: nn.Module, output_dir: str) -> None:
+    """Export a hybrid Linear Attention + Full Attention model to ONNX."""
     print(f"Exporting hybrid model to ONNX format: {output_dir}")
 
     dummy_inputs = create_hybrid_dummy_inputs(model)
     model.eval()
 
     num_attn_layers = model.model.num_attention_layers
-    num_mamba_layers = model.model.num_mamba_layers
+    num_linear_attn_layers = model.model.num_linear_attn_layers
 
     inputs = (
         dummy_inputs['inputs_embeds'],
         dummy_inputs['past_key_values'],
         dummy_inputs['conv_states'],
-        dummy_inputs['ssm_states'],
+        dummy_inputs['recurrent_states'],
         dummy_inputs['rope_rotary_cos_sin'],
         dummy_inputs['context_lengths'],
         dummy_inputs['last_token_ids'],
@@ -557,19 +600,22 @@ def export_hybrid_model_to_onnx(model: EdgeLLMHybridModelForCausalLM,
         None,  # attention_mask
     )
 
-    input_names = (['inputs_embeds'] +
-                   [f'past_key_values_{i}' for i in range(num_attn_layers)] +
-                   [f'conv_state_{i}' for i in range(num_mamba_layers)] +
-                   [f'ssm_state_{i}' for i in range(num_mamba_layers)] + [
-                       'rope_rotary_cos_sin', 'context_lengths',
-                       'last_token_ids', 'kvcache_start_index'
-                   ])
+    input_names = (
+        ['inputs_embeds'] +
+        [f'past_key_values_{i}' for i in range(num_attn_layers)] +
+        [f'conv_state_{i}' for i in range(num_linear_attn_layers)] +
+        [f'recurrent_state_{i}' for i in range(num_linear_attn_layers)] + [
+            'rope_rotary_cos_sin', 'context_lengths', 'last_token_ids',
+            'kvcache_start_index'
+        ])
 
     output_names = (
         ['logits'] +
         [f'present_key_values_{i}' for i in range(num_attn_layers)] +
-        [f'present_conv_state_{i}' for i in range(num_mamba_layers)] +
-        [f'present_ssm_state_{i}' for i in range(num_mamba_layers)])
+        [f'present_conv_state_{i}' for i in range(num_linear_attn_layers)] + [
+            f'present_recurrent_state_{i}'
+            for i in range(num_linear_attn_layers)
+        ])
 
     dynamic_axes = {
         'inputs_embeds': {
@@ -600,14 +646,15 @@ def export_hybrid_model_to_onnx(model: EdgeLLMHybridModelForCausalLM,
             0: 'batch_size',
             3: 'present_kv_cache_len'
         }
-    for i in range(num_mamba_layers):
+    for i in range(num_linear_attn_layers):
         dynamic_axes[f'conv_state_{i}'] = {0: 'batch_size'}
         dynamic_axes[f'present_conv_state_{i}'] = {0: 'batch_size'}
-        dynamic_axes[f'ssm_state_{i}'] = {0: 'batch_size'}
-        dynamic_axes[f'present_ssm_state_{i}'] = {0: 'batch_size'}
+        dynamic_axes[f'recurrent_state_{i}'] = {0: 'batch_size'}
+        dynamic_axes[f'present_recurrent_state_{i}'] = {0: 'batch_size'}
 
     register_attention_plugin_onnx_symbolic_functions()
     register_mamba_plugin_onnx_symbolic_functions()
+    register_gated_delta_net_onnx_symbolic_functions()
     register_gather_nd_onnx_symbolic_functions()
 
     custom_opsets = {"trt_edgellm": ONNX_OPSET_VERSION}
@@ -858,13 +905,14 @@ def export_llm_model(model_dir: str,
                      chat_template_path: Optional[str] = None,
                      fp8_kv_cache: bool = False,
                      trt_native_ops: bool = False,
-                     export_models: Optional[str] = None) -> None:
+                     export_models: Optional[str] = None,
+                     fp8_embedding: bool = False) -> None:
     """
     Export a language model to ONNX format with custom attention plugin.
-    
+
     This is the main entry point for exporting standard LLM models and EAGLE base models
     to ONNX format with TensorRT Edge-LLM optimizations.
-    
+
     Args:
         model_dir: Directory containing the HuggingFace model
         output_dir: Directory to save the exported ONNX model
@@ -875,6 +923,7 @@ def export_llm_model(model_dir: str,
         fp8_kv_cache: Whether to use FP8 KV cache
         trt_native_ops: Whether to use TensorRT native operations instead of plugin
         export_models: Comma-separated list of models to export for Qwen3-Omni (e.g., "thinker,talker"). Default: export all models
+        fp8_embedding: Whether to quantize embedding table to FP8 for reduced memory bandwidth
     """
     start_time = time.time()
 
@@ -929,7 +978,45 @@ def export_llm_model(model_dir: str,
         model_output_dir = os.path.join(
             output_dir, model_name) if is_multi_model else output_dir
 
-        if is_moe_model(model):
+        # Detect NemotronH MoE blocks by type name — the model is loaded via
+        # trust_remote_code so its class is a different object than the one
+        # imported from transformers (which may not be installed at all).
+        # Both "NemotronHMoE" (Will Guo's naming) and "NemotronHMOE" (HF/patch
+        # naming) are accepted.
+        _nemotron_moe_names = {"NemotronHMoE", "NemotronHMOE"}
+        _nemotron_moe_cls = next((type(m) for m in model.modules()
+                                  if type(m).__name__ in _nemotron_moe_names),
+                                 None)
+        _has_nemotron_moe = _nemotron_moe_cls is not None
+        if _has_nemotron_moe:
+            print(
+                "Detected NemotronH MoE blocks — replacing with Nvfp4MoePlugin"
+            )
+            # Patch module-level NemotronHMoE in Will Guo's plugin to the actual
+            # runtime class so all isinstance() checks inside the plugin work.
+            import tensorrt_edgellm.llm_models.layers.nvfp4_moe_plugin as _nvfp4_mod
+            _nvfp4_mod.NemotronHMoE = _nemotron_moe_cls
+            register_nvfp4_moe_plugin_onnx_symbolic_functions()
+            # Snapshot original NemotronHMoE blocks before replacement
+            original_moe_blocks = {
+                name: mod
+                for name, mod in model.named_modules()
+                if type(mod).__name__ in _nemotron_moe_names
+            }
+            model = replace_moe_blocks_with_nvfp4_plugin(model)
+            # Populate Marlin NVFP4 weight buffers from the HF dense weights.
+            # populate_marlin_plugin_buffers is now vectorized (numpy broadcast
+            # over tiles per expert) — replaces the previous ~20M-iter Python loop.
+            for name, plugin in model.named_modules():
+                if isinstance(plugin, NemotronHMoEW4A4Plugin):
+                    # When wrapped in NemotronHMoEWithSharedExperts the plugin
+                    # lives at "<layer_path>.moe_plugin"; strip the suffix to
+                    # recover the original NemotronHMoE block key.
+                    orig_key = name[:-len(".moe_plugin")] if name.endswith(
+                        ".moe_plugin") else name
+                    plugin.pack_experts_weights_to_marlin(
+                        original_moe_blocks[orig_key])
+        elif is_moe_model(model):
             print(
                 "Detected MoE model, replacing MoE blocks with Int4MoePlugin")
             register_int4_moe_plugin_onnx_symbolic_functions()
@@ -941,7 +1028,7 @@ def export_llm_model(model_dir: str,
         # Step 2: Export ONNX
         if trt_native_ops:
             export_model_to_onnx_with_trt_native_ops(model, model_output_dir)
-        elif isinstance(model, EdgeLLMHybridModelForCausalLM):
+        elif is_hybrid_model_type(model.config.model_type):
             export_hybrid_model_to_onnx(model, model_output_dir)
         elif is_qwen3_omni_submodel(model_name):
             dummy_inputs = create_qwen3_omni_dummy_inputs(
@@ -953,14 +1040,8 @@ def export_llm_model(model_dir: str,
                                  fp8_kv_cache)
 
         # Step 3: Export config
-        if isinstance(model, EdgeLLMHybridModelForCausalLM):
-            model_config = export_llm_config(model.config, 'hybrid_mamba',
-                                             trt_native_ops)
-        else:
-            config_hook = get_model_config_export_hook(model_name, model_dir,
-                                                       is_eagle_base,
-                                                       trt_native_ops)
-            model_config = config_hook(model.config)
+        model_config = export_model_config(model_name, model.config, model_dir,
+                                           is_eagle_base, trt_native_ops)
 
         if reduced_vocab_size is not None:
             model_config['reduced_vocab_size'] = reduced_vocab_size
@@ -970,7 +1051,8 @@ def export_llm_model(model_dir: str,
         print(f"Config saved to {model_output_dir}")
 
         # Step 4: Save weights
-        weights_hook = get_model_save_weights_hook(model_name)
+        weights_hook = get_model_save_weights_hook(model_name,
+                                                   fp8_embedding=fp8_embedding)
         weights_hook(model, model_output_dir)
 
     # ========== Save Shared Resources ==========
@@ -1025,7 +1107,8 @@ def export_llm_model(model_dir: str,
         print(f"Chat template saved to {output_template_path}")
     else:
         # Generate chat template from model
-        process_chat_template(model_dir, tokenizer_save_dir)
+        process_chat_template(model_dir, tokenizer, processor,
+                              tokenizer_save_dir)
 
     # Copy vocab_map.safetensors to output directory if reduced_vocab_dir is provided
     if reduced_vocab_dir is not None:

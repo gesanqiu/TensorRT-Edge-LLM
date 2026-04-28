@@ -8,11 +8,11 @@ Complete workflow for Mixture of Experts (MoE) models using a pre-quantized GPTQ
 
 > **Prerequisites:** Complete the [Installation Guide](../getting_started/installation.md) before proceeding.
 
-**Additional dependencies:** Install `gptqmodel` (CPU-only) and `optimum` 2.0.0:
+**Additional dependencies:** Install `gptqmodel` (CPU-only) and `optimum` 2.1.0:
 
 ```bash
-BUILD_CUDA_EXT=0 pip install -v gptqmodel==4.2.5 --no-build-isolation
-pip install optimum==2.0.0
+BUILD_CUDA_EXT=0 pip install -v gptqmodel==5.7.0 --no-build-isolation
+pip install optimum==2.1.0
 ```
 
 ---

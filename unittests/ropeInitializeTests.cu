@@ -147,14 +147,14 @@ TEST(InitializeLongRopeCosSin, Benchmark)
 }
 
 void TestMRopeCosSin(int32_t rotaryDim, int32_t rotaryEmbeddingMaxPositions, int32_t batchSize,
-    float rotaryBaseFrequency = 10000.0f, bool interleaved = false)
+    float rotaryBaseFrequency = 10000.0f, bool interleaved = false, int32_t sectionH = 20, int32_t sectionW = 20)
 {
     std::vector<int64_t> mropePositionIds(batchSize * 3 * rotaryEmbeddingMaxPositions);
     uniformIntInitialization(mropePositionIds, 0, rotaryEmbeddingMaxPositions - 1);
 
     std::vector<float> reference(batchSize * rotaryEmbeddingMaxPositions * rotaryDim);
     computeMRopeReference(reference, mropePositionIds, rotaryBaseFrequency, rotaryDim, rotaryEmbeddingMaxPositions,
-        batchSize, interleaved);
+        batchSize, interleaved, sectionH, sectionW);
 
     thrust::device_vector<float> cosSinCacheDevice(batchSize * rotaryEmbeddingMaxPositions * rotaryDim);
     thrust::device_vector<int64_t> mropePositionIdsDevice(mropePositionIds);
@@ -164,7 +164,7 @@ void TestMRopeCosSin(int32_t rotaryDim, int32_t rotaryEmbeddingMaxPositions, int
     // Launch kernel
     initializeMRopeCosSin(thrust::raw_pointer_cast(cosSinCacheDevice.data()),
         thrust::raw_pointer_cast(mropePositionIdsDevice.data()), rotaryBaseFrequency, rotaryDim,
-        rotaryEmbeddingMaxPositions, batchSize, interleaved, stream);
+        rotaryEmbeddingMaxPositions, batchSize, interleaved, sectionH, sectionW, stream);
 
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
@@ -183,8 +183,8 @@ void TestMRopeCosSin(int32_t rotaryDim, int32_t rotaryEmbeddingMaxPositions, int
               << ", rotaryBaseFrequency=" << rotaryBaseFrequency << ", interleaved=" << interleaved << std::endl;
 }
 
-void BenchmarkMRopeCosSin(
-    int32_t rotaryDim, int32_t rotaryEmbeddingMaxPositions, int32_t batchSize, bool interleaved = false)
+void BenchmarkMRopeCosSin(int32_t rotaryDim, int32_t rotaryEmbeddingMaxPositions, int32_t batchSize,
+    bool interleaved = false, int32_t sectionH = 20, int32_t sectionW = 20)
 {
     std::vector<int64_t> mropePositionIds(batchSize * 3 * rotaryEmbeddingMaxPositions);
     uniformIntInitialization(mropePositionIds, 0, rotaryEmbeddingMaxPositions - 1);
@@ -197,7 +197,7 @@ void BenchmarkMRopeCosSin(
     auto launch = [&]() {
         initializeMRopeCosSin(thrust::raw_pointer_cast(cosSinCacheDevice.data()),
             thrust::raw_pointer_cast(mropePositionIdsDevice.data()), 10000.0f, rotaryDim, rotaryEmbeddingMaxPositions,
-            batchSize, interleaved, stream);
+            batchSize, interleaved, sectionH, sectionW, stream);
     };
 
     // Warmup
@@ -233,16 +233,22 @@ void BenchmarkMRopeCosSin(
 
 TEST(InitializeMRopeCosSin, Accuracy)
 {
-    TestMRopeCosSin(128, 4096, 2);
-    TestMRopeCosSin(128, 8192, 1);
-    TestMRopeCosSin(128, 4096, 2, 5000000.0f, true);
-    TestMRopeCosSin(128, 500, 1, 5000000.0f, true);
+    // Qwen2-VL: rotaryDim=128, non-interleaved, section [16,24,24]
+    TestMRopeCosSin(128, 4096, 2, 10000.0f, false, 24, 24);
+    TestMRopeCosSin(128, 8192, 1, 10000.0f, false, 24, 24);
+    // Qwen3-VL: rotaryDim=128, interleaved, section [24,20,20]
+    TestMRopeCosSin(128, 4096, 2, 5000000.0f, true, 20, 20);
+    TestMRopeCosSin(128, 500, 1, 5000000.0f, true, 20, 20);
+    // Qwen3.5: rotaryDim=64, interleaved, section [11,11,10]
+    TestMRopeCosSin(64, 4096, 2, 10000000.0f, true, 11, 10);
+    TestMRopeCosSin(64, 500, 1, 10000000.0f, true, 11, 10);
 }
 
 TEST(InitializeMRopeCosSin, Benchmark)
 {
-    BenchmarkMRopeCosSin(128, 4096, 2);
-    BenchmarkMRopeCosSin(128, 8192, 1);
-    BenchmarkMRopeCosSin(128, 4096, 2, true);
-    BenchmarkMRopeCosSin(128, 8192, 1, true);
+    BenchmarkMRopeCosSin(128, 4096, 2, false, 24, 24);
+    BenchmarkMRopeCosSin(128, 8192, 1, false, 24, 24);
+    BenchmarkMRopeCosSin(128, 4096, 2, true, 20, 20);
+    BenchmarkMRopeCosSin(128, 8192, 1, true, 20, 20);
+    BenchmarkMRopeCosSin(64, 4096, 2, true, 11, 10);
 }

@@ -16,11 +16,18 @@
 Command-line script for exporting audio models to ONNX format using TensorRT Edge-LLM.
 
 This script provides a command-line interface for exporting audio components of
-multimodal models (Qwen3-Omni) to ONNX format with optional quantization support.
+multimodal models (Qwen3-Omni, Qwen3-ASR) to ONNX format with optional quantization
+support.
 
 Usage:
     # Export without quantization
     python export_audio.py --model_dir /path/to/model --output_dir /path/to/output
+
+    # Export audio encoder with FP8 quantization
+    python export_audio.py --model_dir /path/to/model --output_dir /path/to/output --quantization fp8
+
+    # Export with specific calibration dataset
+    python export_audio.py --model_dir /path/to/model --output_dir /path/to/output --quantization fp8 --dataset_dir openslr/librispeech_asr
 """
 
 import argparse
@@ -63,6 +70,22 @@ def main() -> None:
         "Device to load the model on (default: cuda, options: cpu, cuda, cuda:0, cuda:1, etc.)"
     )
     parser.add_argument(
+        "--quantization",
+        type=str,
+        required=False,
+        choices=["fp8"],
+        default=None,
+        help="Quantization method for audio encoder (fp8 for FP8 quantization). "
+        "Only applies to audio_encoder; code2wav is always exported in FP16.")
+    parser.add_argument(
+        "--dataset_dir",
+        type=str,
+        required=False,
+        default="openslr/librispeech_asr",
+        help=
+        "Dataset directory to use for audio encoder quantization calibration (default: openslr/librispeech_asr)"
+    )
+    parser.add_argument(
         "--export_models",
         type=str,
         required=False,
@@ -78,7 +101,9 @@ def main() -> None:
                      output_dir=args.output_dir,
                      dtype=args.dtype,
                      device=args.device,
-                     export_models=args.export_models)
+                     quantization=args.quantization,
+                     export_models=args.export_models,
+                     dataset_dir=args.dataset_dir)
         print("Audio model export completed successfully!")
     except Exception as e:
         print(f"Error during audio model export: {e}")

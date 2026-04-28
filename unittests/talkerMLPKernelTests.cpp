@@ -17,13 +17,15 @@
 
 #include "common/checkMacros.h"
 #include "common/tensor.h"
+#ifdef CUTE_DSL_GEMM_ENABLED
+#include "kernels/talkerMLPKernels/cuteDslGemmRunner.h"
+#endif
 #include "kernels/talkerMLPKernels/talkerMLPKernels.h"
 #include "testUtils.h"
 
 #include <cmath>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#include <dlfcn.h>
 #include <gtest/gtest.h>
 #include <tuple>
 #include <vector>
@@ -77,48 +79,32 @@ void referenceTalkerMLP(std::vector<half> const& input, std::vector<half> const&
 } // namespace
 
 // ============================================================================
-// Fixture for tests that require cuBLAS (invokeTalkerMLP)
+// Fixture for tests that require CuTe DSL GEMM (invokeTalkerMLP / invokeLinearLayer)
 // ============================================================================
 class TalkerMLPTest : public ::testing::Test
 {
 protected:
     cudaStream_t stream{};
-    void* cublasLib{nullptr};
-    void* cublasHandle{nullptr};
 
     void SetUp() override
     {
         cudaSetDevice(0);
         CUDA_CHECK(cudaStreamCreate(&stream));
-
-        cublasLib = dlopen("libcublas.so", RTLD_LAZY);
-        if (!cublasLib)
+#ifndef CUTE_DSL_GEMM_ENABLED
+        GTEST_SKIP() << "CuTe DSL GEMM not enabled in this build";
+#else
+        if (!trt_edgellm::CuteDslGemmRunner::loadKernelModule())
         {
-            GTEST_SKIP() << "cuBLAS not available";
+            GTEST_SKIP() << "Failed to load CuTe DSL GEMM kernel module";
         }
-        auto createFn = reinterpret_cast<int (*)(void**)>(dlsym(cublasLib, "cublasCreate_v2"));
-        if (!createFn || createFn(&cublasHandle) != 0)
-        {
-            dlclose(cublasLib);
-            cublasLib = nullptr;
-            GTEST_SKIP() << "Failed to create cuBLAS handle";
-        }
+#endif
     }
 
     void TearDown() override
     {
-        if (cublasHandle && cublasLib)
-        {
-            auto destroyFn = reinterpret_cast<int (*)(void*)>(dlsym(cublasLib, "cublasDestroy_v2"));
-            if (destroyFn)
-            {
-                destroyFn(cublasHandle);
-            }
-        }
-        if (cublasLib)
-        {
-            dlclose(cublasLib);
-        }
+#ifdef CUTE_DSL_GEMM_ENABLED
+        trt_edgellm::CuteDslGemmRunner::unloadKernelModule();
+#endif
         CUDA_CHECK(cudaStreamSynchronize(stream));
         CUDA_CHECK(cudaStreamDestroy(stream));
     }
@@ -202,8 +188,7 @@ TEST_F(TalkerMLPTest, MLPAccuracy)
         copyHostToDevice(gpuFc2W, hostFc2W);
         copyHostToDevice(gpuFc2B, hostFc2B);
 
-        kernel::invokeTalkerMLP(
-            cublasHandle, gpuInput, gpuFc1W, gpuFc1B, gpuFc2W, gpuFc2B, gpuOutput, gpuWorkspace, stream);
+        kernel::invokeTalkerMLP(gpuInput, gpuFc1W, gpuFc1B, gpuFc2W, gpuFc2B, gpuOutput, gpuWorkspace, stream);
 
         auto const gpuResult = copyDeviceToHost<half>(gpuOutput);
         CUDA_CHECK(cudaStreamSynchronize(stream));

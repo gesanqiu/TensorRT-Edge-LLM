@@ -23,7 +23,7 @@ classifiers = [
 requires-python = ">=3.10"
 dependencies = [
     "torch~=2.10.0",
-    "transformers==4.57.6",
+    "transformers==5.3.0",
     "nvidia-modelopt[torch]==0.39.0",
     "nvidia-modelopt[onnx]==0.39.0",
     "onnx==1.19.0",
@@ -37,6 +37,8 @@ dependencies = [
     "soundfile==0.13.1",
     "librosa==0.11.0",
     "einops==0.8.2",
+    # For InternVL3/InternLM2 tokenizer support
+    "tiktoken>=0.5.0",
 ]
 
 [project.optional-dependencies]
@@ -50,6 +52,7 @@ tensorrt-edgellm-export-visual = "tensorrt_edgellm.scripts.export_visual:main"
 tensorrt-edgellm-export-llm = "tensorrt_edgellm.scripts.export_llm:main"
 tensorrt-edgellm-export-audio = "tensorrt_edgellm.scripts.export_audio:main"
 tensorrt-edgellm-export-draft = "tensorrt_edgellm.scripts.export_draft:main"
+tensorrt-edgellm-export-action = "tensorrt_edgellm.scripts.export_action:main"
 tensorrt-edgellm-insert-lora = "tensorrt_edgellm.scripts.insert_lora:main"
 tensorrt-edgellm-process-lora = "tensorrt_edgellm.scripts.process_lora_weights:main"
 tensorrt-edgellm-merge-lora = "tensorrt_edgellm.scripts.merge_lora:main"

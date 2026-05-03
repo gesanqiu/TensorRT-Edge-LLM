@@ -339,6 +339,16 @@ def is_qqq_model(model: PreTrainedModel) -> bool:
     return quant_config and quant_config.get("quant_method") == "qqq"
 
 
+def _check_qqq_in_config(model_dir: str) -> bool:
+    """Check if a model directory contains a QQQ (W4A8) quantized model (before loading)."""
+    try:
+        cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+        cfg_dict = cfg.to_dict()
+        quant_config = cfg_dict.get("quantization_config", None)
+        return bool(quant_config and quant_config.get("quant_method") == "qqq")
+    except Exception:
+        return False
+
 def _load_qqq_model(model_dir: str, torch_dtype, device: torch.device):
     """Load a QQQ (W4A8) checkpoint via QQQ ``Quantized*`` classes and ``from_pretrained``.
 
@@ -361,17 +371,6 @@ def _load_qqq_model(model_dir: str, torch_dtype, device: torch.device):
     )
     model.to(device)
     return model
-
-
-def _is_qqq_model_dir(model_dir: str) -> bool:
-    """Check if a model directory contains a QQQ (W4A8) quantized model (before loading)."""
-    try:
-        cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
-        cfg_dict = cfg.to_dict()
-        quant_config = cfg_dict.get("quantization_config", None)
-        return bool(quant_config and quant_config.get("quant_method") == "qqq")
-    except Exception:
-        return False
 
 
 def _is_gptq_moe_model(model_dir: str) -> bool:
@@ -847,7 +846,7 @@ def load_hf_model(
         model = Qwen3OmniForConditionalGeneration.from_pretrained(
             model_dir, torch_dtype=torch_dtype,
             trust_remote_code=True).to(device)
-    elif _is_qqq_model_dir(model_dir):
+    elif _check_qqq_in_config(model_dir):
         print(f"Loading QQQ (W4A8) quantized model from {model_dir}")
         model = _load_qqq_model(model_dir, torch_dtype, device)
     elif _is_gptq_moe_model(model_dir):

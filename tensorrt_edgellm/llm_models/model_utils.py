@@ -339,112 +339,27 @@ def is_qqq_model(model: PreTrainedModel) -> bool:
     return quant_config and quant_config.get("quant_method") == "qqq"
 
 
-def _get_qqq_quantlinear():
-    """Import QQQ QuantLinear, bypassing __init__ chain if needed."""
-    try:
-        from QQQ.gptq.qlinear.qlinear_marlin import QuantLinear
-        return QuantLinear
-    except ImportError:
-        pass
-    import importlib.util as _ilu
-    import QQQ
-    for base in QQQ.__path__:
-        import pathlib
-        candidate = pathlib.Path(base) / "QQQ" / "gptq" / "qlinear" / "qlinear_marlin.py"
-        if not candidate.exists():
-            candidate = pathlib.Path(base) / "gptq" / "qlinear" / "qlinear_marlin.py"
-        if candidate.exists():
-            spec = _ilu.spec_from_file_location("_qlinear_marlin", str(candidate))
-            mod = _ilu.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            return mod.QuantLinear
-    raise ImportError("Cannot locate QQQ QuantLinear")
+def _load_qqq_model(model_dir: str, torch_dtype, device: torch.device):
+    """Load a QQQ (W4A8) checkpoint via QQQ ``Quantized*`` classes and ``from_pretrained``.
 
-
-def _load_qqq_model(model_dir: str, torch_dtype, device: str):
-    """Load a QQQ (W4A8) quantized model.
-
-    Strategy:
-    1. Create model skeleton from config (no weights)
-    2. Scan safetensors for .B keys to identify quantized layers
-    3. Replace nn.Linear → QuantLinear for those layers
-    4. Load safetensors weights into the patched model
+    Requires the QQQ package. Only ``model_type`` values registered in QQQ are supported
+    (no generic meta / safetensors fallback).
     """
-    import glob
-    import pathlib
-    import torch
-    from safetensors import safe_open
-    from safetensors.torch import load_file
+    try:
+        from QQQ.utils import load_qqq_quantized_model
+    except ImportError as err:
+        raise ImportError(
+            "Loading QQQ checkpoints requires the QQQ package on PYTHONPATH "
+            "(e.g. `pip install -e /path/to/QQQ`)."
+        ) from err
 
-    QuantLinear = _get_qqq_quantlinear()
-
-    cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
-    quant_config = cfg.quantization_config
-    del cfg.quantization_config
-    wbits = quant_config.get("wbits", 4)
-    group_size = quant_config.get("group_size", -1)
-
-    shard_files = sorted(glob.glob(str(pathlib.Path(model_dir) / "*.safetensors")))
-
-    qqq_prefixes = set()
-    qqq_bias_prefixes = set()
-    for sf in shard_files:
-        with safe_open(sf, framework="pt") as f:
-            for key in f.keys():
-                if key.endswith(".B"):
-                    qqq_prefixes.add(key[:-2])
-                elif key.endswith(".bias"):
-                    prefix = key[:-5]
-                    if prefix + ".B" != key:
-                        qqq_bias_prefixes.add(prefix)
-
-    qqq_bias_prefixes = qqq_prefixes & qqq_bias_prefixes
-    print(f"  Found {len(qqq_prefixes)} QQQ quantized layers "
-          f"({len(qqq_bias_prefixes)} with bias)")
-
-    # Build model from config (meta device to avoid allocating full weights)
-    with torch.device("meta"):
-        model = AutoModelForCausalLM.from_config(
-            cfg, torch_dtype=torch_dtype, trust_remote_code=True)
-
-    # Replace quantized Linear → QuantLinear
-    for prefix in qqq_prefixes:
-        parts = prefix.split(".")
-        parent = model
-        for part in parts[:-1]:
-            parent = getattr(parent, part)
-        attr_name = parts[-1]
-        old_module = getattr(parent, attr_name)
-        in_f = old_module.in_features
-        out_f = old_module.out_features
-        has_bias = prefix in qqq_bias_prefixes
-        new_ql = QuantLinear(
-            wbits, group_size, in_f, out_f, bias=has_bias)
-        setattr(parent, attr_name, new_ql)
-
-    # Materialize remaining meta tensors on CPU first
-    def _materialize(module, prefix=""):
-        for name, param in module._parameters.items():
-            if param is not None and param.is_meta:
-                module._parameters[name] = torch.nn.Parameter(
-                    torch.empty(param.shape, dtype=param.dtype, device="cpu"),
-                    requires_grad=param.requires_grad)
-        for name, buf in module._buffers.items():
-            if buf is not None and buf.is_meta:
-                module._buffers[name] = torch.empty(
-                    buf.shape, dtype=buf.dtype, device="cpu")
-        for child_name, child in module._modules.items():
-            if child is not None:
-                _materialize(child, prefix + child_name + ".")
-    _materialize(model)
-
-    # Load weights from safetensors
-    for sf in shard_files:
-        state = load_file(sf, device="cpu")
-        model.load_state_dict(state, strict=False)
-
+    model_path = str(_resolve_model_path(model_dir).resolve())
+    model = load_qqq_quantized_model(
+        model_path,
+        trust_remote_code=True,
+        torch_dtype=torch_dtype,
+    )
     model.to(device)
-    model.config.quantization_config = quant_config
     return model
 
 

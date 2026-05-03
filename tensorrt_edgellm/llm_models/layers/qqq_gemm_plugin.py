@@ -35,6 +35,7 @@ from torch.onnx.symbolic_helper import _get_tensor_sizes
 
 from ...common import ONNX_OPSET_VERSION
 
+
 # ---------------------------------------------------------------------------
 # ONNX Schema: per-channel (3 inputs)
 # ---------------------------------------------------------------------------
@@ -265,29 +266,6 @@ def register_qqq_gemm_plugin_onnx_symbolic_functions() -> None:
     print("Registered ONNX symbolic functions for QqqGemmPlugin")
 
 
-def _get_qqq_quantlinear_class():
-    """Import QQQ's QuantLinear, falling back to direct file load if the
-    QQQ package __init__ chain has incompatible transitive imports."""
-    try:
-        from QQQ.gptq.qlinear.qlinear_marlin import QuantLinear
-        return QuantLinear
-    except ImportError:
-        pass
-    import importlib.util as _ilu
-    import pathlib
-    import QQQ
-    for base in QQQ.__path__:
-        candidate = pathlib.Path(base) / "QQQ" / "gptq" / "qlinear" / "qlinear_marlin.py"
-        if not candidate.exists():
-            candidate = pathlib.Path(base) / "gptq" / "qlinear" / "qlinear_marlin.py"
-        if candidate.exists():
-            spec = _ilu.spec_from_file_location("_qlinear_marlin", str(candidate))
-            mod = _ilu.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            return mod.QuantLinear
-    raise ImportError("Cannot locate QQQ QuantLinear")
-
-
 def replace_qqq_linear_with_plugin(model: nn.Module) -> nn.Module:
     """Replace all QQQ QuantLinear modules with QqqGemmPluginModule.
 
@@ -301,11 +279,11 @@ def replace_qqq_linear_with_plugin(model: nn.Module) -> nn.Module:
     Returns:
         The same model with QuantLinear layers replaced.
     """
-    QQQQuantLinear = _get_qqq_quantlinear_class()
+    from QQQ.gptq.qlinear.qlinear_marlin import QuantLinear
 
     replacements = []
     for name, module in model.named_modules():
-        if not isinstance(module, QQQQuantLinear):
+        if not isinstance(module, QuantLinear):
             continue
         has_group = hasattr(module, "s_group") and module.s_group.numel() > 0
         group_size = module.group_size if has_group else -1
